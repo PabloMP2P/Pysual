@@ -1,0 +1,19 @@
+Pysual web bundle runtime notices
+
+The browser build embeds an unmodified Pyodide 0.29.0 npm runtime.
+Pyodide is distributed under the Mozilla Public License 2.0.
+Source: https://github.com/pyodide/pyodide/tree/0.29.0
+License: Pyodide-LICENSE.txt
+Distribution: https://registry.npmjs.org/pyodide/-/pyodide-0.29.0.tgz
+
+The runtime's lock metadata identifies CPython 3.13.2.
+CPython's license history and third-party notices are in CPython-LICENSE.txt.
+Source: https://github.com/python/cpython/tree/v3.13.2
+Pysual does not modify the interpreter or standard library distribution.
+
+DejaVu Sans is bundled for matching window and browser typography.
+Source: https://dejavu-fonts.github.io/
+License and copyright notices: DejaVu-LICENSE.txt
+
+The full license texts are included in the HTML's pysual-notices text block
+and in the embedded Python archive under pysual/web/notices/ and pysual/assets/.

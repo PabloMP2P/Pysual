@@ -1,0 +1,153 @@
+name: Test and package
+on: [push, pull_request]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ['3.11', '3.14']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install Python tools
+        run: python -m pip install -e '.[dev,build]'
+      - name: Check public typing against the checkout
+        run: python tools/check_typing.py
+      - name: Check native source formatting
+        if: runner.os == 'Linux'
+        run: |
+          python -m pip install 'clang-format>=19.1,<20'
+          clang-format --dry-run --Werror native/host.c native/sdl_renderer.c native/terminal_renderer.c
+      - name: Shared core, browser, build, and Python terminal tests
+        run: python -m pytest -o faulthandler_timeout=8
+      - name: Build pure library distributions
+        run: python -m pysual package
+      - name: Check pure wheel in a fresh environment outside the checkout
+        run: python tools/check_wheel.py --kind pure
+      - name: Linux native prerequisites
+        if: matrix.python == '3.14' && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config xvfb libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev libxtst-dev libwayland-dev libxkbcommon-dev libdrm-dev libgbm-dev libgl1-mesa-dev libasound2-dev libpulse-dev libfreetype-dev libharfbuzz-dev libpng-dev libjpeg-dev
+      - name: macOS native prerequisites
+        if: matrix.python == '3.14' && runner.os == 'macOS'
+        run: brew install pkg-config freetype harfbuzz libpng jpeg-turbo
+      - name: Build pinned SDL libraries
+        if: matrix.python == '3.14' && runner.os != 'Windows'
+        shell: bash
+        run: |
+          python tools/fetch_native_deps.py --kind source
+          prefix="$PWD/.build/sdk"
+          cmake -S .build/deps/SDL3-3.4.16 -B .build/sdl -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_INSTALL_LIBDIR=lib -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TEST_LIBRARY=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF
+          cmake --build .build/sdl --parallel 2
+          cmake --install .build/sdl
+          cmake -S .build/deps/SDL3_ttf-3.2.2 -B .build/ttf -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_PREFIX_PATH="$prefix" -DCMAKE_INSTALL_LIBDIR=lib -DSDLTTF_VENDORED=OFF -DSDLTTF_HARFBUZZ=ON -DSDLTTF_PLUTOSVG=OFF -DSDLTTF_SAMPLES=OFF
+          cmake --build .build/ttf --parallel 2
+          cmake --install .build/ttf
+          cmake -S .build/deps/SDL3_image-3.4.6 -B .build/image -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_PREFIX_PATH="$prefix" -DCMAKE_INSTALL_LIBDIR=lib -DSDLIMAGE_VENDORED=OFF -DSDLIMAGE_AVIF=OFF -DSDLIMAGE_JXL=OFF -DSDLIMAGE_WEBP=OFF -DSDLIMAGE_TIF=OFF -DSDLIMAGE_PNG_SHARED=OFF -DSDLIMAGE_JPG_SHARED=OFF -DSDLIMAGE_SAMPLES=OFF -DSDLIMAGE_TESTS=OFF
+          cmake --build .build/image --parallel 2
+          cmake --install .build/image
+          echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$prefix/lib" >> "$GITHUB_ENV"
+          echo "DYLD_LIBRARY_PATH=$prefix/lib" >> "$GITHUB_ENV"
+      - name: Build native host
+        if: matrix.python == '3.14'
+        run: python -m pysual native
+      - name: Real native windows and terminal protocol
+        if: matrix.python == '3.14'
+        shell: bash
+        env:
+          # The opt-in test owns a separate hidden console and restores its modes.
+          PYSUAL_TEST_TERMINAL_IO: ${{ runner.os == 'Windows' && '1' || '0' }}
+        run: |
+          command=(python -m pytest tests/test_native_protocol.py tests/test_native_window.py tests/test_native_terminal.py tests/test_native_scene_parity.py tests/test_native_text.py tests/test_native_resources.py tests/test_terminal_selection.py tests/test_native_runtime.py tests/test_diagnostics.py tests/test_stress_test.py)
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            SDL_VIDEO_DRIVER=x11 LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a "${command[@]}"
+          else
+            "${command[@]}"
+          fi
+      - name: Build native wheel
+        if: matrix.python == '3.14'
+        run: python -m pysual package --wheel
+      - name: Check installed native wheel, fonts, images and both terminal renderers
+        if: matrix.python == '3.14'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            SDL_VIDEO_DRIVER=x11 LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a python tools/check_wheel.py --kind native
+          else
+            python tools/check_wheel.py --kind native
+          fi
+      - name: Freeze and launch window and both terminal renderers
+        if: matrix.python == '3.14'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            SDL_VIDEO_DRIVER=x11 LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a python tools/check_frozen.py
+          else
+            python tools/check_frozen.py
+          fi
+      - name: Build terminal host without SDL
+        if: matrix.python == '3.14'
+        run: python -m pysual native --terminal-only --output .build/terminal-only
+      - name: Exercise independent terminal host
+        if: matrix.python == '3.14'
+        shell: bash
+        run: |
+          suffix=""
+          if [ "$RUNNER_OS" = "Windows" ]; then suffix=".exe"; fi
+          PYSUAL_HOST="$PWD/.build/terminal-only/pysual-host$suffix" python -m pytest tests/test_native_terminal.py tests/test_terminal_selection.py
+      - name: Preserve distribution failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: distribution-${{ matrix.os }}-${{ matrix.python }}
+          path: |
+            .build/wheel-probes/
+            .build/frozen-probes/*-run/
+          if-no-files-found: ignore
+          include-hidden-files: true
+
+  standalone-browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install browser test tools
+        run: python -m pip install -e '.[dev]'
+      - name: Install Chromium and system dependencies
+        run: python -m playwright install --with-deps chromium
+      - name: Cache the checksum-pinned Pyodide runtime
+        uses: actions/cache@v4
+        with:
+          path: .build/pyodide-*
+          key: pyodide-${{ hashFiles('src/pysual/bundle.py') }}
+      - name: Check the standalone page in real Chromium
+        run: python tools/check_web.py
+      - name: Check live Python applications in real Chromium
+        run: python tools/check_web.py --mode live
+      - name: Preserve browser failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: standalone-browser
+          path: |
+            .build/web-smoke/*.png
+            .build/web-smoke/result.json
+            .build/web-live/*.png
+            .build/web-live/result.json
+          if-no-files-found: ignore
+          include-hidden-files: true

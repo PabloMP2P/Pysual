@@ -1,0 +1,17 @@
+include README.md CONTRIBUTING.md LICENSE pyproject.toml setup.py .clang-format
+recursive-include src/pysual *.py *.pyi *.typed *.js *.html *.ttf *LICENSE* *.txt *.json
+recursive-include native *.c *.h *LICENSE*
+recursive-include native/notices *.txt *.json .gitattributes
+recursive-include tools *.py *.md *.gz
+recursive-include examples *.py
+recursive-include docs *.md
+include docs/theme-families.png
+recursive-include tests *.py *.mjs *.txt
+include tests/typing/pyrightconfig.json
+recursive-exclude src/pysual/bin *
+prune .build
+prune .venv
+prune build
+prune dist
+prune work
+global-exclude __pycache__ *.py[cod] *.exe *.dll *.so *.dylib *.o *.obj

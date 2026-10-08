@@ -1,0 +1,12 @@
+{
+  "DejaVuSans.ttf": {
+    "sha256": "7da195a74c55bef988d0d48f9508bd5d849425c1770dba5d7bfc6ce9ed848954",
+    "license": "DejaVu-LICENSE.txt",
+    "upstream": "https://dejavu-fonts.github.io/"
+  },
+  "DejaVuSansMono.ttf": {
+    "sha256": "b4a6c3e4faab8773f4ff761d56451646409f29abedd68f05d38c2df667d3c582",
+    "license": "DejaVu-LICENSE.txt",
+    "upstream": "https://dejavu-fonts.github.io/"
+  }
+}

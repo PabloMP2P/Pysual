@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>Pysual</title>
+  <style>
+    @font-face{font-family:'Pysual Sans';src:url('/font-sans.ttf') format('truetype')}
+    @font-face{font-family:'Pysual Mono';src:url('/font-mono.ttf') format('truetype')}
+    *{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#11151d}
+    #frame{display:block;width:100%;height:100%;outline:0;touch-action:none;user-select:none}
+    #editor{position:fixed;opacity:.01;resize:none;border:0;padding:0;margin:0;outline:0;pointer-events:none;z-index:-1;font:16px 'Pysual Sans';width:1px;height:1px}
+    #safe{position:fixed;visibility:hidden;pointer-events:none;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
+    #status{position:fixed;bottom:12px;left:12px;background:#202938;color:#eef2fa;border:1px solid #51627e;border-radius:8px;padding:10px 14px;font:14px system-ui;z-index:10}
+    #status[hidden]{display:none}#host-menu{position:fixed;right:6px;top:6px;z-index:9;color:#e4e9f2;font:12px system-ui}
+    #host-menu summary{cursor:pointer;list-style:none;opacity:.35;border-radius:5px;padding:3px 6px;background:#202938}#host-menu:hover summary,#host-menu[open] summary{opacity:1}
+    #host-menu nav{display:flex;gap:8px;padding:10px;background:#202938;border:1px solid #51627e;border-radius:6px}
+    button,a.action{font:14px system-ui;background:#3f5dac;color:#fff;border:0;border-radius:6px;padding:9px 14px;cursor:pointer;text-decoration:none}
+    dialog{background:#202938;color:#eef2fa;border:1px solid #617493;border-radius:12px;padding:24px;width:min(480px,90vw);font:15px system-ui}
+    dialog::backdrop{background:#0008}dialog h2{margin-top:0;font-size:20px}dialog .actions{display:flex;gap:10px;margin-top:18px;flex-wrap:wrap}dialog input,dialog textarea{width:100%;margin:12px 0}dialog p{overflow-wrap:anywhere}
+  </style>
+  <script type="module" src="/live.js"></script>
+</head>
+<body>
+  <svg id="frame" xmlns="http://www.w3.org/2000/svg" tabindex="0" role="application" aria-label="Pysual application"></svg>
+  <textarea id="editor" aria-label="Application text input" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+  <div id="safe"></div>
+  <div id="status" role="status">Connecting to Python…</div>
+  <details id="host-menu"><summary aria-label="Host actions">⋯</summary><nav><button id="html-export" type="button">Save HTML</button><button id="svg-export" type="button">Save SVG</button><button id="quit" type="button">Close app</button></nav></details>
+</body>
+</html>

@@ -1,0 +1,13 @@
+# Match the existing native renderer's four-space, attached-brace style.
+# Apply to hand-written files explicitly; leave vendor and generated code alone.
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 120
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+PointerAlignment: Right
+SortIncludes: Never
+ReflowComments: false

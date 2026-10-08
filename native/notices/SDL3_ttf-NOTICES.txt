@@ -1,0 +1,50 @@
+Pysual native Windows text-engine notices
+========================================
+
+The official SDL3_ttf 3.2.2 Windows development package includes the
+following text-engine components within SDL3_ttf.dll. These notices accompany
+the DLL in Pysual native Windows distributions. The SDL_ttf notice itself is
+provided separately as SDL3_ttf-3.2.2-LICENSE.txt.
+
+This software is based in part on the work of the FreeType Team.
+FreeType: https://freetype.org/
+
+The exact upstream notice texts follow in separate files. FreeType's license
+index also identifies the BDF and PCF driver notices, retained here in their
+original README files. Upstream notice files have not been edited.
+
+FreeType
+  Revision: 9973564cfa63763a3e4ac67c09147899539b1e07
+  Notice: SDL3_ttf-FreeType-FTL.txt
+  Source: https://raw.githubusercontent.com/libsdl-org/freetype/9973564cfa63763a3e4ac67c09147899539b1e07/docs/FTL.TXT
+
+FreeType
+  Revision: 9973564cfa63763a3e4ac67c09147899539b1e07
+  Notice: SDL3_ttf-FreeType-LICENSE.txt
+  Source: https://raw.githubusercontent.com/libsdl-org/freetype/9973564cfa63763a3e4ac67c09147899539b1e07/LICENSE.TXT
+
+HarfBuzz
+  Revision: 564bf9818a18709776856533829c0c04950773d6
+  Notice: SDL3_ttf-HarfBuzz-LICENSE.txt
+  Source: https://raw.githubusercontent.com/libsdl-org/harfbuzz/564bf9818a18709776856533829c0c04950773d6/COPYING
+
+PlutoSVG
+  Revision: 2983eb6919feea272d793bc386384e3f5b97b03c
+  Notice: SDL3_ttf-PlutoSVG-LICENSE.txt
+  Source: https://raw.githubusercontent.com/libsdl-org/plutosvg/2983eb6919feea272d793bc386384e3f5b97b03c/LICENSE
+
+PlutoVG
+  Revision: 3e6f922f453da1c9e7d1d7f66cac1d9724a18b47
+  Notice: SDL3_ttf-PlutoVG-LICENSE.txt
+  Source: https://raw.githubusercontent.com/libsdl-org/plutovg/3e6f922f453da1c9e7d1d7f66cac1d9724a18b47/LICENSE
+
+FreeType BDF driver
+  Revision: 9973564cfa63763a3e4ac67c09147899539b1e07
+  Notice: SDL3_ttf-FreeType-BDF-LICENSE.txt
+  Source: https://raw.githubusercontent.com/libsdl-org/freetype/9973564cfa63763a3e4ac67c09147899539b1e07/src/bdf/README
+
+FreeType PCF driver
+  Revision: 9973564cfa63763a3e4ac67c09147899539b1e07
+  Notice: SDL3_ttf-FreeType-PCF-LICENSE.txt
+  Source: https://raw.githubusercontent.com/libsdl-org/freetype/9973564cfa63763a3e4ac67c09147899539b1e07/src/pcf/README
+

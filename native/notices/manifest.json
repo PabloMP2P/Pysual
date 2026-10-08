@@ -1,0 +1,65 @@
+{
+  "library": "SDL3_ttf",
+  "version": "3.2.2",
+  "revision": "a1ce3670aec736ecbf0936c43f2f0cc53aa61e5b",
+  "windows_archive_sha256": "67805c5babfc49ca0c56882dc9b8cabbcdd1e6f9edde10ddac91ddb38f3afb8c",
+  "files": [
+    {
+      "file": "SDL3_ttf-FreeType-FTL.txt",
+      "component": "FreeType",
+      "revision": "9973564cfa63763a3e4ac67c09147899539b1e07",
+      "source": "https://raw.githubusercontent.com/libsdl-org/freetype/9973564cfa63763a3e4ac67c09147899539b1e07/docs/FTL.TXT",
+      "sha256": "08c135755dd589039470f1fdbb400daaabaaa50d0b366d19cebff4d22986baa1"
+    },
+    {
+      "file": "SDL3_ttf-FreeType-LICENSE.txt",
+      "component": "FreeType",
+      "revision": "9973564cfa63763a3e4ac67c09147899539b1e07",
+      "source": "https://raw.githubusercontent.com/libsdl-org/freetype/9973564cfa63763a3e4ac67c09147899539b1e07/LICENSE.TXT",
+      "sha256": "2e3bbb7d7c5c396368dd0853a790ec29ce5b8647163dde42a0493fb0d6556b2b"
+    },
+    {
+      "file": "SDL3_ttf-HarfBuzz-LICENSE.txt",
+      "component": "HarfBuzz",
+      "revision": "564bf9818a18709776856533829c0c04950773d6",
+      "source": "https://raw.githubusercontent.com/libsdl-org/harfbuzz/564bf9818a18709776856533829c0c04950773d6/COPYING",
+      "sha256": "ba8f810f2455c2f08e2d56bb49b72f37fcf68f1f4fade38977cfd7372050ad64"
+    },
+    {
+      "file": "SDL3_ttf-PlutoSVG-LICENSE.txt",
+      "component": "PlutoSVG",
+      "revision": "2983eb6919feea272d793bc386384e3f5b97b03c",
+      "source": "https://raw.githubusercontent.com/libsdl-org/plutosvg/2983eb6919feea272d793bc386384e3f5b97b03c/LICENSE",
+      "sha256": "e008ab9f8b36ec517cc47be20e776e68d69f5ba75f8f774d506ae4696d0e50c4"
+    },
+    {
+      "file": "SDL3_ttf-PlutoVG-LICENSE.txt",
+      "component": "PlutoVG",
+      "revision": "3e6f922f453da1c9e7d1d7f66cac1d9724a18b47",
+      "source": "https://raw.githubusercontent.com/libsdl-org/plutovg/3e6f922f453da1c9e7d1d7f66cac1d9724a18b47/LICENSE",
+      "sha256": "308647f12c8111159e299a0aa50161c8b4309c59e58accd52a5f3a0c53702c05"
+    },
+    {
+      "file": "SDL3_ttf-FreeType-BDF-LICENSE.txt",
+      "component": "FreeType BDF driver",
+      "revision": "9973564cfa63763a3e4ac67c09147899539b1e07",
+      "source": "https://raw.githubusercontent.com/libsdl-org/freetype/9973564cfa63763a3e4ac67c09147899539b1e07/src/bdf/README",
+      "sha256": "7984455e7e5a9faba3797c8bf095fbe10cc846316b7320aff8c58402e22b82fe"
+    },
+    {
+      "file": "SDL3_ttf-FreeType-PCF-LICENSE.txt",
+      "component": "FreeType PCF driver",
+      "revision": "9973564cfa63763a3e4ac67c09147899539b1e07",
+      "source": "https://raw.githubusercontent.com/libsdl-org/freetype/9973564cfa63763a3e4ac67c09147899539b1e07/src/pcf/README",
+      "sha256": "18d9782898d9eac04476e2f744678137b2a889689ed3e923e052fc396a86f86b"
+    },
+    {
+      "file": "SDL3_ttf-NOTICES.txt",
+      "component": "SDL3_ttf dependency inventory",
+      "revision": "a1ce3670aec736ecbf0936c43f2f0cc53aa61e5b",
+      "source": null,
+      "sha256": "6c022a450d8fea0a986506513b1065a69cdf0d8d8e22bb7a04435b016cb6dbbb"
+    }
+  ],
+  "windows_dll_sha256": "95a20af07f194f057b6e778bee0ce608d3c90c3dbd64a4b5120dc4879f43a6be"
+}
