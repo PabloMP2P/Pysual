@@ -270,6 +270,38 @@ this checkout. CI runs it alongside the ordinary test suite. Native text,
 resource and diagnostics tests run again after building the native host;
 Windows CI also opts into the existing isolated console-restoration test.
 
+## Visual regression checks
+
+The small visual fixture covers menus, enabled/disabled buttons, selected rows,
+text entry, a selected card and a fixed-date calendar in modern, modern-dark
+and macOS themes. Native and Chromium images have separate baselines; both
+use an 800 by 560 logical viewport at 1.5 device scale, including fractional
+menu metrics. It requires the development dependencies and the relevant host:
+
+```sh
+python tools/check_visual.py --mode capture
+python tools/check_visual.py --mode check
+# Only after inspecting the captures and intended differences:
+python tools/check_visual.py --mode update
+```
+
+Use `--backend native` or `--backend web` to select one renderer. Captures,
+environment details and results go to `.build/visual`; a failed comparison
+adds the expected image and an amplified difference image. Every pixel must
+be within 8 channel levels of its reference (`--tolerance` adjusts this).
+The check refuses missing baselines or changed OS-family, renderer/browser,
+font, scale or viewport metadata. Baselines are platform-specific under
+`tests/visual_baselines`; the initial reviewed set is Windows/Direct3D11 and
+Chromium. Metadata does not identify GPU drivers or OS releases, so inspect
+differences after those changes too. A fresh baseline is never accepted
+automatically. `--baselines DIR` supports a separately reviewed environment.
+
+CI captures the scene and retains review artifacts on each native platform
+and in Chromium. Pixel gating remains an explicit check in a matching,
+reviewed environment instead of making unqualified cross-platform images
+equivalent. Keep this small matrix alongside the behavioral and incremental
+render-parity tests; do not replace those tests with screenshots.
+
 ## Format native terminal code
 
 With clang-format 19 or newer installed (`python -m pip install clang-format`

@@ -7,6 +7,7 @@ recursive-include examples *.py
 recursive-include docs *.md
 include docs/theme-families.png
 recursive-include tests *.py *.mjs *.txt
+recursive-include tests/visual_baselines *.png *.json *.md
 include tests/typing/pyrightconfig.json
 recursive-exclude src/pysual/bin *
 prune .build

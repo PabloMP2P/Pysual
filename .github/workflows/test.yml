@@ -87,6 +87,24 @@ jobs:
           else
             "${command[@]}"
           fi
+      - name: Capture native visual fixtures
+        if: matrix.python == '3.14'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            SDL_VIDEO_DRIVER=x11 LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a -s '-screen 0 1440x1080x24' python tools/check_visual.py --backend native --mode capture
+          else
+            python tools/check_visual.py --backend native --mode capture
+          fi
+      - name: Preserve native visual review artifacts
+        if: always() && matrix.python == '3.14'
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-native-${{ github.sha }}-${{ matrix.os }}-py${{ matrix.python }}
+          path: .build/visual/
+          retention-days: 14
+          if-no-files-found: ignore
+          include-hidden-files: true
       - name: Build native wheel
         if: matrix.python == '3.14'
         run: python -m pysual package --wheel
@@ -166,6 +184,17 @@ jobs:
         run: python tools/check_web.py
       - name: Check live Python applications in real Chromium
         run: python tools/check_web.py --mode live
+      - name: Capture Chromium visual fixtures
+        run: python tools/check_visual.py --backend web --mode capture
+      - name: Preserve Chromium visual review artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-web-${{ github.sha }}-ubuntu-py3.14
+          path: .build/visual/
+          retention-days: 14
+          if-no-files-found: ignore
+          include-hidden-files: true
       - name: Preserve browser failure diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
