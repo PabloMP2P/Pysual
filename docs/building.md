@@ -291,12 +291,19 @@ Use `--backend native` or `--backend web` to select one renderer. Captures,
 environment details and results go to `.build/visual`; a failed comparison
 adds the expected image and an amplified difference image. Every pixel must
 be within 8 channel levels of its reference (`--tolerance` adjusts this).
-The check refuses missing baselines or changed OS-family, renderer/browser,
-font, scale or viewport metadata. Baselines are platform-specific under
-`tests/visual_baselines`; the initial reviewed set is Windows/Direct3D11 and
-Chromium. Metadata does not identify GPU drivers or OS releases, so inspect
-differences after those changes too. A fresh baseline is never accepted
+The check refuses missing baselines or changed environment metadata. Baselines
+are platform-specific under `tests/visual_baselines`; the reviewed set is
+Windows/Direct3D11 and Chromium. Web captures explicitly use headless Chromium,
+SwiftShader, sRGB and grayscale text antialiasing, wait for the bundled font to
+load, and require identical consecutive frames. Their metadata records the OS
+build, Playwright/browser versions, launch arguments, rendering backend, font
+readiness, font hashes, scale and viewport. Native metadata still identifies
+the renderer and OS family rather than its GPU driver or OS build, so inspect
+native differences after those changes too. A fresh baseline is never accepted
 automatically. `--baselines DIR` supports a separately reviewed environment.
+
+Preserve the pixel tolerance when updating rendering conditions; review
+differences and verify repeated captures before accepting new images.
 
 CI captures the scene and retains review artifacts on each native platform
 and in Chromium. Pixel gating remains an explicit check in a matching,

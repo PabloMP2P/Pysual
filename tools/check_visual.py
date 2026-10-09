@@ -6,6 +6,7 @@ python tools/check_visual.py                # Compare; save useful failure diffs
 """
 import argparse
 import hashlib
+from importlib.metadata import version
 import io
 import json
 from pathlib import Path
@@ -27,6 +28,8 @@ from pysual import (
 THEMES = ("modern", "modern_dark", "macos")
 SIZE = (800, 560)
 SCALE = 1.5
+# Avoid hardware-driver and display subpixel settings in reviewed web pixels.
+WEB_ARGS = ("--use-angle=swiftshader", "--disable-lcd-text", "--force-color-profile=srgb")
 
 
 class VisualFixture(App):
@@ -104,7 +107,13 @@ def capture_web(browser, theme, path):
         page.goto(host.url)
         frame = page.locator("#frame")
         expect(frame).to_contain_text("October 2026")
-        page.evaluate("document.fonts.ready")
+        fonts = page.evaluate("""async () => {
+            await document.fonts.load('16px "Pysual Sans"');
+            await document.fonts.ready;
+            return [...document.fonts].map(font => ({family: font.family, status: font.status}));
+        }""")
+        assert any(font["family"].strip("'\"") == "Pysual Sans" and font["status"] == "loaded"
+                   for font in fonts), fonts
         previous = None
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
@@ -119,12 +128,28 @@ def capture_web(browser, theme, path):
             raise RuntimeError("Visual fixture did not settle")
         assert not errors, errors
         assert not app.resource_errors, app.resource_errors
-        return {"browser": browser.version, "scale": SCALE}
+        return {"browser": browser.version, "scale": SCALE, "font_faces": fonts}
     finally:
         try:
             close(app)
         finally:
             context.close()
+
+
+def web_environment(browser):
+    session = browser.new_browser_cdp_session()
+    try:
+        gpu = session.send("SystemInfo.getInfo")["gpu"]
+    finally:
+        session.detach()
+    attributes = gpu["auxAttributes"]
+    renderer = attributes.get("glRenderer", "")
+    if "SwiftShader" not in renderer:
+        raise RuntimeError(f"Visual baseline requires SwiftShader; got {renderer!r}")
+    return {"os_version": platform.version(), "playwright": version("playwright"),
+            "channel": "chromium", "headless": True, "launch_args": list(WEB_ARGS),
+            "renderer": renderer, "skia_backend": attributes.get("skiaBackendType"),
+            "rasterization": gpu["featureStatus"].get("rasterization")}
 
 
 def compare(actual, expected, difference, tolerance):
@@ -162,12 +187,14 @@ def main():
         if options.backend in ("web", "all"):
             from playwright.sync_api import sync_playwright
             playwright = sync_playwright().start()
-            browser = playwright.chromium.launch(channel="chromium")
+            browser = playwright.chromium.launch(channel="chromium", headless=True, args=list(WEB_ARGS))
         for backend in (("native", "web") if options.backend == "all" else (options.backend,)):
             output, baseline = options.output / backend, options.baselines / backend
             output.mkdir(parents=True, exist_ok=True)
             records = result["backends"][backend] = {}
             environment = {"platform": platform.system(), "size": list(SIZE), "fonts": fonts}
+            if backend == "web":
+                environment.update(web_environment(browser))
             for theme in THEMES:
                 for suffix in ("-diff.png", "-expected.png"):
                     (output / f"{theme}{suffix}").unlink(missing_ok=True)
