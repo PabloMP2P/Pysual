@@ -33,6 +33,16 @@ class ModalHost(RecordingHost):
 class WindowLifecycleTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.windows = []
+        self.consume_previous_failure()
+
+    def consume_previous_failure(self):
+        # Other lifecycle cases deliberately fail openings. Module diagnostics
+        # now outlive later openings, so consume them explicitly between tests.
+        self.assertFalse(call(lambda: bool(window_runtime._active)))
+        try:
+            wait_windows(0)
+        except BaseException:
+            pass
 
     def make(self, window_type=Window, **kwargs):
         window = window_type(**kwargs)
@@ -45,6 +55,7 @@ class WindowLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 await window.destroy_async()
             except BaseException:
                 pass
+        self.consume_previous_failure()
 
     async def test_run_returns_self_after_first_frame_and_script_can_read_write(self):
         owner_threads = []
@@ -552,6 +563,138 @@ class WindowLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(errors, [error, error])
         wait_windows(0)
         await wait_windows_async()
+
+    async def test_global_wait_retains_unobserved_failure_across_later_openings(self):
+        for asynchronous in (False, True):
+            with self.subTest(asynchronous=asynchronous):
+                first, second = self.make(), self.make()
+                error = RuntimeError("unobserved earlier failure")
+
+                def fail(event):
+                    raise error
+
+                first.loaded.connect(fail)
+                first.run(backend=RecordingHost())
+                with self.assertRaises(RuntimeError):
+                    await first.wait_async()
+                second.run(backend=RecordingHost())
+                # The earlier failure must not make a new wait return before
+                # this active period becomes idle, nor be consumed by timeout.
+                with self.assertRaises(TimeoutError):
+                    wait_windows(0)
+                second.close()
+                await second.wait_async()
+                with self.assertRaises(RuntimeError) as caught:
+                    if asynchronous:
+                        await wait_windows_async()
+                    else:
+                        wait_windows(0)
+                self.assertIs(caught.exception, error)
+                wait_windows(0)
+                await wait_windows_async()
+
+    async def test_delayed_global_wait_consumes_failure_carried_to_later_idle(self):
+        first, second = self.make(), self.make()
+        error = RuntimeError("earlier opening failed")
+
+        def fail(event):
+            raise error
+
+        first.loaded.connect(fail)
+        first.run(backend=RecordingHost())
+        old_idle = call(lambda: window_runtime._idle)
+        with self.assertRaises(RuntimeError):
+            await first.wait_async()
+        second.run(backend=RecordingHost())
+        second.close()
+        await second.wait_async()
+        with self.assertRaises(RuntimeError) as caught:
+            await window_runtime._wait_for_idle(old_idle)
+        self.assertIs(caught.exception, error)
+        await wait_windows_async()
+        wait_windows(0)
+
+    async def test_delayed_global_wait_keeps_new_active_period_failure(self):
+        first, second, third = self.make(), self.make(), self.make()
+        first_error = RuntimeError("earlier opening failed")
+        second_error = RuntimeError("new active period failed")
+        trigger = threading.Event()
+
+        def first_fail(event):
+            raise first_error
+
+        async def second_fail(event):
+            while not trigger.is_set():
+                await asyncio.sleep(0.001)
+            raise second_error
+
+        first.loaded.connect(first_fail)
+        first.run(backend=RecordingHost())
+        old_idle = call(lambda: window_runtime._idle)
+        with self.assertRaises(RuntimeError):
+            await first.wait_async()
+        second.loaded.connect(second_fail)
+        second.run(backend=RecordingHost())
+        third.run(backend=RecordingHost())
+        trigger.set()
+        with self.assertRaises(RuntimeError):
+            await second.wait_async()
+        with self.assertRaises(RuntimeError) as caught:
+            await window_runtime._wait_for_idle(old_idle)
+        self.assertIs(caught.exception, first_error)
+        with self.assertRaises(TimeoutError):
+            wait_windows(0)
+        third.close()
+        with self.assertRaises(RuntimeError) as caught:
+            await wait_windows_async()
+        self.assertIs(caught.exception, second_error)
+        wait_windows(0)
+
+    async def test_old_waiter_cannot_consume_new_occurrence_of_same_exception(self):
+        first, second = self.make(), self.make()
+        error = RuntimeError("reused exception")
+
+        def fail(event):
+            raise error
+
+        first.loaded.connect(fail)
+        first.run(backend=RecordingHost())
+        old_idle = call(lambda: window_runtime._idle)
+        with self.assertRaises(RuntimeError):
+            await wait_windows_async()
+        second.loaded.connect(fail)
+        second.run(backend=RecordingHost())
+        with self.assertRaises(RuntimeError):
+            await second.wait_async()
+        with self.assertRaises(RuntimeError):
+            await window_runtime._wait_for_idle(old_idle)
+        with self.assertRaises(RuntimeError) as caught:
+            await wait_windows_async()
+        self.assertIs(caught.exception, error)
+        wait_windows(0)
+
+    async def test_global_wait_retains_only_oldest_unobserved_idle_failure(self):
+        errors = [RuntimeError("first failure"), RuntimeError("later failure")]
+        windows = []
+        for error in errors:
+            window = self.make()
+            windows.append(window)
+
+            def fail(event):
+                raise error
+
+            window.loaded.connect(fail)
+            window.run(backend=RecordingHost())
+            with self.assertRaises(RuntimeError):
+                await window.wait_async()
+        with self.assertRaises(RuntimeError) as caught:
+            await wait_windows_async()
+        self.assertIs(caught.exception, errors[0])
+        wait_windows(0)
+        for window, error in zip(windows, errors):
+            with self.assertRaises(RuntimeError) as caught:
+                await window.wait_async()
+            self.assertIs(caught.exception, error)
 
     async def test_delayed_global_wait_failure_does_not_replace_new_active_period(self):
         first, second = self.make(), self.make()

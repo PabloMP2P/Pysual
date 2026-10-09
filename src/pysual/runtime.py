@@ -808,18 +808,29 @@ class Runtime:
             })
 
 
+@dataclass(eq=False)
+class _IdleFailure:
+    error: BaseException
+
+
+class _IdleFuture(Future[None]):
+    def __init__(self):
+        super().__init__()
+        self.failure: _IdleFailure | None = None
+
+
 _active: set[Runtime] = set()
-_idle: Future[None] = Future()
+_idle = _IdleFuture()
 _idle.set_result(None)
-_idle_error: BaseException | None = None
+_idle_error: _IdleFailure | None = None
+_active_error: _IdleFailure | None = None
 _hook_registered = False
 
 
 def _register(runtime):
-    global _idle, _idle_error, _hook_registered
+    global _idle, _hook_registered
     if not _active:
-        _idle = Future()
-        _idle_error = None
+        _idle = _IdleFuture()
     _active.add(runtime)
     if not _hook_registered:
         from .backends import shutdown_managed_hosts
@@ -834,13 +845,19 @@ def _register(runtime):
 
 
 def _unregister(runtime, error=None):
-    global _idle_error
+    global _idle_error, _active_error
     _active.discard(runtime)
-    if error is not None and _idle_error is None:
-        _idle_error = error
+    if error is not None and _active_error is None:
+        _active_error = _IdleFailure(error)
     if not _active and not _idle.done():
+        # Keep the oldest unobserved failure across openings, without retaining
+        # an unbounded history. A delayed waiter may have consumed it while this
+        # period was active; in that case report this period's first failure.
+        _idle_error = _idle_error or _active_error
+        _active_error = None
+        _idle.failure = _idle_error
         if _idle_error is not None:
-            _idle.set_exception(_idle_error)
+            _idle.set_exception(_idle_error.error)
         else:
             _idle.set_result(None)
 
@@ -967,8 +984,9 @@ def wait(timeout: float | None = None) -> None:
     """Wait until no windows are open, including openings added while waiting.
 
     Return None at the first idle point; return immediately when already idle.
-    A completed failure is reported to current waiters, then cleared for later
-    idle waits. Use app.wait() instead for one opening's persistent Outcome.
+    The oldest unobserved failure survives later openings and is reported at
+    idle, then cleared for later waits. Existing waiters keep their snapshot.
+    Use app.wait() instead for one opening's persistent Outcome.
     """
     ensure_wait_allowed()
     future = call(lambda: _idle)
@@ -984,12 +1002,17 @@ def wait(timeout: float | None = None) -> None:
 
 def _consume_idle_error(future):
     global _idle, _idle_error
+    failure = future.failure
+    # Compare occurrences, not exception identities: an application can raise
+    # the same exception object in more than one active period.
+    if _idle_error is not failure:
+        return
+    _idle_error = None
     # Existing waiters retain their snapshot. A delayed waiter from an earlier
-    # opening must not replace a new active period's completion future.
-    if _idle is future and not _active:
-        _idle = Future()
+    # opening can consume a carried failure, but must leave active waits intact.
+    if not _active and _idle.failure is failure:
+        _idle = _IdleFuture()
         _idle.set_result(None)
-        _idle_error = None
 
 
 def _idle_result(future, timeout=None):

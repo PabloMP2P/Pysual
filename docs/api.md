@@ -47,9 +47,14 @@ allows an async caller to wait. `ui.wait()` and `await ui.wait_async()` return t
 `Outcome` of that particular opening, with its `result` and closure `reason`.
 The module functions `pysual.wait()` and `await pysual.wait_async()` instead return
 `None` at the first point with no open windows, including windows added while
-waiting. A failed opening is reported to the waiters already waiting for that
-idle point, or to the next module wait if none were waiting. Once observed,
-that failure is cleared for later module waits; per-window outcomes are retained.
+waiting. The oldest unobserved failure survives later openings and is reported
+when a module wait reaches idle. Once observed, that failure is cleared for
+later module waits; waiters holding an earlier idle snapshot still receive its
+failure. Retention is bounded: each active period contributes its first failure,
+and an older unobserved failure takes precedence when that period becomes idle.
+Later failures remain available through their per-window outcomes. A delayed
+waiter can consume an older failure while a new period is active; in that case
+the new period reports its own first failure when it becomes idle.
 Module waits return immediately when already idle; they do not wait for future
 openings after that point. Opening waits for the first content frame or an
 actual startup error; slow construction does not expire under the ordinary UI
