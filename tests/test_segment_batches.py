@@ -11,6 +11,18 @@ from pysual.runtime import Runtime
 
 
 class SegmentBatchTests(unittest.TestCase):
+    def test_unchanged_runtime_scene_schedules_but_explicit_present_completes(self):
+        host = NativeHost()
+        host._request = Mock(return_value={})
+        host._scene_background = "#000000"
+        host.begin_scene("#000000")
+        host.end_scene()
+        host._request.assert_called_once_with("present", scheduled=True)
+        host._request.reset_mock()
+        host.begin_scene("#000000")
+        host.present()
+        host._request.assert_called_once_with("present", scheduled=False)
+
     def test_painter_offsets_batched_and_fallback_strokes_identically(self):
         segments = ((1, 2, 3, 4), (9, 8, 7, 6))
         expected = ((11, 22, 13, 24), (19, 28, 17, 26))

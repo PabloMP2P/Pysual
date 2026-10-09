@@ -306,7 +306,13 @@ static void process_command(Host *h, uint32_t id, const unsigned char *data, siz
         goto done;
     }
     if (!strcmp(op, "present")) {
-        int ok = h->has_scene && draw(h, error, sizeof(error));
+        int ok = h->has_scene;
+        if (ok) {
+            if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(j, "scheduled")))
+                h->needs_draw = 1;
+            else
+                ok = draw(h, error, sizeof(error));
+        }
         reply(h, id, NULL, ok ? NULL : (*error ? error : "Commit a scene before presenting"));
         goto done;
     }
@@ -522,9 +528,10 @@ static int wants_frame(Host *h) {
 
 static double frame_delay(Host *h) {
     double interval;
-    if (h->needs_draw)
+    if (h->last_frame == 0)
         return 0;
-    interval = h->continuous ? h->interval : 0;
+    /* Changes need not wait for a continuous replay, but share its FPS cap. */
+    interval = h->continuous && !h->needs_draw ? h->interval : 0;
     if (h->fps_limit > 0)
         interval = fmax(interval, 1 / h->fps_limit);
     return fmax(0, h->last_frame + interval - now_seconds());

@@ -270,7 +270,7 @@ class NativeHost(NativeServices):
         if order is not None:
             self._scene_pending["order"] = list(order)
         self._scene_pending["remove"] = list(remove)
-        self.present()
+        self._present(scheduled=True)
 
     def clip(self, rect):
         self._commands.append(["clip", _rect(rect)])
@@ -410,6 +410,9 @@ class NativeHost(NativeServices):
         ])
 
     def present(self):
+        self._present(scheduled=False)
+
+    def _present(self, *, scheduled):
         if self._scene_pending is None:
             self._request("frame", commands=self._commands, transition_seconds=self._transition_seconds)
             self._scene_background = None
@@ -420,9 +423,9 @@ class NativeHost(NativeServices):
                 self._request("patch", **pending, transition_seconds=self._transition_seconds)
                 self._scene_background = pending.get("background", self._scene_background)
             else:
-                # Explicit frame requests can present unchanged retained pixels
-                # without turning the scene into another update transaction.
-                self._request("present")
+                # Runtime repaints share the native cap; deliberate low-level
+                # presents still complete immediately without a scene update.
+                self._request("present", scheduled=scheduled)
             self._scene_pending = None
         self._transition_seconds = 0.0
 

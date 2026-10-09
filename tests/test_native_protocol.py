@@ -72,6 +72,44 @@ class NativeProtocolTests(unittest.TestCase):
         self.assertEqual(after["scene_updates"], before["scene_updates"])
         self.client.request("frame", commands=self.scene())
 
+    def test_scheduled_changes_and_replays_share_the_frame_cap(self):
+        for fps in (60, 120):
+            for continuous in (False, True):
+                with self.subTest(fps=fps, continuous=continuous):
+                    self.client.request("configure", continuous=continuous,
+                                        redraw_interval=0 if continuous else None,
+                                        fps_limit=fps, vsync=False)
+                    self.client.request("frame", commands=self.scene())
+                    time.sleep(.05)
+                    before = self.client.request("stats")
+                    deadline = time.monotonic() + .5
+                    updates = 0
+                    while time.monotonic() < deadline:
+                        commands = self.scene()
+                        commands[2][1] = f"Frame {updates}"
+                        self.client.request("frame", commands=commands)
+                        self.client.request("present", scheduled=True)
+                        updates += 1
+                        time.sleep(.002)
+                    after = self.client.request("stats")
+                    elapsed = after["elapsed_seconds"] - before["elapsed_seconds"]
+                    frames = after["frames"] - before["frames"]
+                    self.assertLessEqual(frames, fps * elapsed + 2)
+                    self.assertGreater(frames, 2)
+                    self.assertEqual(after["scene_updates"] - before["scene_updates"], updates)
+
+    def test_first_scene_and_explicit_present_do_not_wait_for_the_cap(self):
+        self.client.request("configure", redraw_interval=10, fps_limit=1)
+        self.client.request("frame", commands=self.scene())
+        first = self.wait_for_presentation(0)
+        self.client.request("frame", commands=self.finite_shape(.1))
+        self.client.request("present", scheduled=True)
+        pending = self.client.request("stats")
+        self.assertEqual(pending["frames"], first["frames"])
+        self.assertEqual(pending["scene_updates"], first["scene_updates"] + 1)
+        self.client.request("present")
+        self.assertEqual(self.client.request("stats")["frames"], first["frames"] + 1)
+
     def test_patch_timings_are_separate_from_cached_presentations(self):
         segment = dict(id="control", bounds=[10, 10, 100, 40],
             commands=[["rect", [10, 10, 100, 40], "#ff0000", 0, "", 0]])
@@ -81,7 +119,7 @@ class NativeProtocolTests(unittest.TestCase):
         self.client.request("stats", reset=True)
         segment["commands"][0][2] = "#0000ff"
         self.client.request("patch", upsert=[segment])
-        first = self.client.request("stats")
+        first = self.wait_for_presentation(self.client.request("stats")["frames"])
         time.sleep(.06)
         later = self.client.request("stats")
         self.assertGreater(later["frames"], first["frames"])
@@ -207,10 +245,10 @@ class NativeProtocolTests(unittest.TestCase):
                 before = self.client.request("stats")
                 self.client.request("frame", commands=self.finite_shape(.1))
                 first = self.wait_for_presentation(before["frames"])
-                self.assertTrue(first["animating"])
-                # At 4 FPS the next presentation is after the entire animation.
+                # A low cap may make the first draw the animation endpoint.
                 # Stats never forces a draw, unlike capture/present requests.
-                final = self.wait_for_presentation(first["frames"], settled=True)
+                final = (self.wait_for_presentation(first["frames"], settled=True)
+                         if first["animating"] else first)
                 self.assertEqual(final["scene_updates"], first["scene_updates"])
                 self.assert_presentations_idle(final)
 
@@ -223,13 +261,16 @@ class NativeProtocolTests(unittest.TestCase):
         commands[1][2] = "#ff0000"
         self.client.request("frame", commands=commands, transition_seconds=.1)
         first = self.wait_for_presentation(before["frames"])
-        self.assertTrue(first["animating"])
-        self.assertGreater(first["retained_scene_bytes"], before["retained_scene_bytes"])
-        final = self.wait_for_presentation(first["frames"], settled=True)
+        if first["animating"]:
+            self.assertGreater(first["retained_scene_bytes"], before["retained_scene_bytes"])
+        final = (self.wait_for_presentation(first["frames"], settled=True)
+                 if first["animating"] else first)
         self.assertEqual(final["retained_scene_bytes"], before["retained_scene_bytes"])
         self.assert_presentations_idle(final)
         self.client.request("frame", commands=self.scene(), transition_seconds=1)
         transitioning = self.wait_for_presentation(final["frames"])
+        self.assertTrue(transitioning["animating"])
+        self.assertGreater(transitioning["retained_scene_bytes"], before["retained_scene_bytes"])
         self.client.request("configure", reduce_motion=True)
         reduced = self.wait_for_presentation(transitioning["frames"], settled=True)
         self.assertEqual(reduced["retained_scene_bytes"], before["retained_scene_bytes"])
