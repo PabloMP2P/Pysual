@@ -1,4 +1,4 @@
-include README.md CONTRIBUTING.md LICENSE pyproject.toml setup.py .clang-format
+include README.md CONTRIBUTING.md CHANGELOG.md LICENSE pyproject.toml setup.py .clang-format
 recursive-include src/pysual *.py *.pyi *.typed *.js *.html *.ttf *LICENSE* *.txt *.json
 include src/pysual/web/notices/.gitattributes
 recursive-include native *.c *.h *LICENSE*

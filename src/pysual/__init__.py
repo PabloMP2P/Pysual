@@ -6,7 +6,7 @@ from ._engine import shutdown as shutdown
 from .runtime import wait as wait, wait_async as wait_async
 from .backends.terminal import terminal as terminal
 
-__version__ = "0.1.0a1"
+__version__ = "0.1.1"
 from .controls import (
     Button as Button,
     Container as Container,

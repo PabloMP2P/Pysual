@@ -16,8 +16,11 @@ the Python distribution builder. Application imports use `pysual`.
 
 Installing also provides the `pysual` command (`python -m pysual` is identical):
 `pysual build app.py --backend web|window|terminal` and `pysual run app.py …`
-work from any installation; `pysual native` and `pysual package` need the
-repository checkout because they compile `native/*.c` and package the sources.
+are available from any installation. Web and Python-terminal targets work from
+a pure-Python installation. Window and forced-C-terminal targets require a
+compatible native host; compiling a missing host requires the repository
+checkout. `pysual native` and `pysual package` also need the checkout because
+they compile `native/*.c` and package the sources.
 
 ## Choose a target
 
@@ -102,7 +105,7 @@ environment variable or the `TerminalHost(renderer=...)` constructor.
 | --- | --- |
 | `auto` (default) | Uses the C host when available and the Python renderer otherwise; compiling a terminal app does not require C. |
 | `python` | Uses the Python renderer and excludes the native host from the executable. |
-| `c` | Requires the C renderer; executable builds compile a terminal-only host if needed. |
+| `c` | Requires the C renderer; executable builds from a checkout compile a terminal-only host if needed. |
 
 An independent C terminal host can be built without SDL:
 
@@ -112,8 +115,9 @@ python -m pysual native --terminal-only
 
 That build supports terminal text and vector-to-cell drawing; image decoding
 requires the full SDL-enabled host. Building the full host again restores the
-window renderer. The window executable builder detects a terminal-only build
-and automatically replaces it with a full one.
+window renderer. In a checkout, the window executable builder detects a
+terminal-only build and automatically replaces it with a full one. An installed
+package instead needs a compatible full native host supplied beforehand.
 
 ## Executables
 
@@ -127,8 +131,10 @@ architecture of the build interpreter; it does not cross-compile. Build each
 platform's executable on that platform. Windows and macOS window builds suppress
 the console; terminal builds retain it.
 
-Window builds compile a missing native renderer. Native executables and shared
-libraries are registered as PyInstaller binaries, allowing dependency discovery
+Window builds from a checkout compile a missing native renderer. An installed
+pure wheel cannot compile one: use a compatible native wheel or build the host
+from a checkout first. Native executables and shared libraries are registered
+as PyInstaller binaries, allowing dependency discovery
 for DLLs, `.so` and `.dylib` files. Fonts and notices are packaged as data. Resolve
 missing-library warnings and verify a launch on a clean target machine before
 distribution. Signing, notarization and OS installer creation are separate

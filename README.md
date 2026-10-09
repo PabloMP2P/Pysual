@@ -4,7 +4,9 @@ Python interfaces for **Window**, **Terminal**, and **Web**.
 
 Assign controls, change their properties, and name event handlers. The same
 application runs in a native window, a terminal, or an SVG browser interface.
-Python 3.11+. MIT licensed. Developer alpha.
+Python 3.11+. MIT licensed. Early development; APIs may change.
+
+See the [0.1.1 release notes](CHANGELOG.md) for fixes and supported scope.
 
 ## Start in a browser
 
@@ -178,5 +180,5 @@ or npm project.
 
 Controls are custom drawn. OS accessibility bridges, complex-script shaping,
 full font fallback, mobile hosts, and OS-level modality between separate native
-processes are outside this alpha's supported scope. Real display, terminal,
+processes are outside this release's supported scope. Real display, terminal,
 clipboard, IME, and packaged-app behavior should be checked on the target system.
