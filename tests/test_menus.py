@@ -127,7 +127,15 @@ class MenuRuntimeTests(AsyncUIOwnerTestCase):
 
     async def inputs(self, *events):
         self.host.events.extend(events)
-        await asyncio.sleep(0.04)
+        await eventually(lambda: not self.host.events or self.task.done())
+        if self.task.done():
+            await self.task
+        await asyncio.wait_for(self.runtime.dispatcher.drain(), 2)
+        # Input handlers can invalidate layout after polling. Acknowledge their
+        # frame before reading header and popup geometry, even at a low FPS cap.
+        frames = self.host.frames
+        self.app.request_frame()
+        await eventually(lambda: self.host.frames > frames or self.task.done())
         if self.task.done():
             await self.task
         self.runtime.dispatcher.raise_errors()
@@ -159,6 +167,7 @@ class MenuRuntimeTests(AsyncUIOwnerTestCase):
         modal.destroy()
 
     async def test_open_menu_tracks_its_header_through_window_resize(self):
+        self.app.fps_limit = 10
         self.app.layout = "absolute"
         bar = self.app.bar
         bar.update(left=20, top=10, width=230, anchor="left,right,top",
