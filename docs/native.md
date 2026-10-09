@@ -11,13 +11,22 @@ Native window images accept local PNG files and `data:image/png;base64,...`
 sources. File content is copied into a buffer capped at 8 MiB; that same buffer
 is checked and decoded, so changing the file cannot bypass the header check.
 PNG dimensions are checked against the 32 MiB image budget before pixel
-decoding. Other formats, malformed images and oversized inputs produce a
+decoding, allowing eight bytes per pixel for 16-bit PNG channels. Actual decoded
+row storage and the renderer's selected texture format are checked too. Other
+formats, malformed images and oversized inputs produce a
 `resource_error` event and leave the window running; convert other image
 formats to PNG first. The window does not expose SDL_image's other decoders.
 These bounds cover image input, pixels and retained resources, not all decoder
 working memory or the helper's total memory. `native_stats()` includes
 `image_decode_attempts`, excluding inputs rejected before decoding. The web
 backend retains its separately documented image formats.
+
+Both C backends accept 16-bit PNG only with RGBA channels (PNG color type 6).
+Other 16-bit color modes are rejected before invoking the pinned decoder;
+convert those images to 8-bit PNG or 16-bit RGBA first. Existing PNG modes with
+at most 8-bit channels retain their decoder support. The C terminal also checks
+an input copy capped at 8 MiB and eight bytes per pixel for 16-bit RGBA before
+decoding, then converts accepted pixels to its 8-bit cell colors.
 
 ```python
 from pysual import App, Button, Label, terminal

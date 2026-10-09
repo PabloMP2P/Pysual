@@ -1027,21 +1027,39 @@ static void release_image(ImageResource *im) {
 /* Match the original PNG resource contract and reject oversized dimensions
    before the image decoder allocates the decompressed pixel buffer. */
 static SDL_Surface *load_bounded_png(SDL_IOStream *io) {
-    unsigned char h[24];
+    unsigned char *h;
     uint32_t width, height;
+    size_t size, pixel_bytes;
+    Sint64 length;
+    SDL_Surface *surface = NULL;
     if (!io)
         return NULL;
-    if (SDL_ReadIO(io, h, sizeof(h)) != sizeof(h) || memcmp(h, "\211PNG\r\n\032\n", 8) || memcmp(h + 12, "IHDR", 4)) {
+    length = SDL_GetIOSize(io);
+    if (length < 33 || length > PT_MAX_IMAGE_BYTES) {
         SDL_CloseIO(io);
         return NULL;
     }
+    /* Check and decode one bounded copy; a live file can change after a seek. */
+    h = (unsigned char *)malloc((size_t)length + 1);
+    size = h ? SDL_ReadIO(io, h, (size_t)length + 1) : 0;
+    SDL_CloseIO(io);
+    if (!h)
+        return NULL;
+    if (size != (size_t)length || memcmp(h, "\211PNG\r\n\032\n\0\0\0\rIHDR", 16) || (h[24] == 16 && h[25] != 6))
+        goto done;
     width = ((uint32_t)h[16] << 24) | ((uint32_t)h[17] << 16) | ((uint32_t)h[18] << 8) | h[19];
     height = ((uint32_t)h[20] << 24) | ((uint32_t)h[21] << 16) | ((uint32_t)h[22] << 8) | h[23];
-    if (!width || !height || width > 8u * 1024u * 1024u / height || SDL_SeekIO(io, 0, SDL_IO_SEEK_SET) < 0) {
+    pixel_bytes = h[24] == 16 ? 8 : 4;
+    if (!width || !height || width > PT_IMAGE_CACHE_BUDGET / pixel_bytes / height)
+        goto done;
+    io = SDL_IOFromConstMem(h, size);
+    if (io) {
+        surface = IMG_LoadPNG_IO(io);
         SDL_CloseIO(io);
-        return NULL;
     }
-    return IMG_Load_IO(io, true);
+done:
+    free(h);
+    return surface;
 }
 #endif
 static ImageResource *image_resource(PTBackend *r, const char *source) {
@@ -1112,7 +1130,7 @@ static ImageResource *image_resource(PTBackend *r, const char *source) {
                     SDL_CloseIO(io);
             }
         }
-        reason = "Terminal images require a valid bounded local image or PNG data URI";
+        reason = "Terminal images require bounded PNG data; 16-bit sources must use RGBA channels";
         if (raw && raw->w > 0 && raw->h > 0 && (size_t)raw->w * raw->h <= 8u * 1024u * 1024u)
             rgba = SDL_ConvertSurface(raw, SDL_PIXELFORMAT_RGBA32);
         if (rgba) {

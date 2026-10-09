@@ -327,6 +327,33 @@ class NativeTerminalTests(unittest.TestCase):
                                  (cached['image_count'], cached['image_bytes']))
         self.assertFalse(any(event.get('kind') == 'resource_error' for event in self.events))
 
+    def test_sixteen_bit_png_budget_and_supported_channels(self):
+        if not self.info.get('images', True):
+            self.skipTest('This host was built without PNG decoding')
+        from test_native_image_limits import solid_png
+        inputs = [solid_png(3000, 2000, bit_depth=16),
+                  solid_png(2, 1, bit_depth=16, color_type=0),
+                  solid_png(2, 1, bit_depth=16, color_type=2),
+                  solid_png(2, 1, bit_depth=16, color_type=4)]
+        for data in inputs:
+            self.events.clear()
+            self.client.request('frame', commands=[['begin', '#123456'],
+                                ['image', image_source(data), [0, 0, 16, 16], '#fff', 'stretch']])
+            self.client.request('present')
+            self.assertNotIn('▀', ''.join(self.client.request('snapshot')['rows_text']))
+            deadline = time.monotonic() + 2
+            while not any(event.get('kind') == 'resource_error' for event in self.events):
+                self.assertLess(time.monotonic(), deadline, self.events)
+                time.sleep(.005)
+            self.assertTrue(self.client.is_alive)
+        self.events.clear()
+        self.client.request('frame', commands=[['begin', '#123456'],
+                            ['image', image_source(solid_png(2, 1, bit_depth=16)),
+                             [0, 0, 16, 16], '#fff', 'stretch']])
+        self.client.request('present')
+        self.assertEqual(self.client.request('snapshot')['cells'][0]['foreground'], [255, 0, 0])
+        self.assertFalse(any(event.get('kind') == 'resource_error' for event in self.events))
+
     def test_valid_image_larger_than_cache_budget_is_drawn_without_retaining(self):
         if not self.info.get('images', True):
             self.skipTest('This host was built without PNG decoding')

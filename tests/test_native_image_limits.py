@@ -15,17 +15,24 @@ from test_native_window import bmp_pixels
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def solid_png(width, height):
+def solid_png(width, height, bit_depth=8, color_type=6):
     """Compress one row at a time; the test never allocates the decoded image."""
     def chunk(kind, data):
         return (struct.pack(">I", len(data)) + kind + data
                 + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff))
 
     compressor = zlib.compressobj()
-    row = b"\0" + b"\xff\0\0\xff" * width
+    pixel = b"\xff\xff\0\0\0\0\xff\xff" if bit_depth == 16 else b"\xff\0\0\xff"
+    if color_type == 0:
+        pixel = b"\xab\xcd" if bit_depth == 16 else b"\xab"
+    elif color_type == 2:
+        pixel = pixel[:6 if bit_depth == 16 else 3]
+    elif color_type == 4:
+        pixel = b"\xab\xcd\xff\xff" if bit_depth == 16 else b"\xab\xff"
+    row = b"\0" + pixel * width
     data = b"".join(compressor.compress(row) for _ in range(height)) + compressor.flush()
     return (b"\x89PNG\r\n\x1a\n"
-            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, bit_depth, color_type, 0, 0, 0))
             + chunk(b"IDAT", data) + chunk(b"IEND", b""))
 
 
@@ -64,9 +71,12 @@ class NativeImageLimits(unittest.TestCase):
         self.assertEqual(stats["image_decode_attempts"], before)
         self.assertEqual(stats["texture_entries"], 0)
         deadline = time.monotonic() + 2
-        while not self.events and time.monotonic() < deadline:
+        errors = []
+        while time.monotonic() < deadline:
+            errors = [event["text"] for event in self.events if event.get("kind") == "resource_error"]
+            if any(message in text for text in errors):
+                break
             time.sleep(.005)
-        errors = [event["text"] for event in self.events if event.get("kind") == "resource_error"]
         self.assertTrue(any(message in text for text in errors), errors)
         self.assertTrue(self.client.is_alive)
 
@@ -85,6 +95,42 @@ class NativeImageLimits(unittest.TestCase):
         for source in self.sources(data):
             with self.subTest(data_uri=source.startswith("data:")):
                 self.rejected(source, "encoded input exceeds 8 MiB")
+
+    def test_sixteen_bit_pixel_budget_is_checked_before_decode(self):
+        # 24 MiB at four bytes/pixel, but libpng preserves all 16-bit channels
+        # as a 48 MiB RGBA64 surface. The compressed input remains under 100 KiB.
+        data = solid_png(3000, 2000, bit_depth=16)
+        self.assertLess(len(data), 100_000)
+        for source in self.sources(data):
+            with self.subTest(data_uri=source.startswith("data:")):
+                self.rejected(source, "PNG dimensions exceed")
+
+    def test_bounded_sixteen_bit_png_renders_and_uses_resource_accounting(self):
+        width, height = 64, 32
+        data = solid_png(width, height, bit_depth=16)
+        output = self.directory / "sixteen-bit.bmp"
+        self.addCleanup(output.unlink, missing_ok=True)
+        for source in self.sources(data):
+            with self.subTest(data_uri=source.startswith("data:")):
+                before = self.client.request("stats")
+                stats = self.draw(source)
+                self.assertEqual(stats["image_decode_attempts"], before["image_decode_attempts"] + 1)
+                self.assertEqual(stats["texture_entries"], before["texture_entries"] + 1)
+                # Decoder/renderer formats vary: WIC can use RGBA32, whereas
+                # libpng can retain RGBA64 and the GPU can select another format.
+                self.assertGreaterEqual(stats["texture_bytes"] - before["texture_bytes"], width * height * 4)
+                self.assertLessEqual(stats["texture_bytes"], 32 * 1024 * 1024)
+                self.client.request("capture", path=str(output))
+                self.assertEqual(bmp_pixels(output)[8][8], (255, 0, 0))
+
+    def test_unverified_sixteen_bit_color_modes_are_rejected_before_decode(self):
+        # Two grayscale16 pixels occupy four decoded bytes, safely fitting an
+        # SDL padded row even if this regression were run against the old decoder.
+        for color_type in (0, 2, 4):
+            data = solid_png(2, 1, bit_depth=16, color_type=color_type)
+            for source in self.sources(data):
+                with self.subTest(color_type=color_type, data_uri=source.startswith("data:")):
+                    self.rejected(source, "16-bit PNG images require RGBA channels")
 
     def test_other_formats_are_rejected_by_content_and_png_extensions_are_not_required(self):
         # SDL_image can decode GIF, but the bounded native contract accepts PNG.

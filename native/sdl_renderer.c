@@ -335,28 +335,27 @@ static void cache_remove(PXRenderer *r, Texture *t) {
     free(t);
 }
 static Texture *cache_add(PXRenderer *r, const char *key, int kind, SDL_Surface *surface) {
-    size_t bytes, limit = kind == 1 ? 8u * 1024u * 1024u : PX_IMAGE_BUDGET;
+    size_t bytes, surface_bytes, texture_bytes, key_bytes = strlen(key) + 1,
+                                                limit = kind == 1 ? 8u * 1024u * 1024u : PX_IMAGE_BUDGET;
+    SDL_PixelFormat format;
+    unsigned int pixel_bytes;
     Texture *t, *old;
     if (!surface) {
         fail(r, "Create image/text surface");
         return NULL;
     }
-    bytes = (size_t)surface->w * (size_t)surface->h * 4 + strlen(key) + 1;
-    if (surface->w < 1 || surface->h < 1 || (size_t)surface->w * (size_t)surface->h > PX_MAX_TEXTURE_PIXELS ||
-        bytes > limit) {
+    if (surface->w < 1 || surface->h < 1 || surface->pitch < 1 || key_bytes > limit ||
+        (size_t)surface->w * (size_t)surface->h > PX_MAX_TEXTURE_PIXELS ||
+        (size_t)surface->pitch > (limit - key_bytes) / (size_t)surface->h ||
+        (size_t)surface->w > (limit - key_bytes) / 4 / (size_t)surface->h) {
         SDL_DestroySurface(surface);
         snprintf(r->error, sizeof(r->error), "Texture exceeds native resource budget");
         return NULL;
     }
-    while (r->cache_entries >= PX_CACHE_ENTRIES || r->cache_bytes[kind] + bytes > limit) {
-        old = NULL;
-        for (t = r->textures; t; t = t->next)
-            if ((r->cache_entries >= PX_CACHE_ENTRIES || t->kind == kind) && (!old || t->used < old->used))
-                old = t;
-        if (!old)
-            break;
-        cache_remove(r, old);
-    }
+    bytes = (size_t)surface->w * (size_t)surface->h * 4;
+    surface_bytes = (size_t)surface->pitch * (size_t)surface->h;
+    if (surface_bytes > bytes)
+        bytes = surface_bytes;
     t = (Texture *)calloc(1, sizeof(*t));
     if (!t) {
         SDL_DestroySurface(surface);
@@ -375,6 +374,25 @@ static Texture *cache_add(PXRenderer *r, const char *key, int kind, SDL_Surface 
         fail(r, "Upload texture");
         return NULL;
     }
+    /* SDL can choose a different, higher-precision texture format. Account for
+       its pixels as well as the decoded row storage, including row padding. */
+    format = (SDL_PixelFormat)SDL_GetNumberProperty(SDL_GetTextureProperties(t->texture),
+                                                    SDL_PROP_TEXTURE_FORMAT_NUMBER, SDL_PIXELFORMAT_UNKNOWN);
+    pixel_bytes = SDL_BYTESPERPIXEL(format);
+    if (!pixel_bytes && SDL_ISPIXELFORMAT_INDEXED(format))
+        pixel_bytes = 1; /* Packed indexed pixels remain covered by the RGBA32 floor. */
+    if (!pixel_bytes || SDL_ISPIXELFORMAT_FOURCC(format) ||
+        pixel_bytes > (limit - key_bytes) / (size_t)t->w / (size_t)t->h) {
+        SDL_DestroyTexture(t->texture);
+        free(t->key);
+        free(t);
+        snprintf(r->error, sizeof(r->error), "Texture exceeds native resource budget or has an unsupported format");
+        return NULL;
+    }
+    texture_bytes = (size_t)t->w * (size_t)t->h * pixel_bytes;
+    if (texture_bytes > bytes)
+        bytes = texture_bytes;
+    bytes += key_bytes;
     if (!SDL_SetTextureBlendMode(t->texture, SDL_BLENDMODE_BLEND) ||
         !SDL_SetTextureScaleMode(t->texture, SDL_SCALEMODE_LINEAR)) {
         SDL_DestroyTexture(t->texture);
@@ -382,6 +400,17 @@ static Texture *cache_add(PXRenderer *r, const char *key, int kind, SDL_Surface 
         free(t);
         fail(r, "Configure texture");
         return NULL;
+    }
+    while (r->cache_entries >= PX_CACHE_ENTRIES || r->cache_bytes[kind] + bytes > limit) {
+        Texture *candidate;
+        old = NULL;
+        for (candidate = r->textures; candidate; candidate = candidate->next)
+            if ((r->cache_entries >= PX_CACHE_ENTRIES || candidate->kind == kind) &&
+                (!old || candidate->used < old->used))
+                old = candidate;
+        if (!old)
+            break;
+        cache_remove(r, old);
     }
     t->bytes = bytes;
     t->kind = kind;
@@ -847,7 +876,7 @@ static unsigned char *decode_base64(const char *s, size_t *length) {
 }
 static SDL_Surface *bounded_image(PXRenderer *r, const char *source, size_t key_bytes) {
     unsigned char *bytes = NULL;
-    size_t size = 0;
+    size_t size = 0, pixel_bytes;
     uint32_t width, height;
     SDL_Surface *surface = NULL;
     SDL_IOStream *io;
@@ -889,9 +918,16 @@ static SDL_Surface *bounded_image(PXRenderer *r, const char *source, size_t key_
         snprintf(r->error, sizeof(r->error), "Native window images require PNG data");
         goto done;
     }
+    if (bytes[24] == 16 && bytes[25] != 6) {
+        snprintf(r->error, sizeof(r->error), "Native 16-bit PNG images require RGBA channels");
+        goto done;
+    }
     width = ((uint32_t)bytes[16] << 24) | ((uint32_t)bytes[17] << 16) | ((uint32_t)bytes[18] << 8) | bytes[19];
     height = ((uint32_t)bytes[20] << 24) | ((uint32_t)bytes[21] << 16) | ((uint32_t)bytes[22] << 8) | bytes[23];
-    if (!width || !height || width > (PX_IMAGE_BUDGET - key_bytes) / 4 / height) {
+    /* libpng preserves 16-bit RGBA channels. Other supported depths need at
+       most RGBA32 pixel storage. */
+    pixel_bytes = bytes[24] == 16 ? 8 : 4;
+    if (!width || !height || width > (PX_IMAGE_BUDGET - key_bytes) / pixel_bytes / height) {
         snprintf(r->error, sizeof(r->error), "PNG dimensions exceed the 32 MiB native image budget");
         goto done;
     }
