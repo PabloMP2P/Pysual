@@ -50,6 +50,16 @@ class _CalendarNavButton(Button):
     style_excludes: ClassVar[tuple[str, ...]] = ("Button",)
 
 
+class _CalendarEntry(TextBox):
+    """Keep the calendar in sync before queued text observers run."""
+
+    def _changed(self, field, old, value):
+        super()._changed(field, old, value)
+        editor = getattr(self, "_editor_content", None)
+        if field.name == "text" and editor is not None:
+            editor._sync_date(value)
+
+
 class _DayButton(Button):
     """A regular button with a selected surface and calendar key commands."""
 
@@ -118,8 +128,8 @@ class CalendarEditor(EditorContent):
         super().__init__(value, **properties)
 
     def build(self, value):
-        self.entry = TextBox(text=value, placeholder="YYYY-MM-DD", height=38,
-                             tooltip="Date (YYYY-MM-DD)")
+        self.entry = _CalendarEntry(text=value, placeholder="YYYY-MM-DD", height=38,
+                                    tooltip="Date (YYYY-MM-DD)")
         self._initial_text = value
         self.entry.select_all()
         self.header = Container(layout="stack", direction="horizontal", height=36, spacing=6)
@@ -141,6 +151,7 @@ class CalendarEditor(EditorContent):
             button._date_value = ""
             self._day_buttons.append(button)
         self._refresh()
+        self.entry._editor_content = self
 
     @property
     def displayed_month(self) -> tuple[int, int]:
@@ -169,9 +180,23 @@ class CalendarEditor(EditorContent):
             raise ValueError("Date is outside the calendar bounds")
         self._selected = selected
         self._untouched = False
+        self._view_year, self._view_month = selected.year, selected.month
         self.entry.load_text(value)
         self.entry.select_all()
-        self._view_year, self._view_month = selected.year, selected.month
+        self._refresh()
+
+    def _sync_date(self, text):
+        try:
+            selected = _iso_date(text)
+        except ValueError:
+            return
+        if not self._minimum <= selected <= self._maximum:
+            return
+        month = selected.year, selected.month
+        if selected == self._selected and month == (self._view_year, self._view_month):
+            return
+        self._selected = selected
+        self._view_year, self._view_month = month
         self._refresh()
 
     def navigate(self, months: int) -> None:

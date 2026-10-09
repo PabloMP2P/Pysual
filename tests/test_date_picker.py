@@ -95,12 +95,42 @@ class DateValueTests(UIOwnerTestCase):
 
     def test_reading_inline_typed_date_preserves_selection_and_undo(self):
         editor = self.keep(CalendarEditor("2024-02-28"))
+        self.assertTrue(editor.is_untouched())
         editor.entry.replace_selection("1990-10-07")
+        self.assertEqual(editor.displayed_month, (1990, 10))
+        self.assertEqual(editor.month_label.text, "October 1990")
+        self.assertTrue(day_button(editor, "1990-10-07").selected)
+        self.assertEqual(editor.entry.selection_range, (10, 10))
+        self.assertTrue(editor.entry.can_undo)
         before = editor.entry.selection_range, editor.entry.can_undo
         self.assertEqual(editor.read(), "1990-10-07")
         self.assertEqual((editor.entry.selection_range, editor.entry.can_undo), before)
         editor.entry.undo()
         self.assertEqual(editor.read(), "2024-02-28")
+        self.assertEqual(editor.displayed_month, (2024, 2))
+        self.assertTrue(day_button(editor, "2024-02-28").selected)
+        self.assertTrue(editor.is_untouched())
+        editor.entry.redo()
+        self.assertEqual(editor.displayed_month, (1990, 10))
+        self.assertTrue(day_button(editor, "1990-10-07").selected)
+
+    def test_partial_invalid_and_out_of_range_text_preserves_calendar_view(self):
+        editor = self.keep(CalendarEditor(
+            "2024-02-28", minimum="2024-01-01", maximum="2025-12-31",
+        ))
+        for text in ("2025-", "2025-02-30", "2026-01-01"):
+            with self.subTest(text=text):
+                editor.entry.select_all()
+                editor.entry.replace_selection(text)
+                self.assertEqual(editor.entry.text, text)
+                self.assertEqual(editor.displayed_month, (2024, 2))
+                self.assertTrue(day_button(editor, "2024-02-28").selected)
+                with self.assertRaises(ValueError):
+                    editor.read()
+        editor.entry.select_all()
+        editor.entry.replace_selection("2025-03-02")
+        self.assertEqual(editor.displayed_month, (2025, 3))
+        self.assertTrue(day_button(editor, "2025-03-02").selected)
 
     def test_read_only_and_disabled_still_allow_programmatic_updates(self):
         for properties in ({"read_only": True}, {"enabled": False}):
@@ -169,6 +199,24 @@ class DatePopupTests(AsyncUIOwnerTestCase):
         popup.content.entry.replace_selection("1980-01-01")
         popup.dismiss()
         self.assertEqual(self.picker.value, "1990-10-07")
+
+    async def test_typed_date_precedes_later_navigation_and_day_selection(self):
+        self.picker.open()
+        content = self.runtime.popup.content
+        content.entry.focus()
+        self.runtime.router.process(Input("text", text="2027-03-02", paste=True))
+        self.assertEqual(content.displayed_month, (2027, 3))
+        content.next_button.activate()
+        await self.runtime.dispatcher.drain()
+        self.assertEqual(content.displayed_month, (2027, 4))
+        self.assertEqual(content.read(), "2027-03-02")
+        content.entry.select_all()
+        self.runtime.router.process(Input("text", text="2028-05-03", paste=True))
+        day_button(content, "2028-05-04").activate()
+        await self.runtime.dispatcher.drain()
+        self.assertEqual(content.read(), "2028-05-04")
+        self.assertTrue(day_button(content, "2028-05-04").selected)
+        self.assertEqual(self.picker.value, "2024-02-28")
 
     async def test_direct_date_entry_rejects_invalid_and_changed_bounds_then_corrects(self):
         self.picker.open()
