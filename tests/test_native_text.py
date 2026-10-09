@@ -4,7 +4,7 @@ from pathlib import Path
 import unittest
 from uuid import uuid4
 
-from pysual import Rect
+from pysual import App, Label, Rect
 from pysual.backends._native_client import native_executable
 from pysual.backends.native import NativeHost
 from test_native_window import bmp_pixels
@@ -14,6 +14,26 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @unittest.skipUnless(native_executable().is_file(), "Build the native helper")
 class NativeTextFragmentTests(unittest.TestCase):
+    def test_long_zero_width_label_opens_and_closes_normally(self):
+        for length in (9000, 16000):
+            with self.subTest(length=length):
+                app = App(width=75, height=100, reduce_motion=True)
+                Label(parent=app, text="\u200b" * length + "abcde",
+                      font_size=15, width=35, height=30)
+                host = NativeHost(hidden=True, vsync=False)
+                opened = False
+                try:
+                    app.run(backend=host)
+                    opened = True
+                    self.assertTrue(app.is_open)
+                    self.assertGreaterEqual(app.frame_count, 1)
+                    app.close()
+                    self.assertEqual(app.wait(2).reason, "closed")
+                finally:
+                    app.destroy()
+                    if opened:
+                        app.wait(2)
+
     def test_visible_pixels_match_whole_line_at_left_middle_and_end(self):
         directory = ROOT / "work" / "text-fragments" / uuid4().hex
         directory.mkdir(parents=True)

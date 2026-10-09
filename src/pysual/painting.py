@@ -21,6 +21,32 @@ from .schema import Dirty, _LAYOUT_MASK, _VISUAL_MASK, _mask
 from .theme import Style
 
 
+_ELIDE_BATCH_ITEMS = 64
+_ELIDE_BATCH_BYTES = 1024 * 1024
+
+
+def _elide_widths(host, many, samples, size, mono):
+    """Keep prefix batches small even when most characters have no advance."""
+    batch, batch_bytes = [], 128  # Reserve the measurement request envelope.
+    for sample in samples:
+        # Six bytes per character covers JSON control escapes and UTF-8;
+        # the extra three account for string quotes and the array separator.
+        cost = len(sample) * 6 + 3
+        if batch and (len(batch) >= _ELIDE_BATCH_ITEMS
+                      or batch_bytes + cost > _ELIDE_BATCH_BYTES):
+            yield from (item[0] for item in many(batch, size, mono))
+            batch, batch_bytes = [], 128
+        if batch_bytes + cost > _ELIDE_BATCH_BYTES:
+            # A single long prefix can still be measured without multiplying
+            # its request size by the number of neighboring candidates.
+            yield host.measure(sample, size, mono)[0]
+        else:
+            batch.append(sample)
+            batch_bytes += cost
+    if batch:
+        yield from (item[0] for item in many(batch, size, mono))
+
+
 def _semantic_draw(host, operation, *args, **kwargs):
     """Dispatch an optional semantic host hook at the shared painter boundary."""
     hook = getattr(host, operation, None)
@@ -432,7 +458,7 @@ class Painter:
         # Batch short captions; longer captions need only the fitting interval.
         if len(text) <= 32:
             samples = ["…", *(text[:index] + "…" for index in range(len(text) + 1))]
-            widths = [item[0] for item in many(samples, size, mono)]
+            widths = list(_elide_widths(self.host, many, samples, size, mono))
             if widths[0] > width:
                 return ""
             best = 0
@@ -449,8 +475,8 @@ class Painter:
             step *= 2
         if probes[-1] != len(text):
             probes.append(len(text))
-        samples = ["…", *(text[:index] + "…" for index in probes)]
-        widths = [item[0] for item in many(samples, size, mono)]
+        samples = (text[:index] + "…" for index in (0, *probes))
+        widths = list(_elide_widths(self.host, many, samples, size, mono))
         if widths[0] > width:
             return ""
         fitted = 0
@@ -461,10 +487,19 @@ class Painter:
             else:
                 upper = probe
                 break
+        # Large fitting intervals must not expand into a quadratic collection
+        # of prefixes. Narrow them logarithmically before the final small batch.
+        while upper - fitted > 32:
+            middle = (fitted + upper) // 2
+            if self.host.measure(text[:middle] + "…", size, mono)[0] <= width:
+                fitted = middle
+            else:
+                upper = middle
         if upper - fitted <= 1:
             return text[:floor_boundary(text, fitted)] + "…"
         span = range(fitted + 1, upper + 1)
-        extra = [item[0] for item in many([text[:index] + "…" for index in span], size, mono)]
+        samples = (text[:index] + "…" for index in span)
+        extra = _elide_widths(self.host, many, samples, size, mono)
         best = fitted
         for index, sample in zip(span, extra):
             if sample <= width:

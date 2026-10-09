@@ -1,5 +1,6 @@
 """Fixed captions stay on one visual line without changing their source data."""
 
+import json
 import unittest
 
 from _ui_testcase import AsyncUIOwnerTestCase, UIOwnerTestCase
@@ -41,6 +42,39 @@ class BatchCaptionHost(SVGRenderer):
 
 
 class CaptionFittingTests(unittest.TestCase):
+    def test_zero_advance_prefixes_bound_batches_and_total_measurement_work(self):
+        class BudgetHost:
+            def __init__(self):
+                self.batches = []
+                self.characters = 0
+
+            def measure(self, text, size, mono=False):
+                self.characters += len(text)
+                return len(text.lstrip("\u200b\x01")) * 8, 16
+
+            def measure_many(self, texts, size, mono=False):
+                payload = json.dumps(
+                    {"op": "measure_many", "texts": texts, "size": size, "mono": mono},
+                    ensure_ascii=False, separators=(",", ":"),
+                ).encode("utf-8")
+                self.batches.append((len(texts), len(payload)))
+                return [self.measure(text, size, mono) for text in texts]
+
+        # Cover both failures seen with native captions, plus probes which are
+        # themselves too large to share a batch. Controls exercise JSON's
+        # six-byte escaping, not just the UTF-8 size of ordinary characters.
+        for marker in ("\u200b", "\x01"):
+            for length in (9000, 16000, 200000):
+                with self.subTest(marker=repr(marker), length=length):
+                    host = BudgetHost()
+                    painter = Painter(host, Rect(0, 0, 35, 30), dark())
+                    source = marker * length + "abcde"
+                    self.assertEqual(painter.elide(source, 35), marker * length + "abc…")
+                    self.assertTrue(host.batches)
+                    self.assertTrue(all(count <= 64 and size <= 1024 * 1024
+                                        for count, size in host.batches), host.batches)
+                    self.assertLess(host.characters, len(source) * 80)
+
     def test_nonpositive_width_skips_metrics_but_keeps_font_validation(self):
         for batched in (False, True):
             host = BatchCaptionHost()
