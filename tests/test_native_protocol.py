@@ -1,4 +1,5 @@
 """Actual C process checks; never substitutes a Python renderer."""
+import json
 import os
 from pathlib import Path
 import sys
@@ -188,6 +189,40 @@ class NativeProtocolTests(unittest.TestCase):
         with self.assertRaises(NativeHostError):
             self.client.request("not_an_operation")
         self.assertIn("frames", self.client.request("stats"))
+
+    def test_animation_metadata_is_closed_and_rejection_preserves_both_scene_forms(self):
+        animation = {"property": "x", "from": 10, "to": 10, "duration": 1, "loop": False}
+        shape = ["animated_rect", [10, 10, 20, 20], "#ff0000", 0, "", 0, animation]
+        for operation in ("frame", "patch"):
+            def arguments(command):
+                if operation == "frame":
+                    return {"commands": [["begin", "#000000"], command]}
+                return {"upsert": [dict(id="shape", bounds=[10, 10, 20, 20], commands=[command])],
+                        "order": ["shape"], "background": "#000000"}
+
+            # Normal animation dictionaries remain repeatable retained commands.
+            self.client.request(operation, **arguments(shape))
+            self.client.request(operation, **arguments(shape))
+            before = self.client.request("stats")
+            for fields in ({"extra": None}, {"extra": 1}, {"extra": {"nested": {"value": 1}}},
+                           {"loop": {"nested": 1}}):
+                with self.subTest(operation=operation, fields=fields):
+                    invalid = [*shape[:-1], {**animation, **fields}]
+                    with self.assertRaises(NativeHostError):
+                        self.client.request(operation, **arguments(invalid))
+                    after = self.client.request("stats")
+                    for key in ("scene_updates", "retained_scene_bytes", "command_count", "segment_count"):
+                        self.assertEqual(after[key], before[key], key)
+            # JSON permits duplicate keys. A second nested loop member must not
+            # evade validation because the first loop member is a valid boolean.
+            payload = json.dumps({"op": operation, **arguments(
+                [*shape[:-1], {**animation, "extra": {"nested": 1}}])})
+            payload = payload.replace('"extra":', '"loop":').encode("utf-8")
+            with self.assertRaises(NativeHostError):
+                self.client._request(9, payload, timeout=5)
+            self.assertEqual(self.client.request("stats")["scene_updates"], before["scene_updates"])
+            self.client.request("present")
+            self.assertTrue(self.client.is_alive)
 
     def test_measure_many_matches_single_measures_and_rejects_an_oversized_batch(self):
         single = self.client.request("measure", text="café λ", size=16, mono=False)

@@ -4,6 +4,7 @@ These launch the native executable but never attach or modify a user's console.
 They compare complete cells, not only printable rows or FPS.
 """
 from dataclasses import asdict
+import json
 import os
 from pathlib import Path
 import random
@@ -16,7 +17,7 @@ from uuid import uuid4
 from pysual import Rect, Style
 from pysual._png import encode_png
 from pysual.image_resources import image_source
-from pysual.backends._native_client import NativeClient, NativeHostError
+from pysual.backends._native_client import MAX_PAYLOAD, NativeClient, NativeHostError
 from pysual.backends._term_cells import Cell, CellRenderer, safe_text, text_cells
 from pysual.backends._term_input import TerminalInput
 from pysual.backends.term_text import _ICON_GLYPHS
@@ -469,6 +470,32 @@ class NativeTerminalTests(unittest.TestCase):
             self.assertEqual(self.client.request('snapshot'), before)
         self.compare(valid)
 
+    def test_nested_metadata_and_ignored_argument_types_are_rejected_atomically(self):
+        valid = [['begin', '#123456'], ['text', 'Kept', 0, 0, '#fff', 16, False]]
+        before = self.compare(valid)
+        nested = {'nested': {'value': 1}}
+        invalid = [
+            ['styled_rect', [0, 0, 16, 16], {'extra': nested}],
+            ['styled_rect', [0, 0, 16, 16], {'extra': None}],
+            ['styled_rect', [0, 0, 16, 16], {'font_size': nested}],
+            ['styled_rect', [0, 0, 16, 16], {}, nested],
+            ['marker', [0, 0, 16, 16], {}, 'square', True, nested],
+            ['text', 'Bad', 0, 0, '#fff', 16, nested],
+            ['image', 'unused.png', [0, 0, 16, 16], nested, 'stretch'],
+            ['image', 'unused.png', [0, 0, 16, 16], '#fff', nested],
+            ['image_nine', 'unused.png', [0, 0, 16, 16], [0, 0, 0, 0], nested],
+        ]
+        for command in invalid:
+            for operation, arguments in (
+                ('frame', {'commands': [command]}),
+                ('patch', {'upsert': [self.segment('bad', [command])]}),
+            ):
+                with self.subTest(operation=operation, command=command):
+                    with self.assertRaises(NativeHostError):
+                        self.client.request(operation, **arguments)
+                    self.assertEqual(self.client.request('snapshot'), before)
+                    self.assertTrue(self.client.is_alive)
+
     def test_ansi_unchanged_frames_modes_and_control_sanitization(self):
         commands = [['begin', '#123456'], ['text', 'A\x1b[99mB\x07中', 0, 0, '#abcdef', 16, False], ['caret', 0, 0, 16, '#fff']]
         self.compare(commands)
@@ -519,6 +546,46 @@ class NativeTerminalTests(unittest.TestCase):
         self.assertEqual(len(self.events), 1)
         self.assertEqual(self.events[0]['kind'], 'error')
         self.assertIn('4096', self.events[0]['text'])
+
+    def paste(self, raw):
+        # Hex input represents embedded NULs and avoids applying JSON escaping
+        # to the incoming bytes. Fragmentation also exercises console buffering.
+        self.client.request('feed_input', data='\x1b[200~')
+        for start in range(0, len(raw), 1024 * 1024):
+            self.client.request('feed_input', hex=raw[start:start + 1024 * 1024].hex())
+        self.client.request('feed_input', data='\x1b[201~')
+        deadline = time.monotonic() + 5
+        while not self.events and time.monotonic() < deadline:
+            time.sleep(.005)
+        self.assertTrue(self.events, 'No terminal paste result arrived')
+
+    def test_large_tab_and_newline_paste_uses_compact_escapes(self):
+        self.compare([['begin', '#123456']])
+        text = '\t\n' * (3 * 1024 * 1024 // 2)
+        self.paste(text.encode())
+        self.assertEqual(self.events, [{'kind': 'text', 'text': text, 'paste': True}])
+        self.assertTrue(self.client.is_alive)
+        self.assertIn('frames', self.client.request('stats'))
+
+    def test_encoded_paste_boundary_rejects_only_the_oversized_paste(self):
+        before = self.compare([['begin', '#123456'], ['text', 'Kept', 0, 0, '#fff', 16, False]])
+        overhead = len(json.dumps({'kind': 'text', 'text': '', 'paste': True}, separators=(',', ':')))
+        # NUL must retain its six-byte JSON escape. Check both sides of the
+        # actual outgoing frame boundary without exceeding the 8 MiB raw cap.
+        maximum = (MAX_PAYLOAD - overhead) // 6
+        self.paste(b'\0' * maximum)
+        self.assertEqual(self.events, [{'kind': 'text', 'text': '\0' * maximum, 'paste': True}])
+        self.events.clear()
+        self.paste(b'\0' * (maximum + 1))
+        self.assertEqual(len(self.events), 1)
+        self.assertEqual(self.events[0]['kind'], 'resource_error')
+        self.assertIn('16 MiB event budget', self.events[0]['text'])
+        self.assertTrue(self.client.is_alive)
+        self.assertEqual(self.client.request('snapshot'), before)
+        self.events.clear()
+        self.paste(b'Next paste')
+        self.assertEqual(self.events, [{'kind': 'text', 'text': 'Next paste', 'paste': True}])
+        self.assertIn('frames', self.client.request('stats'))
 
     def test_continuous_c_replay_does_not_require_python_frame_requests(self):
         self.compare([['begin', '#123'], ['text', 'Native cells', 0, 0, '#fff', 16, False]])

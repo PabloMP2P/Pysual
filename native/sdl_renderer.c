@@ -6,6 +6,7 @@
 #include <SDL3_image/SDL_image.h>
 #include "px_backend.h"
 #include "clipboard.h"
+#include "command_schema.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1667,7 +1668,7 @@ static int valid_style(const cJSON *j) {
                             "bevel_light",   "bevel_dark", "highlight", "inner_border", "glow",
                             "pattern_color", "shadow",     NULL};
     int i;
-    if (!cJSON_IsObject(j))
+    if (!px_style_members(j))
         return 0;
     for (i = 0; colors[i]; ++i)
         if (!valid_color(get(j, colors[i]), 1))
@@ -1790,10 +1791,12 @@ static int validate_command(const cJSON *c) {
                floor(number(at(c, 3), 0)) == number(at(c, 3), 0) && floor(number(at(c, 4), 0)) == number(at(c, 4), 0) &&
                floor(number(at(c, 5), 0)) == number(at(c, 5), 0);
     if (strcmp(op, "animated_rect") == 0) {
+        static const char *const names[] = {"property", "from", "to", "duration", "loop", "yoyo"};
         const cJSON *a = at(c, 6);
         const char *property = string(get(a, "property"), "");
         return n == 7 && valid_box(at(c, 1), 0) && valid_color(at(c, 2), 1) && valid_number(at(c, 3), 0, 1000000) &&
-               valid_color(at(c, 4), 1) && valid_number(at(c, 5), 0, 1000000) && cJSON_IsObject(a) &&
+               valid_color(at(c, 4), 1) && valid_number(at(c, 5), 0, 1000000) &&
+               px_scalar_members(a, names, sizeof(names) / sizeof(names[0])) &&
                (!strcmp(property, "x") || !strcmp(property, "y") || !strcmp(property, "opacity")) &&
                valid_number(get(a, "from"), -1000000, 1000000) && valid_number(get(a, "to"), -1000000, 1000000) &&
                valid_number(get(a, "duration"), .001, 86400) && (!get(a, "loop") || cJSON_IsBool(get(a, "loop"))) &&

@@ -3,6 +3,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #define _POSIX_C_SOURCE 200809L
 #include "px_backend.h"
+#include "command_schema.h"
 #include "pt_unicode.h"
 #include <ctype.h>
 #include <errno.h>
@@ -1353,7 +1354,7 @@ static int style_valid(const cJSON *s) {
                                         "inner_border", "glow",        "pattern_color", "shadow"};
     size_t i;
     Color ink;
-    if (!cJSON_IsObject(s))
+    if (!px_style_members(s))
         return 0;
     for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         const cJSON *v = item(s, names[i]);
@@ -1361,6 +1362,10 @@ static int style_valid(const cJSON *s) {
             return 0;
     }
     return 1;
+}
+static int optional_rect(const cJSON *value) {
+    Rect rect;
+    return !value || cJSON_IsNull(value) || (rect_value(value, &rect) && rect.w >= 0 && rect.h >= 0);
 }
 static int command(PTBackend *r, Frame *f, const cJSON *c) {
     const char *name;
@@ -1394,7 +1399,7 @@ static int command(PTBackend *r, Frame *f, const cJSON *c) {
                   num(arg(c, 5), 1));
     } else if (!strcmp(name, "text")) {
         if (n != 7 || !cJSON_IsString(arg(c, 1)) || !numbers(c, 2, 3) || !color(str(arg(c, 4), NULL), &a) ||
-            !cJSON_IsNumber(arg(c, 5)))
+            !cJSON_IsNumber(arg(c, 5)) || !cJSON_IsBool(arg(c, 6)))
             return 0;
         draw_text(f, arg(c, 1)->valuestring, num(arg(c, 2), 0), num(arg(c, 3), 0), a);
     } else if (!strcmp(name, "line")) {
@@ -1423,13 +1428,14 @@ static int command(PTBackend *r, Frame *f, const cJSON *c) {
             return 0;
         gradient_rect(f, rect, a, b, !strcmp(axis, "horizontal"), num(arg(c, 5), 0), num(arg(c, 6), 0));
     } else if (!strcmp(name, "styled_rect")) {
-        if ((n != 3 && n != 4) || !rect_value(arg(c, 1), &rect) || !style_valid(arg(c, 2)))
+        if ((n != 3 && n != 4) || !rect_value(arg(c, 1), &rect) || !style_valid(arg(c, 2)) || !optional_rect(arg(c, 3)))
             return 0;
         styled_rect(f, rect, arg(c, 2));
     } else if (!strcmp(name, "marker")) {
         const char *shape = str(arg(c, 3), "");
         if ((n != 5 && n != 6) || !rect_value(arg(c, 1), &rect) || !style_valid(arg(c, 2)) ||
-            (strcmp(shape, "square") && strcmp(shape, "circle")) || !cJSON_IsBool(arg(c, 4)))
+            (strcmp(shape, "square") && strcmp(shape, "circle")) || !cJSON_IsBool(arg(c, 4)) ||
+            !optional_rect(arg(c, 5)))
             return 0;
         marker(f, rect, arg(c, 2), shape, cJSON_IsTrue(arg(c, 4)));
     } else if (!strcmp(name, "focus_ring")) {
@@ -1450,6 +1456,7 @@ static int command(PTBackend *r, Frame *f, const cJSON *c) {
         int nine = !strcmp(name, "image_nine");
         const char *fit = nine ? "stretch" : str(arg(c, 4), "stretch");
         if (n != 5 || !cJSON_IsString(arg(c, 1)) || !rect_value(arg(c, 2), &rect) ||
+            !cJSON_IsString(arg(c, nine ? 4 : 3)) || (!nine && !cJSON_IsString(arg(c, 4))) ||
             !color(str(arg(c, nine ? 4 : 3), "#ffffff"), &a))
             return 0;
         if (nine) {
@@ -2039,6 +2046,65 @@ static void text_event(PTBackend *r, const char *text, int paste) {
             cJSON_AddBoolToObject(e, "paste", 1);
     }
 }
+static void paste_event(PTBackend *r) {
+    /* Reserve the complete event envelope, including the JSON string's quotes.
+       Raw JSON preserves embedded NULs that cJSON strings cannot represent. */
+    const size_t content_budget = PX_MAX_PAYLOAD - (sizeof("{\"kind\":\"text\",\"text\":\"\",\"paste\":true}") - 1);
+    const char *at = r->paste.data ? r->paste.data : "", *end = at + r->paste.size;
+    Buffer normalized = {0};
+    cJSON *value, *e;
+    size_t content_size = 0;
+    int oversized = 0;
+    if (r->paste.failed) {
+        resource_error(r, "Cannot allocate terminal paste");
+        return;
+    }
+    emit(&normalized, "\"");
+    while (at < end && !normalized.failed) {
+        uint32_t cp;
+        char encoded[12];
+        size_t size;
+        if (!*at) {
+            cp = 0;
+            at++;
+        } else
+            cp = decode(&at);
+        if (cp == '\r') {
+            cp = '\n';
+            if (at < end && *at == '\n')
+                at++;
+        }
+        if (cp == '\b' || cp == '\f' || cp == '\n' || cp == '\t' || cp == '"' || cp == '\\') {
+            encoded[0] = '\\';
+            encoded[1] = cp == '\b' ? 'b' : cp == '\f' ? 'f' : cp == '\n' ? 'n' : cp == '\t' ? 't' : (char)cp;
+            size = 2;
+        } else if (cp < 32) {
+            snprintf(encoded, sizeof(encoded), "\\u%04x", (unsigned)cp);
+            size = 6;
+        } else
+            size = (size_t)encode(cp, encoded);
+        if (size > content_budget - content_size) {
+            oversized = 1;
+            break;
+        }
+        append(&normalized, encoded, size);
+        content_size += size;
+    }
+    emit(&normalized, "\"");
+    if (oversized)
+        resource_error(r, "Terminal paste exceeds the 16 MiB event budget after JSON escaping");
+    else if (normalized.failed || !(value = cJSON_CreateRaw(normalized.data)))
+        resource_error(r, "Cannot allocate terminal paste");
+    else {
+        e = event(r, "text");
+        if (e) {
+            cJSON_AddItemToObject(e, "text", value);
+            cJSON_AddBoolToObject(e, "paste", 1);
+        } else
+            cJSON_Delete(value);
+    }
+    free(normalized.data);
+}
 static const char *key_name(uint32_t code) {
     switch (code) {
     case 8:
@@ -2368,43 +2434,8 @@ static void parse_input(PTBackend *r, int flush) {
             consume_input(r, 6);
             if (r->paste_overflow)
                 resource_error(r, "Terminal paste exceeds 8 MiB");
-            else {
-                Buffer normalized = {0};
-                const char *at = r->paste.data, *paste_end = at + r->paste.size;
-                cJSON *e;
-                emit(&normalized, "\"");
-                while (at < paste_end) {
-                    uint32_t cp;
-                    char encoded[12];
-                    if (!*at) {
-                        cp = 0;
-                        at++;
-                    } else
-                        cp = decode(&at);
-                    if (cp == 13) {
-                        cp = 10;
-                        if (at < paste_end && *at == 10)
-                            at++;
-                    }
-                    if (cp < 32) {
-                        snprintf(encoded, sizeof(encoded), "\\u%04x", (unsigned)cp);
-                        emit(&normalized, encoded);
-                    } else if (cp == '"' || cp == '\\') {
-                        char quoted[2] = {'\\', (char)cp};
-                        append(&normalized, quoted, 2);
-                    } else {
-                        int encoded_size = encode(cp, encoded);
-                        append(&normalized, encoded, (size_t)encoded_size);
-                    }
-                }
-                emit(&normalized, "\"");
-                e = event(r, "text");
-                if (e) {
-                    cJSON_AddItemToObject(e, "text", cJSON_CreateRaw(normalized.data ? normalized.data : "\"\""));
-                    cJSON_AddBoolToObject(e, "paste", 1);
-                }
-                free(normalized.data);
-            }
+            else
+                paste_event(r);
             free(r->paste.data);
             memset(&r->paste, 0, sizeof(r->paste));
             r->in_paste = r->paste_overflow = 0;
