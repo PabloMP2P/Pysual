@@ -35,7 +35,7 @@ export function createBrowserServices({
     const message = document.createElement("p"); panel.append(message);
     const actions = document.createElement("div"); actions.className = "actions";
     const cleanups = [];
-    let settled = false;
+    let settled = false, committing = false, cancelButton;
     const isActive = () => !settled && !signal.aborted && isOpen();
     const finish = (value, error) => {
       if (settled) return;
@@ -46,9 +46,16 @@ export function createBrowserServices({
       restoreFocus();
       error ? reject(error) : resolve(value);
     };
-    const cancelled = () => finish(null, new Error("Browser operation cancelled"));
+    const cancel = error => { if (!committing) finish(null, error); };
+    const cancelled = () => cancel(new Error("Browser operation cancelled"));
     signal.addEventListener("abort", cancelled, {once: true});
-    panel.addEventListener("cancel", event => { event.preventDefault(); finish(null); });
+    panel.addEventListener("cancel", event => { event.preventDefault(); cancel(); });
+    const beginCommit = () => {
+      // Closing a writable stream may replace the destination asynchronously.
+      // From this point only its actual outcome can settle the operation.
+      committing = true;
+      cancelButton.disabled = true;
+    };
     const button = (label, callback) => {
       const element = document.createElement("button");
       element.textContent = label;
@@ -57,8 +64,8 @@ export function createBrowserServices({
       return element;
     };
     try {
-      setup({panel, message, actions, button, finish, cleanups, isActive});
-      button("Cancel", () => finish(null));
+      setup({panel, message, actions, button, finish, cleanups, isActive, beginCommit});
+      cancelButton = button("Cancel", () => cancel());
       panel.append(actions); document.body.append(panel); panel.showModal();
     } catch (error) { finish(null, error); }
   });
@@ -151,14 +158,14 @@ export function createBrowserServices({
       }, signal);
     },
     async saveTextFile(text, name, signal) {
-      return await dialog("Save a text file", ({panel, message, actions, button, finish, cleanups, isActive}) => {
+      return await dialog("Save a text file", ({panel, message, actions, button, finish, cleanups, isActive, beginCommit}) => {
         message.textContent = "Choose a destination for your document.";
         if (window.showSaveFilePicker) {
           let busy = false;
           const choose = button("Choose destination", async () => {
             if (busy || !isActive()) return;
             busy = true; choose.disabled = true;
-            let stream = null;
+            let stream = null, committing = false;
             try {
               const handle = await window.showSaveFilePicker({suggestedName: name});
               if (!isActive()) return;
@@ -166,14 +173,17 @@ export function createBrowserServices({
               if (!isActive()) { await stream.abort(); stream = null; return; }
               await stream.write(text);
               if (!isActive()) { await stream.abort(); stream = null; return; }
+              beginCommit(); committing = true;
+              message.textContent = "Saving the file…";
               await stream.close(); stream = null;
-              if (isActive()) finish(handle.name);
+              finish(handle.name);
             } catch (error) {
               if (stream) {
                 try { await stream.abort(); }
                 catch (_) { /* Preserve the original write error. */ }
               }
-              if (isActive() && error.name !== "AbortError")
+              if (committing) finish(null, error);
+              else if (isActive() && error.name !== "AbortError")
                 message.textContent = `Save failed: ${error.message}`;
             } finally {
               busy = false;

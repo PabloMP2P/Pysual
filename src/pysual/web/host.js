@@ -303,15 +303,24 @@ export function createHost(surface) {
       serviceOperations.set(operation, controller);
       sessionSignal.addEventListener("abort", close, {once: true});
       let cancel;
-      const cancelled = new Promise((resolve, reject) => {
-        cancel = () => sessionSignal.aborted ? resolve(null) : reject(new Error("Browser operation cancelled"));
-        signal.addEventListener("abort", cancel, {once: true});
-      });
       try {
+        if (name === "saveTextFile") {
+          // The file service owns cancellation until its irreversible commit.
+          // Racing the signal here would hide a successful late close().
+          try { return await service(...args, signal); }
+          catch (error) {
+            if (sessionSignal.aborted && error.message === "Browser operation cancelled") return null;
+            throw error;
+          }
+        }
+        const cancelled = new Promise((resolve, reject) => {
+          cancel = () => sessionSignal.aborted ? resolve(null) : reject(new Error("Browser operation cancelled"));
+          signal.addEventListener("abort", cancel, {once: true});
+        });
         return await Promise.race([service(...args, signal), cancelled]);
       } finally {
         sessionSignal.removeEventListener("abort", close);
-        signal.removeEventListener("abort", cancel);
+        if (cancel) signal.removeEventListener("abort", cancel);
         if (serviceOperations.get(operation) === controller) serviceOperations.delete(operation);
       }
     };

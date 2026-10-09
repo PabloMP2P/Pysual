@@ -76,6 +76,12 @@ namespaces; live delivery uses the native session store. File saving and draft
 recovery remain distinct operations. Keep application work cooperative so it
 does not block Python input handlers.
 
+When the save picker provides a writable file, Cancel remains available while
+choosing and preparing the write. Once the final file commit starts, the dialog
+waits for its success or failure and disables Cancel; a completed commit is
+reported as saved. Closing the browser or cancelling the Python caller cannot
+undo a commit that has already started.
+
 Native sprite and property-animation clocks are window-host capabilities.
 Applications should check capabilities before relying on them. SVG output is
 not an operating-system accessibility bridge, and complex-script/IME behavior

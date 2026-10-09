@@ -533,6 +533,27 @@ test('cancel during write aborts the stream before commit', async t => {
   assert.equal(commits, 0); assert.equal(aborts, 1);
 });
 
+for (const cancellation of ['operation', 'shutdown']) {
+  test(`${cancellation} during file close preserves the committed outcome`, async t => {
+    const f = fixture(t), closing = deferred(), started = deferred();
+    let settled = false, aborts = 0;
+    f.win.showSaveFilePicker = async () => ({name: 'saved.txt', createWritable: async () => ({
+      write: async () => {},
+      close: () => { started.resolve(); return closing.promise; },
+      abort: async () => { aborts++; },
+    })});
+    const operation = f.host.saveTextFile('snapshot', 'saved.txt', 99);
+    operation.finally(() => { settled = true; });
+    f.button('Choose destination').click(); await started.promise;
+    if (cancellation === 'operation') f.host.cancelOperation(99);
+    else f.host.close();
+    await tick(); assert.equal(settled, false);
+    closing.resolve();
+    assert.equal(await operation, 'saved.txt');
+    assert.equal(aborts, 0); assert.equal(f.dialog(), undefined);
+  });
+}
+
 test('repeated destination actions create one save and preserve successful output', async t => {
   const f = fixture(t), picker = deferred(); let pickers = 0; const written = [];
   f.win.showSaveFilePicker = () => { pickers++; return picker.promise; };
