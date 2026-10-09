@@ -7,6 +7,18 @@ drawing segments, text and image resources, damage repaint, style transitions,
 sprite animation and presentation. Each window has its own helper process, so
 SDL runs on its actual main thread and can present while Python is busy.
 
+Native window images accept local PNG files and `data:image/png;base64,...`
+sources. File content is copied into a buffer capped at 8 MiB; that same buffer
+is checked and decoded, so changing the file cannot bypass the header check.
+PNG dimensions are checked against the 32 MiB image budget before pixel
+decoding. Other formats, malformed images and oversized inputs produce a
+`resource_error` event and leave the window running; convert other image
+formats to PNG first. The window does not expose SDL_image's other decoders.
+These bounds cover image input, pixels and retained resources, not all decoder
+working memory or the helper's total memory. `native_stats()` includes
+`image_decode_attempts`, excluding inputs rejected before decoding. The web
+backend retains its separately documented image formats.
+
 ```python
 from pysual import App, Button, Label, terminal
 

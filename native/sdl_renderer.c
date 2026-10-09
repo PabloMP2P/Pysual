@@ -14,6 +14,8 @@
 
 #define PX_MAX_COMMANDS 200000
 #define PX_MAX_TEXTURE_PIXELS (16u * 1024u * 1024u)
+#define PX_MAX_IMAGE_BYTES (8u * 1024u * 1024u)
+#define PX_IMAGE_BUDGET (32u * 1024u * 1024u)
 #define PX_MAX_STRING (16u * 1024u * 1024u)
 #define PX_CACHE_ENTRIES 512
 #define PX_TEXTURE_BUCKETS 1024
@@ -107,7 +109,7 @@ struct PXRenderer {
     Texture *buckets[PX_TEXTURE_BUCKETS];
     SDL_Texture *scene_cache;
     size_t scene_cache_bytes;
-    uint64_t scene_cache_hits;
+    uint64_t scene_cache_hits, image_decode_attempts;
     int cache_scene, scene_cache_valid;
     size_t cache_bytes[5];
     unsigned int cache_entries;
@@ -333,7 +335,7 @@ static void cache_remove(PXRenderer *r, Texture *t) {
     free(t);
 }
 static Texture *cache_add(PXRenderer *r, const char *key, int kind, SDL_Surface *surface) {
-    size_t bytes, limit = kind == 1 ? 8u * 1024u * 1024u : 32u * 1024u * 1024u;
+    size_t bytes, limit = kind == 1 ? 8u * 1024u * 1024u : PX_IMAGE_BUDGET;
     Texture *t, *old;
     if (!surface) {
         fail(r, "Create image/text surface");
@@ -807,7 +809,7 @@ static unsigned char *decode_base64(const char *s, size_t *length) {
     size_t n = strlen(s), out = 0, i;
     unsigned char *data;
     unsigned int accumulator = 0, bits = 0;
-    if (n > 32u * 1024u * 1024u || n % 4)
+    if (n > 4u * ((PX_MAX_IMAGE_BYTES + 2u) / 3u) || n % 4)
         return NULL;
     data = (unsigned char *)malloc(n / 4 * 3 + 1);
     if (!data)
@@ -842,6 +844,68 @@ static unsigned char *decode_base64(const char *s, size_t *length) {
     }
     *length = out;
     return data;
+}
+static SDL_Surface *bounded_image(PXRenderer *r, const char *source, size_t key_bytes) {
+    unsigned char *bytes = NULL;
+    size_t size = 0;
+    uint32_t width, height;
+    SDL_Surface *surface = NULL;
+    SDL_IOStream *io;
+    if (!strncmp(source, "data:image/png;base64,", 22)) {
+        bytes = decode_base64(source + 22, &size);
+        if (!bytes) {
+            snprintf(r->error, sizeof(r->error), "Invalid PNG data URI or encoded input exceeds 8 MiB");
+            return NULL;
+        }
+    } else {
+        Sint64 length;
+        io = SDL_IOFromFile(source, "rb");
+        if (!io) {
+            fail(r, "Open PNG image");
+            return NULL;
+        }
+        length = SDL_GetIOSize(io);
+        if (length < 0 || length > PX_MAX_IMAGE_BYTES) {
+            SDL_CloseIO(io);
+            snprintf(r->error, sizeof(r->error), "PNG encoded input exceeds 8 MiB or has unknown size");
+            return NULL;
+        }
+        /* Decode the exact bounded bytes inspected below, even if the file changes. */
+        bytes = (unsigned char *)malloc((size_t)length + 1);
+        if (bytes)
+            size = SDL_ReadIO(io, bytes, (size_t)length + 1);
+        SDL_CloseIO(io);
+        if (!bytes || size != (size_t)length) {
+            free(bytes);
+            snprintf(r->error, sizeof(r->error), "Cannot read a stable bounded PNG image");
+            return NULL;
+        }
+    }
+    if (size > PX_MAX_IMAGE_BYTES) {
+        snprintf(r->error, sizeof(r->error), "PNG encoded input exceeds 8 MiB");
+        goto done;
+    }
+    if (size < 33 || memcmp(bytes, "\211PNG\r\n\032\n\0\0\0\rIHDR", 16)) {
+        snprintf(r->error, sizeof(r->error), "Native window images require PNG data");
+        goto done;
+    }
+    width = ((uint32_t)bytes[16] << 24) | ((uint32_t)bytes[17] << 16) | ((uint32_t)bytes[18] << 8) | bytes[19];
+    height = ((uint32_t)bytes[20] << 24) | ((uint32_t)bytes[21] << 16) | ((uint32_t)bytes[22] << 8) | bytes[23];
+    if (!width || !height || width > (PX_IMAGE_BUDGET - key_bytes) / 4 / height) {
+        snprintf(r->error, sizeof(r->error), "PNG dimensions exceed the 32 MiB native image budget");
+        goto done;
+    }
+    io = SDL_IOFromConstMem(bytes, size);
+    if (io) {
+        ++r->image_decode_attempts;
+        surface = IMG_LoadPNG_IO(io);
+        SDL_CloseIO(io);
+    }
+    if (!surface)
+        fail(r, "Decode PNG image");
+done:
+    free(bytes);
+    return surface;
 }
 static void image_key(const char *source, char key[80]) {
     const unsigned char *p = (const unsigned char *)source;
@@ -899,20 +963,11 @@ static Texture *image_texture(PXRenderer *r, const char *source) {
             r->failed_used[i] = ++r->clock;
             return NULL;
         }
-    if (strncmp(source, "data:image/png;base64,", 22) == 0) {
-        size_t n = 0;
-        unsigned char *bytes = decode_base64(source + 22, &n);
-        SDL_IOStream *io;
-        if (!bytes) {
-            snprintf(r->error, sizeof(r->error), "Invalid PNG data URI");
-            image_failed(r, key);
-            return NULL;
-        }
-        io = SDL_IOFromConstMem(bytes, n);
-        surface = io ? IMG_Load_IO(io, true) : NULL;
-        free(bytes);
-    } else
-        surface = IMG_Load(source);
+    surface = bounded_image(r, source, strlen(key) + 1);
+    if (!surface) {
+        image_failed(r, key);
+        return NULL;
+    }
     t = cache_add(r, key, 2, surface);
     if (!t)
         image_failed(r, key);
@@ -2301,6 +2356,7 @@ void px_renderer_reset_stats(PXRenderer *r) {
     r->commands_touched = r->commands_replayed = r->segments_updated = r->segments_removed = 0;
     r->scene_patch_updates = r->last_commands_touched = r->last_commands_replayed = r->scene_cache_hits = 0;
     r->segments_tested = r->last_segments_tested = r->animation_segments_tested = r->unchanged_segments = 0;
+    r->image_decode_attempts = 0;
 }
 void px_renderer_last_work(PXRenderer *r, uint64_t *touched, uint64_t *replayed) {
     if (touched)
@@ -2994,6 +3050,7 @@ cJSON *px_renderer_info(PXRenderer *r) {
                           (SDL_GetWindowFlags(r->window) & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED)) == 0);
     cJSON_AddBoolToObject(j, "animating", px_renderer_animating(r));
     cJSON_AddNumberToObject(j, "texture_entries", r->cache_entries);
+    cJSON_AddNumberToObject(j, "image_decode_attempts", (double)r->image_decode_attempts);
     cJSON_AddNumberToObject(
         j, "texture_bytes",
         (double)(r->cache_bytes[0] + r->cache_bytes[1] + r->cache_bytes[2] + r->cache_bytes[3] + r->cache_bytes[4]));
