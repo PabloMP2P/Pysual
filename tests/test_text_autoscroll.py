@@ -80,13 +80,17 @@ class TextSelectionScrollTests(AsyncUIOwnerTestCase):
                 area = super()._text_viewport()
                 return Rect(area.x, area.y, max(0, area.width - 40), area.height)
 
+        self.app.fps_limit = 10
         self.entry.destroy()
         self.entry = ReservedEntry(parent=self.parent, left=20, top=20, width=260,
                                    height=40, text="word " * 100)
         self.entry.load_text(self.entry.text)
-        await asyncio.sleep(.03)
+        # The replacement has no hit geometry until a frame arranges it. A
+        # fixed sleep can expire before that frame, especially on a busy host.
+        await eventually(lambda: self.entry.bounds.width == 260)
         box = self.entry.bounds
         self.send("pointer_down", box.x + self.entry._text_viewport().right + 5, box.y + 20)
+        self.assertIs(self.runtime.router.capture, self.entry)
         anchor = self.entry._anchor
         await eventually(lambda: self.entry._caret > anchor)
         self.assertEqual(self.entry._anchor, anchor)

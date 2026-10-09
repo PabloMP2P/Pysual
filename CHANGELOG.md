@@ -12,6 +12,8 @@ Unicode text editing, retained rendering, and executable/HTML build tools.
   budget, and encode common control characters compactly.
 - Bound caption measurement work so long Unicode labels do not exceed native
   batch or transport limits.
+- Preserve text-selection autoscroll when rendering is delayed or the frame
+  rate is low.
 - Validate default numeric grid formatting before accepting rows and edits.
 - Isolate chart axis formatting from an application's Decimal precision and
   exception traps.

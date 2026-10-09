@@ -829,9 +829,13 @@ class TextBox(Control):
                     x=max(self._rect.x - 16, min(event.x, self._rect.x + area.right + 16)),
                     y=(self._rect.y - self._line_height() if event.y < self._rect.y else
                        min(event.y, self._rect.y + area.bottom + self._line_height())))
+                reveal_pending = self._reveal_after_paint and runtime.router.focus is self
                 before = self._scroll, self._scroll_x, self._caret
                 self.handle_input(event)
-                if before == (self._scroll, self._scroll_x, self._caret):
+                # Horizontal reveal is completed by paint. A tick can precede
+                # that frame when rendering is capped or the host is busy;
+                # unchanged coordinates then do not mean the gesture is done.
+                if before == (self._scroll, self._scroll_x, self._caret) and not reveal_pending:
                     break
         finally:
             if self._selection_token is token:
