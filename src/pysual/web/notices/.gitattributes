@@ -1,0 +1,3 @@
+# Preserve the exact upstream notice bytes recorded in manifest.json.
+*.txt -text
+manifest.json text eol=lf

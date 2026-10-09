@@ -52,7 +52,7 @@ include = ["pysual", "pysual.*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-pysual = ["py.typed", "*.pyi", "assets/*", "bin/*", "web/*.js", "web/*.html", "web/notices/*.txt"]
+pysual = ["py.typed", "*.pyi", "assets/*", "bin/*", "web/*.js", "web/*.html", "web/notices/*.txt", "web/notices/manifest.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]

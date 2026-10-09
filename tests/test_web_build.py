@@ -1,10 +1,12 @@
 """Offline SVG bundles preserve Python, assets, notices and atomic publication."""
 
 import base64
+import hashlib
 import io
 import json
 from pathlib import Path
 import re
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -67,6 +69,38 @@ class WebBuildTests(unittest.TestCase):
             first = self.output.read_bytes()
             build_web(self.script, self.output, self.runtime)
         self.assertEqual(self.output.read_bytes(), first)
+
+    def test_complete_runtime_notice_inventory_is_in_html_and_zip(self):
+        build_web(self.script, self.output, self.runtime)
+        page = self.output.read_text(encoding="utf-8")
+        notices = re.search(r'<script id="pysual-notices" type="text/plain">(.*?)</script>',
+                            page, re.S).group(1)
+        # The compiled _random module's notice must accompany the interpreter.
+        for text in ("Makoto Matsumoto", "Takuji Nishimura", "Redistributions in binary form",
+                     "Emscripten authors", "HACL* Contributors"):
+            self.assertIn(text, notices)
+        payload = json.loads(re.search(
+            r'<script id="pysual-bundle" type="application/json">(.*?)</script>', page, re.S).group(1))
+        with zipfile.ZipFile(io.BytesIO(base64.b64decode(payload["files"]["pysual.zip"]))) as archive:
+            prefix = "pysual/web/notices/"
+            manifest = json.loads(archive.read(prefix + "manifest.json"))
+            self.assertEqual(manifest["pyodide_version"], PYODIDE_VERSION)
+            for name, entry in manifest["files"].items():
+                data = archive.read(prefix + name)
+                self.assertEqual(hashlib.sha256(data).hexdigest(), entry["sha256"])
+                self.assertIn(data.decode("utf-8"), notices)
+
+    def test_truncated_runtime_notice_preserves_existing_output(self):
+        import pysual.bundle as bundle
+
+        package = self.root / "package"
+        shutil.copytree(Path(bundle.__file__).parent / "web/notices", package / "web/notices")
+        (package / "web/notices/CPython-LICENSE.txt").write_text("truncated license")
+        self.output.write_bytes(b"previous publication")
+        with patch.object(bundle, "__file__", str(package / "bundle.py")):
+            with self.assertRaisesRegex(ValueError, "notice checksum mismatch"):
+                build_web(self.script, self.output, self.runtime)
+        self.assertEqual(self.output.read_bytes(), b"previous publication")
 
     def test_failed_validation_preserves_existing_output(self):
         self.output.write_text("old artifact")

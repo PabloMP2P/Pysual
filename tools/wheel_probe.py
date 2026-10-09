@@ -32,7 +32,15 @@ def main(kind):
     assert any(path.name.endswith(".ttf") for path in root.joinpath("assets").iterdir())
     for name in ("host.js", "input.js", "services.js", "standalone.js", "svg.js", "live.html"):
         assert root.joinpath("web", name).read_bytes(), name
-    assert root.joinpath("web", "notices", "Pyodide-LICENSE.txt").read_bytes()
+    from pysual.bundle import PYODIDE_VERSION
+
+    runtime_notices = json.loads(root.joinpath("web", "notices", "manifest.json").read_text())
+    assert runtime_notices["pyodide_version"] == PYODIDE_VERSION
+    for name, entry in runtime_notices["files"].items():
+        data = root.joinpath("web", "notices", name).read_bytes()
+        assert hashlib.sha256(data).hexdigest() == entry["sha256"], name
+    assert "Makoto Matsumoto" in root.joinpath("web", "notices", "CPython-LICENSE.txt").read_text()
+    print(json.dumps({"runtime_notices_verified": sorted(runtime_notices["files"])}), flush=True)
     helper = native_executable()
     assert helper.is_file() == (kind == "native"), helper
     if kind == "native":

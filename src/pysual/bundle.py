@@ -92,6 +92,20 @@ def _zip_file(archive, name: str, data: bytes):
     archive.writestr(info, data, compresslevel=9)
 
 
+def _runtime_notices(package: Path) -> str:
+    directory = package / "web" / "notices"
+    manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+    if manifest["pyodide_version"] != PYODIDE_VERSION:
+        raise ValueError("Runtime notice inventory does not match the pinned Pyodide version")
+    texts = [(directory / "WEB-NOTICES.txt").read_text(encoding="utf-8")]
+    for name, entry in sorted(manifest["files"].items()):
+        data = (directory / name).read_bytes()
+        if hashlib.sha256(data).hexdigest() != entry["sha256"]:
+            raise ValueError(f"Runtime notice checksum mismatch: {name}")
+        texts.append(data.decode("utf-8"))
+    return "\n\n".join(texts)
+
+
 def build_web(script: Path, output: Path, runtime: Path | None = None, *, includes=()) -> Path:
     """Embed the entry script and optional relative files into a self-contained HTML.
 
@@ -109,6 +123,7 @@ def build_web(script: Path, output: Path, runtime: Path | None = None, *, includ
     if output.is_relative_to(runtime):
         raise ValueError("Web output must be outside the runtime directory")
     package = Path(__file__).parent
+    notices = _runtime_notices(package)
     entries = {"app.py": script.read_bytes()}
     for item in includes:
         _, paths = include_files(script.parent, item, output)
@@ -149,8 +164,6 @@ def build_web(script: Path, output: Path, runtime: Path | None = None, *, includ
         name: base64.b64encode(data).decode("ascii") for name, data in sorted(files.items())
     }}, separators=(",", ":")).replace("<", "\\u003c")
     bootstrap = (package / "web" / "standalone.js").read_text(encoding="utf-8")
-    notice_names = ("WEB-NOTICES.txt", "Pyodide-LICENSE.txt", "CPython-LICENSE.txt")
-    notices = "\n\n".join((package / "web" / "notices" / name).read_text(encoding="utf-8") for name in notice_names)
     notices += "\n\n" + (package / "assets" / "DejaVu-LICENSE.txt").read_text(encoding="utf-8")
     notices += "\n\n" + (package / "assets" / "UNICODE-LICENSE.txt").read_text(encoding="utf-8")
     if "PYSUAL-LICENSE.txt" in entries:
