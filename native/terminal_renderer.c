@@ -2986,10 +2986,40 @@ static cJSON *rgb(Color c) {
     cJSON_AddItemToArray(a, cJSON_CreateNumber(c.b));
     return a;
 }
-static cJSON *snapshot(PTBackend *r) {
+static int snapshot_fits(const Frame *f) {
+    /* Include the reply envelope, dimensions, row quotes/commas and the largest
+       fixed cell fields. Every escaped text byte occurs in both cells and rows. */
+    const size_t cell_bytes = sizeof("{\"text\":\"\",\"foreground\":[255,255,255],\"background\":[255,255,255],"
+                                     "\"width\":2,\"underline\":false},") -
+                              1;
+    size_t i, count, bytes;
+    if (!f)
+        return 1;
+    count = (size_t)f->cols * f->rows;
+    bytes = 128 + (size_t)f->rows * 3 + count * cell_bytes;
+    if (bytes > PX_MAX_PAYLOAD)
+        return 0;
+    for (i = 0; i < count; ++i) {
+        const unsigned char *p = (const unsigned char *)f->cells[i].text;
+        for (; *p; ++p) {
+            bytes += 2 * (*p < 32 ? 6 : *p == '"' || *p == '\\' ? 2 : 1);
+            if (bytes > PX_MAX_PAYLOAD)
+                return 0;
+        }
+    }
+    return 1;
+}
+static cJSON *snapshot(PTBackend *r, char *error, int error_size) {
     Frame *f = r->current;
-    cJSON *j = cJSON_CreateObject(), *cells = cJSON_CreateArray(), *rows = cJSON_CreateArray();
+    cJSON *j, *cells, *rows;
     int x, y;
+    if (!snapshot_fits(f)) {
+        fail(error, error_size, "Terminal snapshot exceeds the 16 MiB reply budget; use a smaller viewport");
+        return NULL;
+    }
+    j = cJSON_CreateObject();
+    cells = cJSON_CreateArray();
+    rows = cJSON_CreateArray();
     cJSON_AddNumberToObject(j, "columns", r->cols);
     cJSON_AddNumberToObject(j, "rows", r->rows);
     cJSON_AddItemToObject(j, "cells", cells);
@@ -3092,7 +3122,7 @@ cJSON *pt_call(PTBackend *r, const cJSON *request, char *error, int error_size) 
         return array;
     }
     if (!strcmp(op, "snapshot"))
-        return snapshot(r);
+        return snapshot(r, error, error_size);
     if (!strcmp(op, "info"))
         return pt_info(r);
     if (!strcmp(op, "frame") || !strcmp(op, "ansi")) {

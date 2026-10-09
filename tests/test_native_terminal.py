@@ -63,6 +63,39 @@ class NativeTerminalTests(unittest.TestCase):
             width=320, height=192, hidden=True, headless=True, color='truecolor', scale=1)
         self.cols, self.rows = 40, 12
 
+    def assert_snapshot_rejection_preserves_session(self):
+        before = self.client.request('stats')
+        with self.assertRaisesRegex(NativeHostError, 'snapshot exceeds the 16 MiB reply budget'):
+            self.client.request('snapshot')
+        after = self.client.request('stats')
+        self.assertEqual(after['scene_updates'], before['scene_updates'])
+        self.assertTrue(self.client.is_alive)
+        self.client.request('configure', columns=40, rows=12)
+        self.client.request('frame', commands=[['begin', '#123456'],
+                            ['text', 'Still alive: "café" \\', 0, 0, '#fff', 16, False]])
+        self.client.request('present')
+        snapshot = self.client.request('snapshot')
+        self.assertEqual(len(snapshot['cells']), 480)
+        self.assertTrue(snapshot['rows_text'][0].startswith('Still alive: "café" \\'))
+
+    def test_large_snapshot_is_rejected_without_disconnect_or_scene_mutation(self):
+        # The viewport is valid for rendering but its cell objects exceed one reply.
+        self.client.request('configure', columns=512, rows=384)
+        self.client.request('frame', commands=[['begin', '#ffffff']])
+        self.client.request('present')
+        self.assert_snapshot_rejection_preserves_session()
+
+    def test_snapshot_budget_counts_utf8_text_in_cells_and_rows(self):
+        # This smaller grid fits with ordinary text. A 64-codepoint grapheme
+        # repeated in every cell exceeds the reply budget when included twice.
+        self.client.request('configure', columns=256, rows=256)
+        cluster = 'a' + '\u0301' * 63
+        text = '\n'.join([cluster * 256] * 256)
+        self.client.request('frame', commands=[['begin', '#ffffff'],
+                            ['text', text, 0, 0, '#000', 16, False]])
+        self.client.request('present')
+        self.assert_snapshot_rejection_preserves_session()
+
     def test_capture_preserves_unicode_directory_and_filename(self):
         directory = ROOT / 'work' / 'terminal-captures' / ('résumé-' + uuid4().hex)
         directory.mkdir(parents=True)

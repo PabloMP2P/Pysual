@@ -135,6 +135,11 @@ measure completed presentation calls, not physical monitor refreshes.
 driver-dependent hidden-window backbuffer contents. `terminal(hidden=True)`
 uses deterministic cells without touching the caller's console; `snapshot()`
 returns rows and complete cell metadata for either implementation.
+The C renderer preflights snapshots against its 16 MiB reply budget, including
+UTF-8 text in both the cells and rows. A snapshot too large for one reply raises
+`NativeHostError` without changing the scene or closing the host; reduce the
+headless viewport before requesting another snapshot. Rendering may support a
+larger grid than can be returned in one snapshot.
 
 ## Verification boundary
 
