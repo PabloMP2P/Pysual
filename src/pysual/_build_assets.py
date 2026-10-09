@@ -16,7 +16,7 @@ def _checked_path(root: Path, path: Path):
     resolved = path.resolve(strict=True)
     if not resolved.is_relative_to(root):
         raise ValueError(f"Included files must be inside the application directory: {path}")
-    return path.lstat()
+    return path.lstat(), resolved
 
 
 def include_files(root: Path, item, output: Path):
@@ -30,13 +30,15 @@ def include_files(root: Path, item, output: Path):
         raise ValueError("Included files must be inside the application directory, using relative paths")
     candidate = root / relative
     try:
-        info = _checked_path(root, candidate)
-        if output == candidate or stat.S_ISDIR(info.st_mode) and output.is_relative_to(candidate):
+        info, resolved = _checked_path(root, candidate)
+        # Windows accepts aliases such as a trailing dot or an 8.3 short name.
+        # Compare canonical paths only after checking lexical redirect parents.
+        if output == resolved or stat.S_ISDIR(info.st_mode) and output.is_relative_to(resolved):
             raise ValueError("The generated output cannot be inside an included path")
         pending, files = [candidate], []
         while pending:
             path = pending.pop()
-            info = _checked_path(root, path)
+            info, _ = _checked_path(root, path)
             if stat.S_ISDIR(info.st_mode):
                 # Validate before descending, so junction cycles cannot recurse.
                 pending.extend(reversed(sorted(path.iterdir())))

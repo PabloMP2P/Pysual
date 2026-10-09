@@ -92,6 +92,42 @@ def test_directory_cycle_is_rejected_before_descent(project, redirect):
         build_web(script, app / "published.html", runtime, includes=["assets"])
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory aliases")
+@pytest.mark.parametrize("include", ["assets.", "ASSETS"])
+@pytest.mark.parametrize("backend", ["web", "executable"])
+@pytest.mark.parametrize("existing_output", [False, True])
+def test_alias_output_is_rejected_before_asset_read_and_preserves_output(
+        project, monkeypatch, include, backend, existing_output):
+    app, script, _, runtime = project
+    assets = app / "assets"
+    (assets / "message.txt").write_bytes(b"included asset")
+    assert (app / include).resolve(strict=True) == assets
+    output = assets / ("published.html" if backend == "web" else "published.exe")
+    if existing_output:
+        output.write_bytes(b"previous publication")
+    original = Path.read_bytes
+
+    def guarded_read(path):
+        assert not path.resolve().is_relative_to(assets), "must reject before reading included assets"
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read)
+    if backend == "web":
+        build = lambda: build_web(script, output, runtime, includes=[include])
+    else:
+        monkeypatch.setattr(cli.importlib.util, "find_spec", lambda _: object())
+        monkeypatch.setattr(cli.subprocess, "run", lambda *_a, **_kw: pytest.fail("must reject before freeze"))
+        build = lambda: cli.build_executable(script, output, backend="terminal", terminal="python",
+                                             includes=[include])
+    with pytest.raises(ValueError, match="output cannot be inside an included path"):
+        build()
+    if existing_output:
+        assert original(output) == b"previous publication"
+    else:
+        assert not output.exists()
+    assert not list(assets.glob(".pysual-build-*"))
+
+
 def test_regular_nested_assets_are_preserved_in_actual_zip(project):
     app, script, _, runtime = project
     (app / "assets/nested").mkdir()
