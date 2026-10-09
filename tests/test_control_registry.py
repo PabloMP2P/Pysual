@@ -74,6 +74,17 @@ class CatalogRegistryTests(unittest.TestCase):
         signature = inspect.signature(parent.catalog_alias)
         self.assertIs(signature.return_annotation, CatalogBadge)
         self.assertIs(signature.parameters["count"].annotation, int)
+        self.assertEqual(signature.parameters["count"].default, 0)
+        self.assertEqual(signature.parameters["count"].kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIs(signature.parameters["text"].annotation, str)
+        self.assertIs(inspect.signature(parent.catalog_alias), signature)
+        other = Container()
+        self.addCleanup(other.destroy)
+        self.assertIs(inspect.signature(other.catalog_alias), signature)
+        other_child = other.catalog_alias(count=5)
+        self.assertIs(other_child.parent, other)
+        self.assertEqual(child.count, 4)
+        self.assertEqual(other_child.count, 5)
 
     def test_snapshots_and_duplicate_catalog_names_are_independent_of_aliases(self):
         register_control(CatalogBadge, name="catalog_entry", factory=False)

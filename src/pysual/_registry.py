@@ -28,17 +28,7 @@ class _Factory(Generic[C]):
     def __init__(self, control_type: type[C], *, authorable: bool = True):
         self.control_type = control_type
         self.authorable = authorable
-
-    def __get__(self, owner: Container | None, cls: type | None = None):
-        if owner is None:
-            return self
-
-        def factory(**properties: object) -> C:
-            return owner.create(self.control_type, **properties)
-
-        factory.__name__ = self.control_type.__name__
-        factory.__doc__ = self.control_type.__doc__
-        factory.__signature__ = inspect.Signature(  # type: ignore[attr-defined]
+        self._signature = inspect.Signature(
             [
                 inspect.Parameter(
                     name,
@@ -50,6 +40,17 @@ class _Factory(Generic[C]):
             ],
             return_annotation=self.control_type,
         )
+
+    def __get__(self, owner: Container | None, cls: type | None = None):
+        if owner is None:
+            return self
+
+        def factory(**properties: object) -> C:
+            return owner.create(self.control_type, **properties)
+
+        factory.__name__ = self.control_type.__name__
+        factory.__doc__ = self.control_type.__doc__
+        factory.__signature__ = self._signature  # type: ignore[attr-defined]
         return ui_method(factory)
 
 
