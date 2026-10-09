@@ -98,6 +98,11 @@ native sprite/property animation are not implemented. Native terminal capability
 metadata excludes clipboard and text composition; ordinary paste is supported.
 Python clipboard availability depends on the terminal and OS services.
 
+C-terminal bracketed paste accepts at most 8 MiB of raw input and must also fit
+the 16 MiB event frame after JSON escaping. An oversized paste is rejected with
+a resource error while preserving the session and previously rendered scene.
+Subsequent input remains available.
+
 ## Native builds
 
 Run `python tools/native.py` for the full window/terminal helper. On Windows

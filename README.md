@@ -6,7 +6,7 @@ Assign controls, change their properties, and name event handlers. The same
 application runs in a native window, a terminal, or an SVG browser interface.
 Python 3.11+. MIT licensed. Early development; APIs may change.
 
-See the [0.1.1 release notes](CHANGELOG.md) for fixes and supported scope.
+See the [0.1.1 release notes](https://github.com/PabloMP2P/Pysual/blob/main/CHANGELOG.md) for fixes and supported scope.
 
 ## Start in a browser
 
