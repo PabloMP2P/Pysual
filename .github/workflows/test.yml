@@ -81,7 +81,7 @@ jobs:
           # The opt-in test owns a separate hidden console and restores its modes.
           PYSUAL_TEST_TERMINAL_IO: ${{ runner.os == 'Windows' && '1' || '0' }}
         run: |
-          command=(python -m pytest tests/test_native_protocol.py tests/test_native_window.py tests/test_native_terminal.py tests/test_native_scene_parity.py tests/test_native_text.py tests/test_native_resources.py tests/test_terminal_selection.py tests/test_native_runtime.py tests/test_diagnostics.py tests/test_stress_test.py)
+          command=(python -m pytest tests/test_native_protocol.py tests/test_native_window.py tests/test_native_terminal.py tests/test_native_scene_parity.py tests/test_native_text.py tests/test_native_resources.py tests/test_native_image_limits.py tests/test_terminal_selection.py tests/test_native_runtime.py tests/test_diagnostics.py tests/test_stress_test.py)
           if [ "$RUNNER_OS" = "Linux" ]; then
             SDL_VIDEO_DRIVER=x11 LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a "${command[@]}"
           else
