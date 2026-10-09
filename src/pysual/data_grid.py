@@ -160,8 +160,10 @@ def _validate_data(columns, rows, previous_rows=()):
                 raise TypeError(
                     f"Cell {row.key!r}/{column.key!r} must match {column.kind!r}"
                 )
-            if column.format_spec and value is not None:
+            if column.kind == "number" and value is not None:
                 try:
+                    # The empty format also converts integers to decimal text,
+                    # which can fail under Python's integer-string digit limit.
                     format(value, column.format_spec)
                 except (ValueError, OverflowError) as error:
                     raise ValueError(

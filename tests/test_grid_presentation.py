@@ -3,6 +3,7 @@
 import asyncio
 import importlib.util
 import os
+import sys
 import unittest
 from _ui_testcase import AsyncUIOwnerTestCase
 from dataclasses import replace
@@ -81,6 +82,34 @@ class ColumnPresentationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot use this numeric format"):
             grid.rows = (GridRow("huge", (10**400,)),)
         self.assertIs(grid.rows, before)
+
+    def test_default_number_format_rejects_unprintable_integers_atomically(self):
+        previous_limit = sys.get_int_max_str_digits()
+        self.addCleanup(sys.set_int_max_str_digits, previous_limit)
+        sys.set_int_max_str_digits(640)
+        app, host = App(), RecordingHost()
+        self.addCleanup(app.destroy)
+        columns = (GridColumn("n", "Number", kind="number"),)
+        grid = app.data_grid(columns=columns, rows=(GridRow("r", (42,)),),
+                             selected_key="r", width=240, height=150)
+        children, rows, order = tuple(app.children), grid.rows, grid._order
+        for value in (10**640, -(10**640)):
+            with self.subTest(negative=value < 0):
+                with self.assertRaisesRegex(ValueError, "cannot use this numeric format"):
+                    app.data_grid(columns=columns, rows=(GridRow("bad", (value,)),))
+                self.assertEqual(tuple(app.children), children)
+                with self.assertRaisesRegex(ValueError, "cannot use this numeric format"):
+                    grid.rows = (GridRow("bad", (value,)),)
+                self.assertIs(grid.rows, rows)
+                self.assertIs(grid._order, order)
+                self.assertEqual(grid.selected_key, "r")
+                with self.assertRaisesRegex(ValueError, "cannot use this numeric format"):
+                    grid.set_cell("r", "n", value)
+                self.assertIs(grid.rows, rows)
+                self.assertIs(grid._order, order)
+        arrange(app, host)
+        paint_tree(app, host)
+        self.assertIn("42", host.texts)
 
     def test_alignment_applies_to_headers_and_elided_cells(self):
         class PositionedHost(RecordingHost):
