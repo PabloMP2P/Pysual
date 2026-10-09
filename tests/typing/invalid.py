@@ -11,6 +11,7 @@ Container(direction="wrong")  # error: reportArgumentType
 Button(dock="wrong")  # error: reportArgumentType
 Button(font_family="wrong")  # error: reportArgumentType
 Image(fit="wrong")  # error: reportArgumentType
+Image().reload("another.png")  # error: reportCallIssue
 SplitPane(orientation="wrong")  # error: reportArgumentType
 Separator(orientation="wrong")  # error: reportArgumentType
 DonutChart(center_mode="wrong")  # error: reportArgumentType

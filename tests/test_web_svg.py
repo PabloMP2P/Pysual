@@ -184,6 +184,57 @@ class SVGRendererTests(unittest.TestCase):
         scene.reset_scene("Reopened", 320, 240)
         self.assertEqual(scene._frame_image_sources, {})
 
+    def test_reload_replaces_one_resource_and_preserves_published_frames(self):
+        scene = self.scene
+        red = encode_png(1, 1, bytes((255, 0, 0, 255)))
+        blue = encode_png(1, 1, bytes((0, 0, 255, 255)))
+        other = image_source(red)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "preview.png"
+            path.write_bytes(red)
+
+            def paint():
+                scene.begin("#ffffff")
+                for x, source in enumerate((str(path), str(path), other)):
+                    scene.image(source, Rect(x * 10, 0, 10, 10))
+                scene.present()
+
+            paint()
+            before = scene.frame_packet(-1)
+            old_identifier = scene._images[str(path)][1]
+            other_resource = scene._images[other]
+            path.write_bytes(blue)
+            paint()
+            self.assertEqual(scene.frame_packet(-1), before)
+            revision = scene.resource_revision
+            scene.reload_image(str(path))
+            self.assertGreater(scene.resource_revision, revision)
+            self.assertEqual(scene._image_bytes, len(other_resource[0]))
+            self.assertIs(scene._images[other], other_resource)
+            paint()
+            after = scene.frame_packet(before["revision"])
+            self.assertEqual(after["remove_images"], [str(old_identifier)])
+            self.assertEqual(list(after["image_sources"].values()), [image_source(blue)])
+            self.assertEqual(len(after["updates"]), 2)
+            self.assertIn(image_source(red), scene._frame_image_sources[before["revision"]].values())
+            scene.report_image_error(old_identifier)
+            self.assertEqual(scene.errors, [])
+
+    def test_reload_retries_missing_files_and_their_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "later.png"
+            rect = Rect(0, 0, 10, 10)
+            self.scene.image(str(path), rect)
+            self.assertEqual(len(self.scene.errors), 1)
+            self.scene.reload_image(str(path))
+            self.scene.image(str(path), rect)
+            self.assertEqual(len(self.scene.errors), 2)
+            data = encode_png(1, 1, bytes((255, 0, 0, 255)))
+            path.write_bytes(data)
+            self.scene.reload_image(str(path))
+            self.scene.image(str(path), rect)
+            self.assertEqual(self.scene._nodes[-1]["attrs"]["href"], image_source(data))
+
     def test_cached_surface_images_use_references_without_losing_decode_diagnostics(self):
         scene = self.scene
         source = "data:image/gif;base64,Y29ycnVwdA=="

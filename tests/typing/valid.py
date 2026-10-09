@@ -25,6 +25,7 @@ panel.donut_chart(center_mode="none")
 assert_type(button, Button)
 assert_type(panel.button(text="Save"), Button)
 assert_type(image.fit, Literal["stretch", "contain", "cover"])
+assert_type(image.reload(), None)
 button.dock = "right"
 panel.layout = "flow"
 panel.font_family = "mono"

@@ -319,20 +319,43 @@ def check_dashboard(page, app):
 def check_live_images(page, app):
     from PIL import Image
     from playwright.sync_api import expect
+    from pysual._png import encode_png
 
-    expect(page.locator("#frame image")).to_have_count(2)
-    deadline = time.monotonic() + 10
-    while True:
-        pixels = Image.open(io.BytesIO(page.screenshot())).convert("RGB")
-        samples = [pixels.getpixel((70 + 150 * index, 70)) for index in range(2)]
-        if samples == [(59, 130, 246)] * 2:
-            break
-        if time.monotonic() >= deadline:
-            raise AssertionError(f"Live local/data SVG pixels: {samples}")
-        page.wait_for_timeout(50)
+    def expect_pixels(y, colors):
+        deadline = time.monotonic() + 10
+        while True:
+            with Image.open(io.BytesIO(page.screenshot())) as screenshot:
+                pixels = screenshot.convert("RGB")
+            samples = [pixels.getpixel((70 + 150 * index, y)) for index in range(2)]
+            if samples == colors:
+                return
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"Live image pixels at y={y}: {samples}, expected {colors}")
+            page.wait_for_timeout(50)
+
+    expect(page.locator("#frame image")).to_have_count(4)
+    expect_pixels(70, [(59, 130, 246)] * 2)
     # SVG files remain image resources, never markup inserted into the DOM.
     assert page.locator("#frame #asset-only").count() == 0
-    return ["local_svg_pixels", "data_svg_pixels", "svg_stays_in_image_context"]
+    expect_pixels(220, [(255, 0, 0)] * 2)
+    preview = Path(app.preview_image.source)
+    preview.write_bytes(encode_png(8, 8, bytes((0, 0, 255, 255)) * 64))
+    app.preview_image.reload()
+    expect_pixels(220, [(0, 0, 255)] * 2)
+
+    missing = preview.with_name("repaired-preview.png")
+    missing.unlink(missing_ok=True)
+    app.preview_image.source = str(missing)
+    wait_for_model(page, lambda: bool(app.resource_errors), "missing image diagnosed")
+    errors = list(app.resource_errors)
+    assert len(errors) == 1 and errors[0].startswith("web image unavailable:") and missing.name in errors[0], errors
+    missing.write_bytes(encode_png(8, 8, bytes((0, 255, 0, 255)) * 64))
+    app.preview_image.reload()
+    expect_pixels(220, [(0, 255, 0), (0, 0, 255)])
+    # Retrying repairs the image without erasing the original diagnostic history.
+    app.expected_resource_errors = errors
+    return ["local_svg_pixels", "data_svg_pixels", "svg_stays_in_image_context",
+            "reload_shared_source", "reload_missing_file"]
 
 
 def check_live_transport(browser, *, fallback=False):
@@ -462,6 +485,7 @@ def check_live():
     from playwright.sync_api import sync_playwright
     from pysual import App, Button, Image, Style, Theme, Toggle, Tokens
     from pysual.backends.web import WebHost
+    from pysual._png import encode_png
     from examples.hello import Hello
     from examples.dashboard import Dashboard
 
@@ -481,6 +505,8 @@ def check_live():
            '<rect id="asset-only" width="100" height="100" fill="#3b82f6"/></svg>')
     svg_file = destination / "image.svg"
     svg_file.write_text(svg, encoding="utf-8")
+    preview_file = destination / "preview.png"
+    preview_file.write_bytes(encode_png(8, 8, bytes((255, 0, 0, 255)) * 64))
 
     class ImageSmoke(App):
         def build(self):
@@ -489,6 +515,10 @@ def check_live():
             self.data_image = Image(source="data:image/svg+xml;base64," +
                                     base64.b64encode(svg.encode()).decode(),
                                     left=170, top=20, width=100, height=100)
+            self.preview_image = Image(source=str(preview_file), left=20, top=170,
+                                       width=100, height=100)
+            self.shared_image = Image(source=str(preview_file), left=170, top=170,
+                                      width=100, height=100)
 
     diagnostics = {"apps": {}, "success": False}
     try:
@@ -515,7 +545,8 @@ def check_live():
                         result["scenarios"] = scenario(page, app)
                         page.screenshot(path=str(destination / f"{name}.png"))
                         result["resource_errors"] = list(app.resource_errors)
-                        assert not result["resource_errors"], result["resource_errors"]
+                        result["expected_resource_errors"] = getattr(app, "expected_resource_errors", [])
+                        assert result["resource_errors"] == result["expected_resource_errors"], result["resource_errors"]
                         assert_browser_clean(result)
                         result["success"] = True
                     except BaseException:

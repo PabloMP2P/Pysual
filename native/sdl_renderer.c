@@ -3337,6 +3337,24 @@ cJSON *px_renderer_call(PXRenderer *r, const cJSON *request, char *error, int er
     if (!r)
         return NULL;
     r->error[0] = '\0';
+    if (!strcmp(op, "reload_image")) {
+        char key[80];
+        Texture *texture;
+        int i;
+        v = get(request, "source");
+        if (!valid_string(v))
+            goto invalid;
+        image_key(v->valuestring, key);
+        texture = cache_find(r, key);
+        if (texture)
+            cache_remove(r, texture);
+        for (i = 0; i < 128; ++i)
+            if (r->failed_used[i] && !strcmp(key, r->failed_images[i]))
+                r->failed_used[i] = 0;
+        r->scene_cache_valid = 0;
+        ++r->revision;
+        return px_renderer_info(r);
+    }
     if (!strcmp(op, "measure")) {
         double values[2];
         const cJSON *text = get(request, "text"), *size = get(request, "size"), *mono = get(request, "mono");

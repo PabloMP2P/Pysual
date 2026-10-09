@@ -396,6 +396,23 @@ test('partial client construction removes its DOM and listeners before reopening
   assert.equal(JSON.parse(f.host.poll()).length, 1);
 });
 
+test('new image resource identities retry the same URL without changing other nodes', t => {
+  const f = fixture(t), url = 'preview.png';
+  const picture = id => ({tag: 'image', image: id, attrs: {'data-pysual-image': id}});
+  const label = {tag: 'text', attrs: {}, text: 'Unchanged'};
+  f.host.present(JSON.stringify(scene([picture('1'), label], {image_sources: {'1': url}})));
+  const oldImage = f.surface.children[0], oldLabel = f.surface.children[1];
+  f.host.present(JSON.stringify(scene([picture('2'), label], {
+    reset: false, image_sources: {'2': url}, remove_images: ['1'],
+  })));
+  const freshImage = f.surface.children[0];
+  assert.notEqual(freshImage, oldImage); assert.equal(oldImage.parentNode, null);
+  assert.equal(freshImage.getAttribute('href'), url);
+  assert.equal(f.surface.children[1], oldLabel);
+  f.host.present(JSON.stringify(scene([picture('2'), label], {reset: false})));
+  assert.equal(f.surface.children[0], freshImage);
+});
+
 test('image source references preserve DOM images across geometry deltas and resets', t => {
   const f = fixture(t), source = 'data:image/png;base64,AA==';
   const picture = x => ({tag: 'g', attrs: {}, children: [{tag: 'image', image: '7', attrs: {

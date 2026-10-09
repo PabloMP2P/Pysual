@@ -166,6 +166,19 @@ fail before partial property changes are applied.
 Batch changes obey the same lifecycle rules as individual assignments, including
 startup-only window options and visibility restrictions on active modals.
 
+Call `image.reload()` after replacing a local image file, or after creating a
+file whose earlier load failed. It discards the cached source and schedules a
+repaint for every use of that source in the current window, including cached
+controls. Other decoded images remain cached. Reload returns before the next
+frame or asynchronous decode completes; an older pending decode cannot replace
+the refreshed image. Built-in window, terminal and web hosts support it,
+including bundled web assets in the browser's virtual filesystem. Browser URLs
+keep ordinary browser caching rules. Detached images and images in closed
+windows only invalidate their future paint. Custom hosts can implement the
+optional `reload_image(source)` operation described in the
+[Host contract](../src/pysual/host.py); otherwise `reload()` raises
+`CapabilityError` while the image is attached to an open window.
+
 Finite-choice properties expose the same `Literal` choices in constructors and
 container factories, for example `Container(layout="stack")` and
 `parent.panel(layout="stack")`. Custom properties can declare

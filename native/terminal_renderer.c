@@ -133,11 +133,12 @@ struct PTBackend {
     PTSegmentSlot *segment_table;
     size_t segment_count, segment_capacity, command_count, retained_scene_bytes;
     Color scene_background;
-    int segmented, pending_work;
+    int segmented, pending_work, images_dirty;
     uint64_t commands_touched, commands_replayed, last_commands_touched, last_commands_replayed;
     uint64_t segments_updated, segments_removed, segments_tested, last_segments_tested;
     uint64_t scene_patch_updates, unchanged_segments, cell_frames_composed, cell_cache_hits;
     uint64_t ansi_frames_encoded, ansi_bytes_encoded, terminal_bytes_written;
+    uint64_t resource_revision;
     ImageResource *images;
     size_t image_bytes;
     unsigned image_count;
@@ -1543,12 +1544,13 @@ failed:
     return NULL;
 }
 static int frame_current(PTBackend *r) {
-    return r->current && r->current->cols == r->cols && r->current->rows == r->rows &&
+    return r->current && !r->images_dirty && r->current->cols == r->cols && r->current->rows == r->rows &&
            r->current->mono == (r->color_mode == 3);
 }
 static void composed(PTBackend *r, Frame *f, size_t replayed, size_t tested) {
     frame_release(r->current);
     r->current = f;
+    r->images_dirty = 0;
     r->cell_frames_composed++;
     r->commands_replayed += replayed;
     r->last_commands_replayed = replayed;
@@ -2937,6 +2939,7 @@ cJSON *pt_info(PTBackend *r) {
     cJSON_AddNumberToObject(j, "width", r->cols * 8);
     cJSON_AddNumberToObject(j, "height", r->rows * 16);
     cJSON_AddNumberToObject(j, "scale", 1);
+    cJSON_AddNumberToObject(j, "resource_revision", (double)r->resource_revision);
     cJSON_AddNumberToObject(j, "columns", r->cols);
     cJSON_AddNumberToObject(j, "rows", r->rows);
     cJSON_AddNumberToObject(j, "text_row_height", 16);
@@ -3017,6 +3020,29 @@ cJSON *pt_call(PTBackend *r, const cJSON *request, char *error, int error_size) 
     if (!r) {
         fail(error, error_size, "Terminal is closed");
         return NULL;
+    }
+    if (!strcmp(op, "reload_image")) {
+        const char *source = str(item(request, "source"), NULL);
+        ImageResource **at = &r->images;
+        if (!source || strlen(source) > PT_MAX_IMAGE_SOURCE) {
+            fail(error, error_size, "Invalid terminal image source");
+            return NULL;
+        }
+        while (*at) {
+            ImageResource *image = *at;
+            if (!strcmp(image->source, source)) {
+                *at = image->next;
+                r->image_bytes -= image->bytes;
+                --r->image_count;
+                release_image(image);
+                break;
+            }
+            at = &image->next;
+        }
+        /* Keep the last snapshot and ANSI baseline until the scheduled redraw. */
+        r->images_dirty = 1;
+        ++r->resource_revision;
+        return pt_info(r);
     }
     if (!strcmp(op, "measure")) {
         double w, h;

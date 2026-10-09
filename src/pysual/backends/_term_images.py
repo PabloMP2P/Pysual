@@ -57,6 +57,11 @@ class ImageCache:
         self._entries.clear()
         self.byte_size = 0
 
+    def invalidate(self, source):
+        entry = self._entries.pop(source, None)
+        if entry is not None:
+            self.byte_size -= entry[1]
+
     def close(self):
         self.clear()
 
@@ -76,6 +81,7 @@ class AsyncImageCache(ImageCache):
         super().__init__()
         self._executor = None
         self._pending = None
+        self._pending_invalidated = False
         self._failures = OrderedDict()
         self._failure_bytes = 0
         # One valid image may exceed the LRU charge once its source is included.
@@ -115,6 +121,11 @@ class AsyncImageCache(ImageCache):
             return False
         source, future = self._pending
         self._pending = None
+        if self._pending_invalidated:
+            # Keep one worker and no queued backlog while an old decode runs.
+            # Its completion only wakes painting to request the fresh source.
+            self._pending_invalidated = False
+            return True
         try:
             result = future.result()
         except (OSError, ValueError) as exc:
@@ -148,12 +159,24 @@ class AsyncImageCache(ImageCache):
         # both a spare completion and another background job.
         self._uncached = None
 
+    def invalidate(self, source):
+        super().invalidate(source)
+        message = self._failures.pop(source, None)
+        if message is not None:
+            self._failure_bytes -= len(source) * 4 + len(message) * 4
+        if self._uncached is not None and self._uncached[0] == source:
+            self._uncached = None
+        if self._pending is not None and self._pending[0] == source:
+            self._pending_invalidated = True
+            self._pending[1].cancel()
+
     def clear(self):
         # No completion callback can repopulate a closed cache. A new opening
         # gets another instance; running decoding only retains its own input.
         if self._pending is not None:
             self._pending[1].cancel()
             self._pending = None
+        self._pending_invalidated = False
         if self._executor is not None:
             self._executor.shutdown(wait=False, cancel_futures=True)
             self._executor = None

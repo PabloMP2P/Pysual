@@ -272,6 +272,16 @@ class TermTextHost(TerminalSession):
     def image_nine(self, source, rect, edges, *, tint="#ffffff"):
         self.image(source, rect, tint=tint, _edges=edges)
 
+    def reload_image(self, source):
+        self._renderer._images.invalidate(source)
+        source_key = hash(source)
+        for key in tuple(self._image_errors):
+            if key[0] == source_key:
+                del self._image_errors[key]
+        self.resource_revision += 1
+        self._renderer.resource_revision += 1
+        self._repaint()
+
     def gradient_rect(self, rect, first, last, axis, radius, border_width=0):
         return self._renderer.gradient_rect(
             rect, first, last, axis, radius, border_width

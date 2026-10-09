@@ -374,6 +374,8 @@ static void process_command(Host *h, uint32_t id, const unsigned char *data, siz
     result = backend_call(h, j, error, sizeof(error));
     if (result && !strcmp(op, "configure"))
         configure(h, j);
+    if (result && !strcmp(op, "reload_image") && h->has_scene)
+        h->needs_draw = 1;
     reply(h, id, result, result ? NULL : (*error ? error : "Unsupported native operation"));
 done:
     cJSON_Delete(j);

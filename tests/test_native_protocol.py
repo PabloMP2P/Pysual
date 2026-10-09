@@ -4,7 +4,9 @@ from pathlib import Path
 import sys
 import time
 import unittest
+from uuid import uuid4
 
+from pysual._png import decode_png, encode_png
 from pysual.backends._native_client import NativeClient, NativeHostError
 from pysual.backends.native import NativeHost
 
@@ -401,6 +403,84 @@ class NativeTerminalPatchProtocolTests(unittest.TestCase):
         self.assertEqual(after["frames"], before["frames"])
         self.assertEqual(after["scene_update_samples_ms"], before["scene_update_samples_ms"])
         self.assertEqual(self.client.request("snapshot")["cells"], cells)
+
+
+@unittest.skipUnless(EXE.is_file(), "Build the standalone C host first")
+class NativeImageReloadTests(unittest.TestCase):
+    def test_reload_refreshes_shared_sources_and_retries_failures_without_resubmission(self):
+        directory = PACKAGE.parents[1] / "work" / "image-reload-tests" / uuid4().hex
+        directory.mkdir(parents=True)
+        source, other, capture = (directory / name for name in ("preview.png", "other.png", "frame.png"))
+        self.addCleanup(directory.rmdir)
+        for path in (source, other, capture):
+            self.addCleanup(path.unlink, missing_ok=True)
+        for backend in ("window", "terminal"):
+            for retained in (False, True):
+                for missing in (False, True):
+                    with self.subTest(backend=backend, retained=retained, missing=missing):
+                        client = NativeClient(lambda event: None, executable=EXE)
+                        try:
+                            info = client.request("open", backend=backend, hidden=True, headless=True,
+                                width=160, height=96, color="truecolor", scale=1, vsync=False,
+                                resizable=False, font_dir=str(PACKAGE / "assets"))
+                            if not info.get("images", True):
+                                self.skipTest("Build with SDL_image to test image reload")
+                            source.unlink(missing_ok=True)
+                            if not missing:
+                                source.write_bytes(encode_png(1, 1, bytes((255, 0, 0, 255))))
+                            other.write_bytes(encode_png(1, 1, bytes((0, 255, 0, 255))))
+                            commands = [["image", str(path), [x, 0, 16, 16], "#ffffff", "stretch"]
+                                        for path, x in ((source, 0), (source, 32), (other, 64))]
+                            if retained:
+                                client.request("patch", background="#000000", upsert=[
+                                    dict(id=str(i), bounds=[i * 32, 0, 16, 16], commands=[command])
+                                    for i, command in enumerate(commands)], order=["0", "1", "2"])
+                            else:
+                                client.request("frame", commands=[["begin", "#000000"], *commands])
+                            self.wait_for_frame(client, 0)
+                            before = self.colors(client, backend, capture)
+                            if not missing:
+                                self.assertEqual(before, [(255, 0, 0), (255, 0, 0), (0, 255, 0)])
+                            source.write_bytes(encode_png(1, 1, bytes((0, 0, 255, 255))))
+                            other.write_bytes(encode_png(1, 1, bytes((0, 0, 255, 255))))
+                            client.request("present")
+                            self.assertEqual(self.colors(client, backend, capture), before)
+                            if backend == "terminal":
+                                client.request("configure", fps_limit=1)
+                                client.request("present")
+                            prior = client.request("stats")
+                            reloaded = client.request("reload_image", source=str(source))
+                            self.assertEqual(reloaded["resource_revision"], prior["resource_revision"] + 1)
+                            if backend == "terminal":
+                                self.assertEqual(self.colors(client, backend, capture), before)
+                            after = self.wait_for_frame(client, prior["frames"])
+                            self.assertEqual(after["scene_updates"], prior["scene_updates"])
+                            self.assertEqual(self.colors(client, backend, capture),
+                                             [(0, 0, 255), (0, 0, 255), (0, 255, 0)])
+                            with self.assertRaises(NativeHostError):
+                                client.request("reload_image", source=None)
+                            self.assertEqual(client.request("stats")["resource_revision"],
+                                             reloaded["resource_revision"])
+                        finally:
+                            client.close()
+
+    def wait_for_frame(self, client, before):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            stats = client.request("stats")
+            if stats["frames"] > before:
+                return stats
+            time.sleep(.005)
+        self.fail("Reload did not schedule a native presentation")
+
+    @staticmethod
+    def colors(client, backend, path):
+        if backend == "terminal":
+            cells = client.request("snapshot")["cells"]
+            return [tuple(cells[x // 8]["background"]) for x in (8, 40, 72)]
+        client.request("capture", path=str(path))
+        width, _, pixels = decode_png(path.read_bytes())
+        return [tuple(pixels[(8 * width + x) * 4:(8 * width + x) * 4 + 3]) for x in (8, 40, 72)]
 
 
 if __name__ == "__main__":

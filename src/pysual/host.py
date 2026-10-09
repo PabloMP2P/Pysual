@@ -240,6 +240,9 @@ class Host(Protocol):
     # Optional "image_fit" adds keyword fit="contain"/"cover" to image().
     # Default stretch keeps the two-argument contract for third-party hosts.
     def image(self, source: str, rect: Rect) -> None: ...
+    # Optional reload_image(source) discards that source's successful/failed
+    # loads and increments resource_revision so shared cached paint rebuilds.
+    # Pending decodes must not publish a result started before the reload.
 
     # Optional when "render_surfaces" is advertised. Handles stay host-owned.
     # A host may also provide surface_byte_size(rect) -> int to include padding

@@ -589,9 +589,13 @@ class LiveSVGHost(SVGRenderer, NativeServices):
                 "closed": self._closed,
             }
 
-    def _image_error(self, detail):
+    def _image_error(self, detail, source_key):
         with self._condition:
-            super()._image_error(detail)
+            super()._image_error(detail, source_key)
+
+    def reload_image(self, source):
+        with self._condition:
+            super().reload_image(source)
 
     def _resource_error(self, message):
         with self._condition:

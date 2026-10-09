@@ -1,15 +1,19 @@
 """Application-relative resources remain independent of the helper's cwd."""
 
+import asyncio
 import os
 from pathlib import Path
 import unittest
 from uuid import uuid4
 
-from pysual import Rect, terminal
+from _terminal import until
+from _ui_testcase import AsyncUIOwnerTestCase
+from pysual import App, Image, Rect, terminal
 from pysual._png import encode_png
 from pysual.backends._native_client import NativeHostError, native_executable
 from pysual.backends.native import NativeHost
 from pysual.image_resources import image_source
+from pysual.runtime import Runtime
 from test_native_window import bmp_pixels
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +31,65 @@ class NativeResourceCommands(unittest.TestCase):
                             frame_count=1)
                 expected = os.path.abspath(source) if source == sources[0] else source
                 self.assertEqual([command[1] for command in host._commands[-3:]], [expected] * 3)
+
+    def test_detached_image_reload_is_safe_and_disposed_image_stays_invalid(self):
+        image = Image(source="not-loaded.png")
+        image.reload()
+        image.destroy()
+        with self.assertRaises(RuntimeError):
+            image.reload()
+
+
+@unittest.skipUnless(native_executable().is_file(), "Build the native helper")
+class NativeImageReloadRuntime(AsyncUIOwnerTestCase):
+    async def test_reload_refreshes_shared_cached_controls_and_missing_file(self):
+        directory = ROOT / "work" / "reload-runtime" / uuid4().hex
+        directory.mkdir(parents=True)
+        asset, missing, output = (directory / name for name in ("preview.png", "missing.png", "frame.bmp"))
+        red = encode_png(1, 1, bytes((255, 0, 0, 255)))
+        blue = encode_png(1, 1, bytes((0, 0, 255, 255)))
+        try:
+            for backend in ("window", "terminal"):
+                with self.subTest(backend=backend):
+                    asset.write_bytes(red)
+                    missing.unlink(missing_ok=True)
+                    app = App(width=160, height=96, layout="absolute", reduce_motion=True, ui_scale=1)
+                    first = Image(parent=app, source=str(asset), width=32, height=32)
+                    Image(parent=app, source=str(asset), left=64, width=32, height=32)
+                    retry = Image(parent=app, source=str(missing), top=48, width=32, height=32)
+                    host = (NativeHost(hidden=True, vsync=False) if backend == "window"
+                            else terminal(renderer="c", hidden=True, color="truecolor"))
+                    runtime = Runtime(app, host)
+                    task = asyncio.create_task(runtime.main())
+                    try:
+                        def samples():
+                            if backend == "window":
+                                host.capture(output)
+                                pixels = bmp_pixels(output)
+                                return pixels[8][8], pixels[8][72], pixels[56][8]
+                            cells = host.snapshot()["cells"]
+                            return tuple(tuple(cells[index]["foreground"]) for index in (0, 8, 60))
+
+                        await until(lambda: app.is_open and runtime.frames >= 1)
+                        await until(lambda: samples()[:2] == ((255, 0, 0),) * 2)
+                        revision, frames = host.resource_revision, runtime.frames
+                        asset.write_bytes(blue)
+                        first.reload()
+                        self.assertGreater(host.resource_revision, revision)
+                        await until(lambda: runtime.frames > frames and samples()[:2] == ((0, 0, 255),) * 2)
+                        missing.write_bytes(red)
+                        retry.reload()
+                        await until(lambda: samples()[2] == (255, 0, 0))
+                        self.assertFalse(task.done())
+                    finally:
+                        runtime._stop.set()
+                        runtime.invalidate()
+                        await task
+                        app.destroy()
+        finally:
+            for path in (asset, missing, output):
+                path.unlink(missing_ok=True)
+            directory.rmdir()
 
 
 @unittest.skipUnless(native_executable().is_file(), "Build the native helper")

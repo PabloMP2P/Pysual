@@ -255,15 +255,32 @@ class SVGRenderer:
 
     def report_image_error(self, identifier):
         """Resolve a browser decode failure without exposing an arbitrary path."""
-        if 0 < identifier <= self._image_serial:
-            label = self._image_labels.get(identifier, f"resource {identifier}")
-            self._image_error(f"Browser could not decode {label}")
+        resource = self._image_labels.get(identifier)
+        if resource is not None:
+            label, source_key = resource
+            self._image_error(f"Browser could not decode {label}", source_key)
 
-    def _image_error(self, detail):
+    def _image_error(self, detail, source_key):
         message = f"{self._error_prefix} image unavailable: {str(detail)[:400]}"
-        if message not in self._image_errors and len(self._image_errors) < 32:
-            self._image_errors.add(message)
+        key = source_key, message
+        if key not in self._image_errors and len(self._image_errors) < 32:
+            self._image_errors.add(key)
             self._resource_error(message)
+
+    def reload_image(self, source):
+        source = str(source)
+        previous = self._images.pop(source, None)
+        if previous is not None:
+            value, _ = previous
+            self._image_bytes -= len(value)
+        source_key = hash(source)
+        for identifier, (_, key) in tuple(self._image_labels.items()):
+            if key == source_key:
+                del self._image_labels[identifier]
+        self._image_errors = {
+            key for key in self._image_errors if key[0] != source_key
+        }
+        self._resource_revision += 1
 
     def _resource_error(self, message):
         """Execution adapters enqueue a resource_error input event here."""
@@ -572,11 +589,12 @@ class SVGRenderer:
             self._image_bytes -= len(evicted[0])
         self._image_serial += 1
         identifier = self._image_serial
-        self._image_labels[identifier] = (
+        label = (
             f"embedded image {identifier}"
             if source.startswith("data:")
             else source[:300]
         )
+        self._image_labels[identifier] = label, hash(source)
         while len(self._image_labels) > 256:
             self._image_labels.popitem(last=False)
         self._images[source] = (value, identifier)
@@ -648,7 +666,7 @@ class SVGRenderer:
         try:
             value, identifier = self._image_source(source)
         except (OSError, ValueError) as exc:
-            self._image_error(exc)
+            self._image_error(exc, hash(str(source)))
             return
         self._append(
             _node(

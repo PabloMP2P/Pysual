@@ -387,6 +387,11 @@ class NativeHost(NativeServices):
     def image_nine(self, source, rect, edges, *, tint="#ffffff"):
         self._commands.append(["image_nine", _image_source(source), _rect(rect), list(edges), tint])
 
+    def reload_image(self, source):
+        info = self._request("reload_image", source=_image_source(source))
+        self.info.update(info)
+        self._accept_viewport(self.info)
+
     def sprite(self, source, rect, *, frame_width, frame_height, frame_count,
                fps=12, loop=True, tint="#ffffff"):
         """Declare a row-major sprite sheet; its clock and frame selection run in C."""

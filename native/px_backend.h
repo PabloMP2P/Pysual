@@ -24,7 +24,7 @@ int px_renderer_present(PXRenderer *r, char *error, int error_size);
 cJSON *px_renderer_poll(PXRenderer *r);
 cJSON *px_renderer_info(PXRenderer *r);
 /* Request has op measure/set_title/set_size/text_input/clipboard_read/write/
-   capture/configure. Return result JSON (incl JSON null), NULL + error failure. */
+   capture/configure/reload_image. Return result JSON (incl JSON null), NULL + error failure. */
 cJSON *px_renderer_call(PXRenderer *r, const cJSON *request, char *error, int error_size);
 int px_renderer_animating(PXRenderer *r);
 /* Terminal same operations; config headless=true makes deterministic cell tests

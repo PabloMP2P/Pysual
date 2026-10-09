@@ -7,7 +7,11 @@ const NS = "http://www.w3.org/2000/svg";
 // of reading live DOM attributes/text for every unchanged descendant.
 const rendered = new WeakMap();
 export function reconcile(element, node, imageSources) {
-  if (!element || element.localName !== node.tag) {
+  const oldImage = element && rendered.get(element)?.attrs["data-pysual-image"];
+  // Reloads get a new resource identity even when their URL is unchanged.
+  // A fresh image retries decoding and detaches pending events from the old one.
+  if (!element || element.localName !== node.tag || (node.tag === "image"
+      && oldImage !== node.attrs["data-pysual-image"])) {
     const replacement = document.createElementNS(NS, node.tag);
     if (element) element.replaceWith(replacement);
     element = replacement;
