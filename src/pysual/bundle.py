@@ -16,6 +16,7 @@ import tempfile
 from urllib.request import urlopen
 import zipfile
 
+from ._build_assets import include_files
 
 PYODIDE_VERSION = "0.29.0"
 PYODIDE_URL = f"https://registry.npmjs.org/pyodide/-/pyodide-{PYODIDE_VERSION}.tgz"
@@ -110,20 +111,9 @@ def build_web(script: Path, output: Path, runtime: Path | None = None, *, includ
     package = Path(__file__).parent
     entries = {"app.py": script.read_bytes()}
     for item in includes:
-        candidate = script.parent / item
-        if candidate.is_symlink() or not candidate.resolve().is_relative_to(script.parent):
-            raise ValueError("Included files must be inside the application directory")
-        if not candidate.exists():
-            raise ValueError(f"Included path does not exist: {item}")
-        if output == candidate.resolve() or (
-            candidate.is_dir() and output.is_relative_to(candidate.resolve())
-        ):
-            raise ValueError("The generated output cannot be inside an included path")
-        paths = sorted(candidate.rglob("*")) if candidate.is_dir() else [candidate]
+        _, paths = include_files(script.parent, item, output)
         for path in paths:
-            if path.is_symlink():
-                raise ValueError(f"Included symlinks are unsupported: {path}")
-            if not path.is_file() or "__pycache__" in path.parts:
+            if "__pycache__" in path.parts:
                 continue
             name = path.relative_to(script.parent).as_posix()
             if name in entries or name.split("/")[0] == "pysual" or path.resolve() == output:

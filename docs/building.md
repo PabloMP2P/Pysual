@@ -183,6 +183,8 @@ python -m pysual app/main.py --backend window --include assets --package package
 ```
 
 `--include` paths are relative to the entry script and preserve their paths.
+Both builders reject symlinks and Windows junctions/reparse points, including
+redirects inside included directories. Keep source assets unchanged during a build.
 Resolve assets relative to `__file__`; keep writable user documents outside the
 packaged application. Executables analyze regular imports; `--package` collects
 a dynamically imported installed package. Web builds accept local pure-Python

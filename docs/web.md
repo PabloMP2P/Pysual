@@ -48,8 +48,10 @@ Python source.
 
 Use repeated `--include` options for files and local pure-Python modules below
 the entry script's directory. Included files preserve their relative paths in
-the browser's virtual filesystem. Paths outside that directory, symlinks and
-reserved package names are rejected. Files are published atomically only after
+the browser's virtual filesystem. Paths outside that directory, symlinks,
+Windows junctions/reparse points (including nested ones), and reserved package
+names are rejected. Keep the input tree unchanged while building. Files are
+published atomically only after
 the entire bundle is prepared. Native binary Python extensions need their own
 WebAssembly distributions and cannot be copied into a browser application.
 

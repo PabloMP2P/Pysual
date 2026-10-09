@@ -23,6 +23,8 @@ import subprocess
 import sys
 import tempfile
 
+from ._build_assets import include_files
+
 PACKAGE = Path(__file__).resolve().parent
 # The directory that contains the ``pysual`` package: ``src`` in a checkout.
 SOURCE = PACKAGE.parent
@@ -119,11 +121,7 @@ def build_executable(script, output, *, backend="window", terminal="auto", inclu
         relative = Path(include)
         if relative.is_absolute() or ".." in relative.parts:
             raise ValueError("--include paths must be relative to the entry script, without '..'")
-        source = (script.parent / relative).resolve()
-        if not source.is_relative_to(script.parent) or not source.exists():
-            raise ValueError(f"Included asset is missing or outside the app directory: {include}")
-        if output == source or source.is_dir() and output.is_relative_to(source):
-            raise ValueError("Output cannot be inside an included asset")
+        source, _ = include_files(script.parent, relative, output)
         assets.append((source, str(relative if source.is_dir() else relative.parent)))
     for package in packages:
         if not package or any(not piece.isidentifier() for piece in package.split(".")):
