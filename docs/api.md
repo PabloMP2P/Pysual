@@ -299,12 +299,13 @@ and `origin`. Programmatic calls default to `origin="program"`; a committed
 editor action uses `"user"`. The column's `editable` flag controls the user
 editor, not application updates. Invalid data leaves the current dataset intact.
 
-Numeric editors accept plain numbers and the column's copied decimal presentation,
-including its prefix, suffix, and comma or underscore grouping with an empty
-format specification or an `f`/`F` format. For example, a column using `prefix="$"` and
-`format_spec=",.2f"` accepts `$1,234.57`. Pasting commits the displayed, rounded
-amount; it cannot recover precision omitted by formatting. Other display formats
-continue to use plain numeric entry.
+Numeric editors accept plain numbers and the column's copied decimal or percentage
+presentation, including its prefix, suffix, and comma or underscore grouping with
+an empty format specification or an `f`/`F`/`%` format. For example, a column using
+`prefix="$"` and `format_spec=",.2f"` accepts `$1,234.57`. A column using
+`format_spec=".1%"` accepts `50.0%` as `0.5`; plain `50` still means `50`. Pasting
+commits the displayed, rounded amount; it cannot recover precision omitted by
+formatting. Other display formats continue to use plain numeric entry.
 
 Selection changes emit `ChangeEvent[str | None]` through `grid.changed`, with
 `old_value` and `new_value` row keys. `selected_column` is a zero-based column

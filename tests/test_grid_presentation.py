@@ -247,9 +247,57 @@ class FormattedEditingTests(AsyncUIOwnerTestCase):
                 _parse_number(invalid, column)
         grouped = GridColumn("amount", "Amount", kind="number", prefix="USD ", format_spec="_.2f")
         self.assertEqual(_parse_number("USD 1_234.57", grouped), 1234.57)
-        percent = GridColumn("ratio", "Ratio", kind="number", format_spec=".1%")
+
+    def test_percentage_parser_accepts_own_display_and_preserves_raw_entry(self):
+        column = GridColumn("ratio", "Ratio", kind="number", prefix="Rate: ",
+                            suffix=" annual", format_spec=",.2%")
+        for spec in (".2%", "+.2%", ",.2%", "_.2%"):
+            formatted = replace(column, format_spec=spec)
+            for value in (0, 0.5, -0.125, 1234.5678):
+                with self.subTest(spec=spec, value=value):
+                    self.assertAlmostEqual(_parse_number(_display(value, formatted), formatted), value)
+        for text, expected in (("0.5", 0.5), ("50", 50), ("1e-3", 0.001),
+                               ("50.0%", 0.5), ("", None)):
+            with self.subTest(text=text):
+                self.assertEqual(_parse_number(text, column), expected)
+        for text in ("Rate: 5,00.0% annual", "Rate: 50.0% daily", "50.0%%",
+                     "Rate: 50.0 annual", "nan%", "inf%", "1e3%"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                _parse_number(text, column)
         with self.assertRaises(ValueError):
-            _parse_number("50.0%", percent)
+            _parse_number("50.0%", replace(column, format_spec=".2f"))
+
+    async def test_copied_percentage_cell_pastes_back_with_displayed_precision(self):
+        app, host = App(), RecordingHost()
+        grid = DataGrid(parent=app, width=300, height=160,
+            columns=(GridColumn("ratio", "Ratio", kind="number", editable=True,
+                                prefix="Rate: ", suffix=" annual", format_spec=".1%"),),
+            rows=(GridRow("a", (0.12567,)),), selected_key="a")
+        runtime = Runtime(app, host)
+        task = asyncio.create_task(runtime.main())
+        try:
+            await eventually(lambda: app.is_open or task.done())
+            if task.done():
+                await task
+            grid.focus()
+            await runtime.router.clipboard("c")
+            self.assertEqual(host.clipboard, "Rate: 12.6% annual")
+            grid.begin_edit()
+            self.assertEqual(runtime.popup.children[0].text, "0.12567")
+            await runtime.router.clipboard("v")
+            runtime.router.process(Input("key_down", key="Enter"))
+            self.assertIsNone(runtime.popup)
+            self.assertAlmostEqual(grid.rows[0].cells[0], 0.126)
+            self.assertEqual(grid.selected_cell_text, host.clipboard)
+            grid.begin_edit()
+            runtime.router.process(Input("text", text="Rate: inf% annual", paste=True))
+            runtime.router.process(Input("key_down", key="Enter"))
+            self.assertIsNotNone(runtime.popup)
+            self.assertAlmostEqual(grid.rows[0].cells[0], 0.126)
+        finally:
+            runtime._stop.set()
+            await task
+            app.destroy()
 
     async def test_editor_uses_raw_value_and_reports_numeric_changes(self):
         app, host = App(), RecordingHost()

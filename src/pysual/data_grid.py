@@ -199,24 +199,29 @@ def _parse_number(text, column=None):
     try:
         return int(text) if digits.isdecimal() else float(text)
     except ValueError:
-        if column is None or (column.format_spec and column.format_spec[-1] not in "fF"):
+        if column is None or (column.format_spec and column.format_spec[-1] not in "fF%"):
             raise
-    # Accept the ordinary decimal presentation copied from this column. Raw
-    # numeric entry above stays independent of formatting; percentages and
-    # other display transformations are not inversely interpreted here.
+    # Accept the decimal or percentage presentation copied from this column.
+    # Raw numeric entry above stays independent of display formatting.
     prefix, suffix = column.prefix.lstrip(), column.suffix.rstrip()
     if prefix and text.startswith(prefix):
         text = text[len(prefix):]
     if suffix and text.endswith(suffix):
         text = text[:-len(suffix)]
     text = text.strip()
+    percentage = column.format_spec.endswith("%")
+    if percentage:
+        if not text.endswith("%"):
+            raise ValueError("Use a percentage with the column's formatting")
+        text = text[:-1]
     separator = next((s for s in (",", "_") if s in column.format_spec), "")
     integer = r"\d+"
     if separator:
         integer = rf"(?:\d+|\d{{1,3}}(?:{re.escape(separator)}\d{{3}})+)"
     if re.fullmatch(rf"[+-]?(?:{integer}(?:\.\d*)?|\.\d+)", text) is None:
         raise ValueError("Use a decimal number with the column's formatting")
-    return _parse_number(text.replace(separator, "") if separator else text)
+    number = text.replace(separator, "") if separator else text
+    return float(number) / 100 if percentage else _parse_number(number)
 
 
 class _CellEditor(TextBox):
