@@ -1319,6 +1319,10 @@ static int finite_commands(const cJSON *commands) {
         const cJSON *source = (!strcmp(name, "image") || !strcmp(name, "image_nine")) ? arg(c, 1) : NULL;
         if (!cJSON_IsArray(c))
             return 0;
+        /* Compare runs before drawing validation. Reject duplicate style keys
+           even when cJSON considers them equal to the committed scalar style. */
+        if ((!strcmp(name, "styled_rect") || !strcmp(name, "marker")) && !px_style_members(arg(c, 2)))
+            return 0;
         cJSON_ArrayForEach(v, c) {
             if (v == source && cJSON_IsString(v) &&
                 !strncmp(v->valuestring, PT_IMAGE_PREFIX, sizeof(PT_IMAGE_PREFIX) - 1)) {

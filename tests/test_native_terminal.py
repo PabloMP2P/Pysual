@@ -509,6 +509,26 @@ class NativeTerminalTests(unittest.TestCase):
             self.assertNotIn('\x07', encoded)
             self.assertEqual(self.client.request('ansi', diff=True), '')
 
+    def test_duplicate_style_keys_cannot_bypass_validation_as_an_unchanged_scene(self):
+        command = ['styled_rect', [0, 0, 16, 16], {'fill': '#ffffff'}]
+        for operation in ('frame', 'patch'):
+            def arguments(value):
+                if operation == 'frame':
+                    return {'commands': [value]}
+                return {'upsert': [self.segment('style', [value])], 'order': ['style']}
+
+            self.client.request(operation, **arguments(command))
+            before = self.client.request('snapshot')
+            # Equal duplicate scalar keys compare equal in cJSON, but still
+            # violate the retained command schema and must be rejected first.
+            duplicate = [*command[:-1], {'fill': '#ffffff', 'extra': '#ffffff'}]
+            payload = json.dumps({'op': operation, **arguments(duplicate)})
+            payload = payload.replace('"extra":', '"fill":').encode('utf-8')
+            with self.subTest(operation=operation), self.assertRaises(NativeHostError):
+                self.client._request(9, payload, timeout=5)
+            self.assertEqual(self.client.request('snapshot'), before)
+            self.assertTrue(self.client.is_alive)
+
     def test_resize_invalidates_viewport_and_repaints_retained_scene(self):
         self.client.request('configure', columns=17, rows=4)
         self.cols, self.rows = 17, 4
