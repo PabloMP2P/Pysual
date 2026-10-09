@@ -687,12 +687,12 @@ class LiveSVGHostTests(unittest.TestCase):
             self.assertTrue(any("8 MiB" in event.text for event in errors))
 
     def test_other_browser_formats_report_decode_failures_with_bounded_labels(self):
-        for mime in ("jpeg", "gif", "webp"):
+        for mime in ("jpeg", "gif", "webp", "svg+xml"):
             source = f"data:image/{mime};base64," + base64.b64encode(b"corrupt").decode()
             self.host.image(source, Rect(0, 0, 20, 20))
             identifier = self.host._nodes[-1]["attrs"]["data-pysual-image"]
             self.host._receive({"events": [{"kind": "image_error", "text": identifier}]})
-        self.assertEqual(len(self.host.poll()), 3)
+        self.assertEqual(len(self.host.poll()), 4)
         for index in range(300):
             source = "data:image/gif;base64," + base64.b64encode(str(index).encode()).decode()
             self.host.image(source, Rect(0, 0, 20, 20))

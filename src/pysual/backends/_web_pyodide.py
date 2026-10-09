@@ -117,7 +117,10 @@ class BundledSVGHost(SVGRenderer):
         if source.startswith(("http://", "https://", "blob:")):
             return source
         if source.startswith("data:image/"):
-            if source.startswith(tuple(f"data:image/{kind};base64," for kind in ("png", "jpeg", "gif", "webp"))):
+            if source.startswith(tuple(
+                f"data:image/{kind};base64,"
+                for kind in ("png", "jpeg", "gif", "webp", "svg+xml")
+            )):
                 return super()._resolve_image_source(source)
             if len(source) > 44 * 1024 * 1024:
                 raise ValueError("Encoded browser image exceeds 44 MiB")
@@ -155,7 +158,9 @@ class BundledSVGHost(SVGRenderer):
             if not path.is_file():
                 return source
         mime = mimetypes.guess_type(path.name)[0]
-        if mime and mime.startswith("image/") and mime not in {"image/png", "image/jpeg", "image/gif", "image/webp"}:
+        if mime and mime.startswith("image/") and mime not in {
+            "image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml"
+        }:
             with path.open("rb") as stream:
                 data = stream.read(32 * 1024 * 1024 + 1)
             if len(data) > 32 * 1024 * 1024:

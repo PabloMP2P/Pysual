@@ -64,6 +64,8 @@ text input and composition, viewport changes, device scaling, safe areas and
 on-screen keyboard occlusion. It draws text, icons, images, clipped groups,
 gradients and theme effects as SVG. Cached control bodies remain vector groups.
 The browser owns viewport size and zoom; use automatic scale or `ui_scale=1`.
+Local PNG, JPEG, GIF, WebP and SVG assets are embedded in live web scenes.
+SVG stays an image resource rather than page markup and is limited to 32 MiB.
 
 Clipboard, file selection/download and URL opening are explicit browser
 operations and can be denied or cancelled. File and session text is limited to

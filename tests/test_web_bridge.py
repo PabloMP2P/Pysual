@@ -283,6 +283,15 @@ class WebBundleBridgeTests(unittest.TestCase):
                     with self.subTest(source=source), self.assertRaisesRegex(ValueError, "MiB"):
                         host._resolve_image_source(source)
 
+    def test_embedded_svg_uses_shared_base64_validation(self):
+        host = self.host(browser_bridge())
+        source = "data:image/svg+xml;base64," + base64.b64encode(
+            b'<svg xmlns="http://www.w3.org/2000/svg"/>'
+        ).decode("ascii")
+        self.assertEqual(host._resolve_image_source(source), source)
+        with self.assertRaises(ValueError):
+            host._resolve_image_source("data:image/svg+xml;base64,invalid!")
+
     def test_page_scale_is_explicit_and_resource_changes_invalidate_caches(self):
         bridge = browser_bridge()
         host = self.host(bridge)

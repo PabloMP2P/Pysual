@@ -1,9 +1,12 @@
 """Scene behavior shared by the native and Pyodide delivery adapters."""
 
+import base64
 import json
+import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from math import ceil, floor
+from pathlib import Path
 from unittest.mock import patch
 
 from pysual import App, Button, Dropdown, Rect, get_theme
@@ -197,6 +200,49 @@ class SVGRendererTests(unittest.TestCase):
         self.assertNotIn(source, json.dumps(packet["updates"]))
         scene.report_image_error(int(identifier))
         self.assertIn("Browser could not decode", scene.errors[0])
+
+    def test_svg_files_and_data_stay_embedded_as_image_resources(self):
+        data = (
+            b'<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" '
+            b'viewBox="0 0 2 1"><rect width="2" height="1" fill="red"/></svg>'
+        )
+        embedded = "data:image/svg+xml;base64," + base64.b64encode(data).decode("ascii")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "image.SVG"
+            path.write_bytes(data)
+            for source in (str(path), embedded):
+                with self.subTest(source=source):
+                    self.scene.begin("#ffffff")
+                    self.scene.image(source, Rect(0, 0, 20, 10), fit="contain")
+                    self.scene.present()
+                    root = ET.fromstring(self.scene.export_svg())
+                    namespace = {"s": "http://www.w3.org/2000/svg"}
+                    image = root.find("s:image", namespace)
+                    self.assertEqual(image.get("href"), embedded)
+                    self.assertEqual(image.get("preserveAspectRatio"), "xMidYMid meet")
+                    self.assertEqual(root.findall(".//s:svg", namespace), [])
+                    self.assertEqual(
+                        list(self.scene.frame_packet(-1)["image_sources"].values()),
+                        [embedded],
+                    )
+                    self.assertNotIn(str(path), self.scene.export_svg())
+        self.assertEqual(self.scene.errors, [])
+
+    def test_svg_file_and_data_size_limits_and_invalid_base64(self):
+        limit = 32 * 1024 * 1024
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "large.svg"
+            with path.open("wb") as stream:
+                stream.write(b'<svg xmlns="http://www.w3.org/2000/svg"/>')
+                stream.truncate(limit + 1)
+            with self.assertRaisesRegex(ValueError, "32 MiB"):
+                self.scene._resolve_image_source(str(path))
+        oversized = "data:image/svg+xml;base64," + "A" * (((limit + 2) // 3) * 4 + 4)
+        with self.assertRaisesRegex(ValueError, "32 MiB"):
+            self.scene._resolve_image_source(oversized)
+        self.scene.image("data:image/svg+xml;base64,not!base64", Rect(0, 0, 1, 1))
+        self.assertEqual(self.scene._nodes, [])
+        self.assertEqual(len(self.scene.errors), 1)
 
     def test_disconnected_strokes_keep_separate_svg_overlap_composition(self):
         scene = self.scene

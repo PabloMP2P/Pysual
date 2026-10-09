@@ -316,6 +316,25 @@ def check_dashboard(page, app):
             "horizontal_wheel", "shift_wheel"]
 
 
+def check_live_images(page, app):
+    from PIL import Image
+    from playwright.sync_api import expect
+
+    expect(page.locator("#frame image")).to_have_count(2)
+    deadline = time.monotonic() + 10
+    while True:
+        pixels = Image.open(io.BytesIO(page.screenshot())).convert("RGB")
+        samples = [pixels.getpixel((70 + 150 * index, 70)) for index in range(2)]
+        if samples == [(59, 130, 246)] * 2:
+            break
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"Live local/data SVG pixels: {samples}")
+        page.wait_for_timeout(50)
+    # SVG files remain image resources, never markup inserted into the DOM.
+    assert page.locator("#frame #asset-only").count() == 0
+    return ["local_svg_pixels", "data_svg_pixels", "svg_stays_in_image_context"]
+
+
 def check_live_transport(browser, *, fallback=False):
     from playwright.sync_api import expect
     from pysual import App, Label
@@ -438,8 +457,10 @@ def check_live_transport(browser, *, fallback=False):
 
 
 def check_live():
+    import base64
+
     from playwright.sync_api import sync_playwright
-    from pysual import App, Button, Style, Theme, Toggle, Tokens
+    from pysual import App, Button, Image, Style, Theme, Toggle, Tokens
     from pysual.backends.web import WebHost
     from examples.hello import Hello
     from examples.dashboard import Dashboard
@@ -456,6 +477,19 @@ def check_live():
 
     destination = ROOT / ".build/web-live"
     destination.mkdir(parents=True, exist_ok=True)
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">'
+           '<rect id="asset-only" width="100" height="100" fill="#3b82f6"/></svg>')
+    svg_file = destination / "image.svg"
+    svg_file.write_text(svg, encoding="utf-8")
+
+    class ImageSmoke(App):
+        def build(self):
+            self.layout = "absolute"
+            self.local_image = Image(source=str(svg_file), left=20, top=20, width=100, height=100)
+            self.data_image = Image(source="data:image/svg+xml;base64," +
+                                    base64.b64encode(svg.encode()).decode(),
+                                    left=170, top=20, width=100, height=100)
+
     diagnostics = {"apps": {}, "success": False}
     try:
         with sync_playwright() as playwright:
@@ -464,6 +498,7 @@ def check_live():
             try:
                 scenarios = (("hello", Hello, check_hello),
                              ("dashboard", Dashboard, check_dashboard),
+                             ("images", ImageSmoke, check_live_images),
                              ("feedback", FeedbackSmoke,
                               lambda page, app: check_feedback_and_resize(page, "#frame")))
                 for name, app_type, scenario in scenarios:

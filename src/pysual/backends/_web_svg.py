@@ -592,8 +592,9 @@ class SVGRenderer:
                 "data:image/jpeg;base64",
                 "data:image/gif;base64",
                 "data:image/webp;base64",
+                "data:image/svg+xml;base64",
             }:
-                raise ValueError("Images must be PNG, JPEG, GIF or WebP data")
+                raise ValueError("Images must be PNG, JPEG, GIF, WebP or SVG data")
             limit = (
                 MAX_IMAGE_BYTES
                 if header == "data:image/png;base64"
@@ -613,6 +614,8 @@ class SVGRenderer:
                     else 32 * 1024 * 1024
                 )
                 data += stream.read(limit - len(data) + 1)
+            if len(data) > limit:
+                raise ValueError(f"Image exceeds {limit // (1024 * 1024)} MiB")
             if data.startswith(b"\x89PNG\r\n\x1a\n"):
                 mime = "png"
             elif data.startswith(b"\xff\xd8\xff"):
@@ -621,8 +624,12 @@ class SVGRenderer:
                 mime = "gif"
             elif data.startswith(b"RIFF") and data[8:12] == b"WEBP":
                 mime = "webp"
+            elif path.suffix.lower() == ".svg":
+                # Keep SVG in an image resource, never insert its markup into
+                # the page. The browser validates and decodes its contents.
+                mime = "svg+xml"
             else:
-                raise ValueError("Web images must be PNG, JPEG, GIF or WebP")
+                raise ValueError("Web images must be PNG, JPEG, GIF, WebP or SVG")
             # Use the portable PNG API's encoded/header/decoded bounds without
             # decoding the pixels twice. The browser reports decode failures.
             value = (
