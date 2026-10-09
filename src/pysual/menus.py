@@ -640,13 +640,10 @@ class MenuBar(Control):
             style = p.style("item", selected=active and not self._overflow_open
                             and index == self._active_group)
             p.surface(Rect(x, 0, width, p.height), style)
+            # Layout reserves the full caption; subtracting padding can lose
+            # a floating-point bit and incorrectly elide fractional metrics.
             p.text(
-                p.elide(
-                    single_line(group.text),
-                    width - 24,
-                    size=style.font_size,
-                    font_family=style.font_family,
-                ),
+                single_line(group.text),
                 x + 12,
                 (p.height - self.effective_row_height(style.font_size * 1.2)) / 2,
                 color=style.foreground,

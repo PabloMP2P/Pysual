@@ -5,11 +5,43 @@ from _ui_testcase import AsyncUIOwnerTestCase, UIOwnerTestCase
 from pysual import App, Button, Menu, MenuBar, MenuGroup, MenuItem
 from pysual.commands import normalize_shortcut
 from pysual.host import Input
+from pysual.layout import arrange
+from pysual.painting import paint_tree
 from pysual.runtime import Runtime
 from test_library import RecordingHost, eventually
 
 
 class MenuDataTests(UIOwnerTestCase):
+    def test_fractional_header_metrics_keep_full_captions_and_overflow(self):
+        class FractionalHost(RecordingHost):
+            def measure(self, text, size, mono=False):
+                widths = {"File": 70 / 3, "Edit": 28.8}
+                return widths.get(text, len(text) * 7), size * 1.2
+
+        app, host = App(), FractionalHost()
+        self.addCleanup(app.destroy)
+        bar = MenuBar(parent=app, groups=(
+            MenuGroup("File", (MenuItem("open", "Open"),)),
+            MenuGroup("Edit", (MenuItem("copy", "Copy"),)),
+        ))
+        for width, captions, visible in (
+            (400, ["File", "Edit"], 2),
+            (90, ["File", "…"], 1),
+            (70, ["…"], 0),
+        ):
+            with self.subTest(width=width):
+                bar.width = width
+                arrange(app, host)
+                paint_tree(app, host)
+                self.assertEqual(host.texts, captions)
+                self.assertEqual(bar._overflow_start, visible)
+                for index in range(visible):
+                    box = bar._headers[index]
+                    expected = host.measure(bar.groups[index].text, 15)[0] + 24
+                    self.assertEqual(box.width, expected)
+                    self.assertLessEqual(box.right, bar.bounds.right)
+                self.assertLessEqual(bar._overflow_rect.right, bar.bounds.right)
+
     def test_named_shortcuts_accept_case_variants_and_reject_alias_duplicates(self):
         for key in ("Enter", "Space", "Home", "End", "PageUp", "PageDown",
                     "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"):
