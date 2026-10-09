@@ -59,9 +59,9 @@ class VisualFixture(App):
                                               width=348, height=398)
 
 
-def fixture(theme):
+def fixture(theme, *, scale=SCALE):
     return VisualFixture(title="Pysual visual check", width=SIZE[0], height=SIZE[1],
-                         theme=get_theme(theme), reduce_motion=True, ui_scale=SCALE)
+                         theme=get_theme(theme), reduce_motion=True, ui_scale=scale)
 
 
 def close(app):
@@ -72,10 +72,10 @@ def close(app):
         app.destroy()
 
 
-def capture_native(theme, path):
+def capture_native(theme, path, *, scale=SCALE):
     from pysual.backends.native import NativeHost
 
-    app, host = fixture(theme), NativeHost(hidden=True, vsync=False)
+    app, host = fixture(theme, scale=scale), NativeHost(hidden=True, vsync=False)
     try:
         app.run(backend=host)
         bitmap = path.with_suffix(".bmp")
@@ -171,6 +171,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("native", "web", "all"), default="all")
     parser.add_argument("--mode", choices=("capture", "check", "update"), default="check")
+    parser.add_argument("--native-scale", type=float, choices=(1, 1.5), default=SCALE,
+                        help="Native capture scale; use 1 on small desktops (web stays at 1.5)")
     parser.add_argument("--output", type=Path, default=ROOT / ".build/visual")
     parser.add_argument("--baselines", type=Path,
                         default=ROOT / "tests/visual_baselines" / platform.system().lower())
@@ -189,6 +191,7 @@ def main():
             playwright = sync_playwright().start()
             browser = playwright.chromium.launch(channel="chromium", headless=True, args=list(WEB_ARGS))
         for backend in (("native", "web") if options.backend == "all" else (options.backend,)):
+            scale = options.native_scale if backend == "native" else SCALE
             output, baseline = options.output / backend, options.baselines / backend
             output.mkdir(parents=True, exist_ok=True)
             records = result["backends"][backend] = {}
@@ -199,10 +202,11 @@ def main():
                 for suffix in ("-diff.png", "-expected.png"):
                     (output / f"{theme}{suffix}").unlink(missing_ok=True)
                 path = output / f"{theme}.png"
-                environment.update(capture_native(theme, path) if backend == "native"
+                environment.update(capture_native(theme, path, scale=scale) if backend == "native"
                                    else capture_web(browser, theme, path))
                 with Image.open(path) as image:
-                    assert image.size == tuple(int(value * SCALE) for value in SIZE), image.size
+                    expected = tuple(int(value * scale) for value in SIZE)
+                    assert image.size == expected, (image.size, expected)
             (output / "environment.json").write_text(json.dumps(environment, indent=2) + "\n", encoding="utf-8")
             if options.mode == "update":
                 baseline.mkdir(parents=True, exist_ok=True)

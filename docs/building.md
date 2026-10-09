@@ -283,8 +283,8 @@ Windows CI also opts into the existing isolated console-restoration test.
 The small visual fixture covers menus, enabled/disabled buttons, selected rows,
 text entry, a selected card and a fixed-date calendar in modern, modern-dark
 and macOS themes. Native and Chromium images have separate baselines; both
-use an 800 by 560 logical viewport at 1.5 device scale, including fractional
-menu metrics. It requires the development dependencies and the relevant host:
+use an 800 by 560 logical viewport at 1.5 device scale by default, including
+fractional menu metrics. It requires the development dependencies and the relevant host:
 
 ```sh
 python tools/check_visual.py --mode capture
@@ -312,10 +312,16 @@ Preserve the pixel tolerance when updating rendering conditions; review
 differences and verify repeated captures before accepting new images.
 
 CI captures the scene and retains review artifacts on each native platform
-and in Chromium. Pixel gating remains an explicit check in a matching,
-reviewed environment instead of making unqualified cross-platform images
-equivalent. Keep this small matrix alongside the behavioral and incremental
-render-parity tests; do not replace those tests with screenshots.
+and in Chromium. Native CI uses `--native-scale 1` for an exact 800 by 560 pixel
+capture that fits hosted desktops; requesting 1200 by 840 pixels can exceed the
+usable desktop area and the native host correctly clamps the window. Web CI
+retains scale 1.5, and native text tests still cover fractional scale 1.5.
+The native scale option does not change the fixture's logical layout or the
+reviewed default baselines. Captures must match the requested pixel dimensions;
+smaller or cropped images are rejected. Pixel gating remains an explicit check
+in a matching, reviewed environment instead of making unqualified cross-platform
+images equivalent. Keep this small matrix alongside the behavioral and
+incremental render-parity tests; do not replace those tests with screenshots.
 
 ## Format native terminal code
 

@@ -92,9 +92,9 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
-            SDL_VIDEO_DRIVER=x11 LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a -s '-screen 0 1440x1080x24' python tools/check_visual.py --backend native --mode capture
+            SDL_VIDEO_DRIVER=x11 LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a -s '-screen 0 1440x1080x24' python tools/check_visual.py --backend native --native-scale 1 --mode capture
           else
-            python tools/check_visual.py --backend native --mode capture
+            python tools/check_visual.py --backend native --native-scale 1 --mode capture
           fi
       - name: Preserve native visual review artifacts
         if: always() && matrix.python == '3.14'
