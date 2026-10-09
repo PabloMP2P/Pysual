@@ -74,35 +74,38 @@ def _reduce(points, buckets):
 
 def _axis_labels(values, available, measure):
     """Format a small tick set together, retaining its visible differences."""
-    numbers = tuple(Decimal(str(value)) for value in values)
+    # Axis formatting must not inherit the application's Decimal precision or
+    # traps, nor leave rounding flags in the caller's context.
+    with localcontext(Context(prec=28)):
+        numbers = tuple(Decimal(str(value)) for value in values)
 
-    def labels_for(ticks):
-        gaps = [abs(b - a) for a, b in zip(ticks, ticks[1:]) if a != b]
-        largest = max(map(abs, ticks))
-        precision = max(4, largest.adjusted() - min(gaps).adjusted() + 2) if gaps else 4
-        for digits in range(min(17, precision), 18):
-            labels = tuple(format(float(value), f".{digits}g") for value in ticks)
-            if len(set(labels)) == len(set(ticks)):
-                return labels
-        return labels
+        def labels_for(ticks):
+            gaps = [abs(b - a) for a, b in zip(ticks, ticks[1:]) if a != b]
+            largest = max(map(abs, ticks))
+            precision = max(4, largest.adjusted() - min(gaps).adjusted() + 2) if gaps else 4
+            for digits in range(min(17, precision), 18):
+                labels = tuple(format(float(value), f".{digits}g") for value in ticks)
+                if len(set(labels)) == len(set(ticks)):
+                    return labels
+            return labels
 
-    labels = labels_for(numbers)
-    if max(map(measure, labels)) <= available:
+        labels = labels_for(numbers)
+        if max(map(measure, labels)) <= available:
+            return labels, ""
+        span = max(numbers) - min(numbers)
+        largest = max(map(abs, numbers))
+        # Close values with a large shared base (such as timestamps) benefit from
+        # an explicit additive offset; wide ranges instead share an exponent.
+        if span and largest > span * 100:
+            shifted = labels_for(tuple(value - numbers[0] for value in numbers))
+            if max(map(measure, shifted)) <= available:
+                offset = format(float(numbers[0]), ".17g")
+                return shifted, ("+" if numbers[0] >= 0 else "") + offset
+        exponent = largest.adjusted() if largest else 0
+        if exponent:
+            scale = Decimal(10) ** exponent
+            return labels_for(tuple(value / scale for value in numbers)), f"×1e{exponent}"
         return labels, ""
-    span = max(numbers) - min(numbers)
-    largest = max(map(abs, numbers))
-    # Close values with a large shared base (such as timestamps) benefit from
-    # an explicit additive offset; wide ranges instead share an exponent.
-    if span and largest > span * 100:
-        shifted = labels_for(tuple(value - numbers[0] for value in numbers))
-        if max(map(measure, shifted)) <= available:
-            offset = format(float(numbers[0]), ".17g")
-            return shifted, ("+" if numbers[0] >= 0 else "") + offset
-    exponent = largest.adjusted() if largest else 0
-    if exponent:
-        scale = Decimal(10) ** exponent
-        return labels_for(tuple(value / scale for value in numbers)), f"×1e{exponent}"
-    return labels, ""
 
 
 class LineChart(Control):

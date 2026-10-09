@@ -4,6 +4,7 @@ import asyncio
 import unittest
 from _ui_testcase import AsyncUIOwnerTestCase
 from dataclasses import FrozenInstanceError
+from decimal import Inexact, Overflow, Underflow, localcontext
 from math import isfinite
 from unittest.mock import patch
 
@@ -138,6 +139,32 @@ class ChartTests(unittest.TestCase):
             self.assertEqual(chart._fractions, (1.0,))
         finally:
             chart.destroy()
+
+    def test_line_chart_labels_are_independent_of_caller_decimal_context(self):
+        app, host = App(), RecordingHost()
+        self.addCleanup(app.destroy)
+        chart = app.line_chart(width=300, height=260, show_legend=False)
+        arrange(app, host)
+        for points in (
+            ((1e30, 1), (1e30 + 1e15, 2)),
+            ((-1.7e308, 0), (1.7e308, 1)),
+            ((0, 0), (5e-324, 5e-324)),
+        ):
+            with self.subTest(points=points):
+                chart.series = (ChartSeries("s", "Values", points),)
+                paint_tree(app, host)
+                expected = list(host.texts)
+                with localcontext() as context:
+                    context.prec = 6
+                    context.Emax, context.Emin = 9, -9
+                    for signal in (Inexact, Overflow, Underflow):
+                        context.traps[signal] = True
+                    context.clear_flags()
+                    paint_tree(app, host)
+                    self.assertEqual(host.texts, expected)
+                    self.assertFalse(any(context.flags.values()))
+                    self.assertEqual((context.prec, context.Emax, context.Emin), (6, 9, -9))
+                    self.assertTrue(all(context.traps[s] for s in (Inexact, Overflow, Underflow)))
 
     def test_donut_uses_shared_primitives_handles_empty_and_elides_legend(self):
         app, host = App(width=500, height=400), RecordingHost()
