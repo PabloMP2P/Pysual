@@ -7,9 +7,11 @@ Native Linux/macOS wheels need the documented system SDL libraries. Their loader
 paths are preserved; source imports and native-helper overrides are removed.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import shutil
 import subprocess
 import tempfile
@@ -30,6 +32,8 @@ def main():
         parser.error(f"Expected exactly one {options.kind} wheel, found {wheels}; use --wheel")
     evidence = ROOT / ".build/wheel-probes" / options.kind
     evidence.mkdir(parents=True, exist_ok=True)
+    result_path = evidence / "result.json"
+    result_path.unlink(missing_ok=True)  # A failed rerun must not retain success.
     environment = dict(os.environ)
     for name in ("PYTHONPATH", "PYTHONHOME", "PYSUAL_HOST", "PYSUAL_TERMINAL"):
         environment.pop(name, None)
@@ -56,6 +60,18 @@ def main():
                 if (directory / "frame.bmp").is_file():
                     shutil.copy2(directory / "frame.bmp", evidence / "frame.bmp")
         print((evidence / "process.log").read_text(encoding="utf-8"), end="")
+    distributions = [wheels[0]]
+    sdist = wheels[0].with_name("-".join(wheels[0].name.split("-")[:2]) + ".tar.gz")
+    if options.kind == "pure" and sdist.is_file():
+        distributions.append(sdist)
+    result_path.write_text(json.dumps({
+        "success": True, "kind": options.kind,
+        "commit": os.environ.get("GITHUB_SHA"),
+        "python": platform.python_version(), "platform": platform.platform(),
+        "wheel_tested": wheels[0].name,
+        "distributions": {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                          for path in distributions},
+    }, indent=2) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

@@ -32,6 +32,19 @@ jobs:
         run: python -m pysual package
       - name: Check pure wheel in a fresh environment outside the checkout
         run: python tools/check_wheel.py --kind pure
+      - name: Retain verified pure distributions
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.14'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pure-${{ github.sha }}-${{ matrix.os }}-py${{ matrix.python }}
+          path: |
+            dist/*-none-any.whl
+            dist/*.tar.gz
+            .build/wheel-probes/pure/result.json
+            .build/wheel-probes/pure/process.log
+          retention-days: 14
+          if-no-files-found: error
+          include-hidden-files: true
       - name: Linux native prerequisites
         if: matrix.python == '3.14' && runner.os == 'Linux'
         run: |
@@ -95,6 +108,20 @@ jobs:
           else
             python tools/check_frozen.py
           fi
+      - name: Retain verified native distributions
+        if: matrix.python == '3.14'
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ github.sha }}-${{ matrix.os }}-py${{ matrix.python }}
+          path: |
+            dist/*.whl
+            !dist/*-none-any.whl
+            .build/wheel-probes/native/result.json
+            .build/wheel-probes/native/process.log
+            .build/frozen-probes/*-run/result.json
+          retention-days: 14
+          if-no-files-found: error
+          include-hidden-files: true
       - name: Build terminal host without SDL
         if: matrix.python == '3.14'
         run: python -m pysual native --terminal-only --output .build/terminal-only

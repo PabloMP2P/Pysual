@@ -237,6 +237,16 @@ python tools/check_frozen.py
 ```
 
 Use `--wheel FILE` to select a wheel when `dist` contains multiple versions.
+Successful wheel checks write `.build/wheel-probes/<kind>/result.json` with
+the tested wheel's SHA256, interpreter/platform details, and CI commit when
+available. A matching source archive is checksummed too; the wheel is the
+artifact exercised by the installation probe. CI retains the pure wheel and
+source archive once, and each tested native wheel with its compact probe
+results, for 14 days. Artifact names include commit, platform, and Python
+version. Pure artifacts are uploaded before the native build, so the exact
+validated files remain available even if a later stage fails. These artifacts
+are build outputs, not automatically published releases.
+
 For the standalone browser check, install Chromium once and run:
 
 ```sh
