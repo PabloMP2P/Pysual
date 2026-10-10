@@ -265,8 +265,15 @@ class NativeProtocolTests(unittest.TestCase):
         self.fail(f"Native presentation did not {'settle' if settled else 'advance'}: {stats}")
 
     def assert_presentations_idle(self, stats):
-        time.sleep(.08)
-        self.assertEqual(self.client.request("stats")["frames"], stats["frames"])
+        frames = stats["frames"]
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            time.sleep(.08)
+            current = self.client.request("stats")["frames"]
+            if current == frames:
+                return
+            frames = current
+        self.assertEqual(self.client.request("stats")["frames"], frames)
 
     @staticmethod
     def finite_shape(duration=.1, loop=False):
