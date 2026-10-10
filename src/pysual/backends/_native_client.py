@@ -30,6 +30,87 @@ class NativeHostError(RuntimeError):
     pass
 
 
+# Keep this text equal to the rejection in native/host.c. Raw frames bypass Python.
+_NUL_ERROR = 'Embedded NUL is not representable in a native C string'
+
+
+def display_text(value):
+    """Drop U+0000 from text that is measured, drawn, or shown as a title.
+
+    Characters on either side stay in order. Terminal painting removes this
+    same character; its other control-character rules stay terminal-specific.
+    """
+    if isinstance(value, str) and '\0' in value:
+        return value.replace('\0', '')
+    return value
+
+
+def _contains_embedded_nul(value):
+    if isinstance(value, str):
+        return '\0' in value
+    if isinstance(value, dict):
+        return any(_contains_embedded_nul(key) or _contains_embedded_nul(item)
+                   for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_embedded_nul(item) for item in value)
+    return False
+
+
+def _sanitize_commands(commands):
+    if not isinstance(commands, (list, tuple)):
+        return commands
+    sanitized = None
+    for index, command in enumerate(commands):
+        if (isinstance(command, (list, tuple)) and len(command) > 1 and command[0] == 'text'
+                and isinstance(command[1], str) and '\0' in command[1]):
+            if sanitized is None:
+                sanitized = list(commands)
+            sanitized[index] = [command[0], display_text(command[1]), *command[2:]]
+    return commands if sanitized is None else sanitized
+
+
+def _sanitize_segment(segment):
+    if not isinstance(segment, dict):
+        return segment
+    commands = _sanitize_commands(segment.get('commands'))
+    if commands is segment.get('commands'):
+        return segment
+    return {**segment, 'commands': commands}
+
+
+def _sanitize_display_nuls(op, fields):
+    fields = dict(fields)
+    if op == 'measure' and isinstance(fields.get('text'), str):
+        fields['text'] = display_text(fields['text'])
+    elif op == 'measure_many' and isinstance(fields.get('texts'), (list, tuple)):
+        fields['texts'] = [display_text(item) for item in fields['texts']]
+    elif op in ('set_title', 'open') and isinstance(fields.get('title'), str):
+        fields['title'] = display_text(fields['title'])
+    elif op == 'frame':
+        fields['commands'] = _sanitize_commands(fields.get('commands'))
+    elif op == 'patch' and isinstance(fields.get('upsert'), (list, tuple)):
+        fields['upsert'] = [_sanitize_segment(segment) for segment in fields['upsert']]
+    return fields
+
+
+def prepare_native_request(op, fields):
+    """Apply the embedded-NUL policy before a native request is serialized.
+
+    Display text, measurements and titles drop U+0000. Clipboard text, paths,
+    identifiers and every other string are rejected. The C host stores strings
+    with a terminating zero, so leaving the character in place would hide the
+    suffix during measurement, drawing, JSON duplication and service calls.
+    """
+    if not isinstance(fields, dict):
+        raise TypeError('Native request fields must be a dictionary')
+    if '\0' not in op and not _contains_embedded_nul(fields):
+        return fields
+    sanitized = _sanitize_display_nuls(op, fields)
+    if '\0' in op or _contains_embedded_nul(sanitized):
+        raise ValueError(_NUL_ERROR)
+    return sanitized
+
+
 def _read_handshake(sock, check_startup):
     # Poll actual cancellation/process failure without imposing an elapsed
     # deadline on a live helper, including a partially received handshake.
@@ -295,6 +376,7 @@ class NativeClient:
     def request(self, op, **kwargs):
         if not isinstance(op, str):
             raise TypeError('op must be a string')
+        kwargs = prepare_native_request(op, kwargs)
         payload = json.dumps({'op': op, **kwargs}, ensure_ascii=False,
                              allow_nan=False, separators=(',', ':')).encode('utf-8')
         if len(payload) > MAX_PAYLOAD:

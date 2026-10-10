@@ -14,6 +14,7 @@ from pathlib import Path
 
 from ..host import CapabilityError, Input, MAX_TEXT_BYTES, Viewport
 from ._native import NativeServices
+from ._native_client import display_text
 
 
 def _rect(rect):
@@ -144,6 +145,7 @@ class NativeHost(NativeServices):
             from ._native_client import NativeClient
             factory = lambda **kwargs: NativeClient(executable=self._executable, **kwargs)
         self._client = factory(on_event=self._on_event)
+        title = display_text(title)
         try:
             self.info = self._request(
                 "open", backend=self.backend, title=title, width=width, height=height,
@@ -232,6 +234,7 @@ class NativeHost(NativeServices):
         self._transition_seconds = max(self._transition_seconds, seconds)
 
     def set_title(self, title):
+        title = display_text(title)
         if title != self._title:
             self._request("set_title", title=title)
             self._title = title
@@ -279,7 +282,7 @@ class NativeHost(NativeServices):
         self._commands.append(["rect", _rect(rect), fill, radius, border, border_width])
 
     def text(self, text, x, y, color, size, mono=False):
-        self._commands.append(["text", text, x, y, color, size, mono])
+        self._commands.append(["text", display_text(text), x, y, color, size, mono])
 
     def _store_metric(self, text, size, mono, result):
         if len(text) > 8192:
@@ -299,6 +302,7 @@ class NativeHost(NativeServices):
         return result
 
     def measure(self, text, size, mono=False):
+        text = display_text(text)
         key = (text, size, mono)
         if key in self._metrics:
             self._metrics.move_to_end(key)
@@ -310,7 +314,7 @@ class NativeHost(NativeServices):
         """Measure several strings in one native round trip and fill the same cache."""
         if isinstance(texts, str):
             raise TypeError("measure_many expects a sequence of strings")
-        texts = tuple(texts)
+        texts = tuple(display_text(text) for text in texts)
         if len(texts) > 4096:
             raise ValueError("measure_many accepts at most 4096 strings")
         results = [None] * len(texts)

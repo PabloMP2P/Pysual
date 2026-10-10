@@ -98,7 +98,11 @@ def _character_flags(character: str) -> int:
 
 
 def safe_text(text: str) -> str:
-    """Keep printable Unicode, line breaks and tabs, never terminal controls."""
+    """Keep printable Unicode, line breaks and tabs, never terminal controls.
+
+    U+0000 is removed, as it is for native display text, so the characters
+    after it stay visible. Other controls are dropped only for terminals.
+    """
     result = []
     for character in text:
         flags = _character_flags(character)

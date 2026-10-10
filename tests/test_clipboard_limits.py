@@ -21,7 +21,7 @@ class ClipboardLimitTests(unittest.IsolatedAsyncioTestCase):
         client._start = Mock(side_effect=AssertionError("Must not start a process"))
         client._send = Mock(side_effect=AssertionError("Must not send clipboard data"))
         host._request = client.request
-        for value in ("x" * (MAX_TEXT_BYTES + 1), "\x01" * (3 * 1024 * 1024), "\ud800"):
+        for value in ("x" * (MAX_TEXT_BYTES + 1), "\x01" * (3 * 1024 * 1024), "\ud800", "A\0B"):
             with self.subTest(length=len(value)), self.assertRaises(CapabilityError):
                 await host.clipboard_write(value)
         self.assertFalse(client._closed.is_set())

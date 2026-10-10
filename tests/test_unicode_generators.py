@@ -92,3 +92,4 @@ def test_python_terminal_uses_the_complete_shared_width_and_category_baseline():
         ("\u2630", 1), ("\U0001fae9", 1), ("\U0001fa89", 1), ("\U0001fa8f", 1), ("\U0001f680", 2),
     ]
     assert safe_text("a\x1b\u202e\ud800\n\t\u200d") == "a\ufffd\n\t\u200d"
+    assert safe_text("A\0B") == "AB"

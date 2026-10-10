@@ -12,6 +12,7 @@ static int clipboard_fits(const char *text) {
     /* A string result uses 23 bytes for {"ok":true,"result":""}.
        Match cJSON escaping without allocating an oversized wire reply. */
     const size_t content_budget = PX_MAX_PAYLOAD - 23u;
+    /* Embedded U+0000 is rejected before text becomes a C string. */
     for (; *p; p++) {
         unsigned int cost = 1;
         if (++source > PX_MAX_CLIPBOARD)

@@ -265,11 +265,64 @@ static void configure(Host *h, const cJSON *j) {
         h->fps_limit = fmax(0, number(j, "fps_limit", 0));
 }
 
+static int hex_nibble(unsigned char c) {
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+/* cJSON stores every string with a terminating zero. An embedded U+0000 would
+   hide the rest from strlen and from JSON duplication. Reject that command
+   before parse. Python removes U+0000 from display text before serialization
+   and rejects it for every other string. */
+static int json_string_has_nul(const unsigned char *data, size_t length) {
+    size_t i = 0;
+    int quoted = 0;
+    while (i < length) {
+        unsigned char c = data[i++];
+        if (!quoted) {
+            if (c == '"')
+                quoted = 1;
+            continue;
+        }
+        if (c == '"') {
+            quoted = 0;
+            continue;
+        }
+        if (c == 0)
+            return 1;
+        if (c != '\\')
+            continue;
+        if (i >= length)
+            return 0;
+        c = data[i++];
+        if (c != 'u')
+            continue;
+        if (i + 4 > length)
+            return 0;
+        if (data[i] == 0 || data[i + 1] == 0 || data[i + 2] == 0 || data[i + 3] == 0 ||
+            (!hex_nibble(data[i]) && !hex_nibble(data[i + 1]) && !hex_nibble(data[i + 2]) &&
+             !hex_nibble(data[i + 3])))
+            return 1;
+        i += 4;
+    }
+    return 0;
+}
+
 static void process_command(Host *h, uint32_t id, const unsigned char *data, size_t length) {
     const char *end = NULL, *op;
     char error[1024] = {0};
     double command_started = now_seconds();
-    cJSON *j = cJSON_ParseWithLengthOpts((const char *)data, length, &end, 0), *result = NULL;
+    cJSON *j, *result = NULL;
+    if (length && json_string_has_nul(data, length)) {
+        reply(h, id, NULL, "Embedded NUL is not representable in a native C string");
+        return;
+    }
+    j = cJSON_ParseWithLengthOpts((const char *)data, length, &end, 0);
     if (!j || end != (const char *)data + length || !cJSON_IsObject(j)) {
         cJSON_Delete(j);
         reply(h, id, NULL, "Invalid JSON command");
