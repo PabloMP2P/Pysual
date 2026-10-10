@@ -305,8 +305,7 @@ static int json_string_has_nul(const unsigned char *data, size_t length) {
         if (i + 4 > length)
             return 0;
         if (data[i] == 0 || data[i + 1] == 0 || data[i + 2] == 0 || data[i + 3] == 0 ||
-            (!hex_nibble(data[i]) && !hex_nibble(data[i + 1]) && !hex_nibble(data[i + 2]) &&
-             !hex_nibble(data[i + 3])))
+            (!hex_nibble(data[i]) && !hex_nibble(data[i + 1]) && !hex_nibble(data[i + 2]) && !hex_nibble(data[i + 3])))
             return 1;
         i += 4;
     }
