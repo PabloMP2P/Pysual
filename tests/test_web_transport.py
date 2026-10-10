@@ -352,6 +352,83 @@ class LiveSVGHostTests(unittest.TestCase):
             self.request("GET", "/font-mono.ttf")[1][:4], b"\x00\x01\x00\x00"
         )
 
+    def test_event_ack_has_a_stricter_policy_without_changing_input_or_framing(self):
+        events = [
+            {"kind": "key_down", "key": "a"},
+            {"kind": "text", "text": "\u00e9"},
+            {"kind": "key_up", "key": "a"},
+        ]
+        status, body, headers = self.request(
+            "POST", "/events", json.dumps({"events": events})
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"{}")
+        self.assertEqual(headers["Content-Length"], "2")
+        self.assertEqual(headers["Content-Type"], "application/json; charset=utf-8")
+        self.assertNotIn("Transfer-Encoding", headers)
+        self.assertNotIn("Content-Encoding", headers)
+        self.assertEqual(
+            headers["Content-Security-Policy"],
+            "default-src 'none'; base-uri 'none'; "
+            "frame-ancestors 'none'; form-action 'none'",
+        )
+        for name, value in (
+            ("Cache-Control", "no-store"),
+            ("X-Content-Type-Options", "nosniff"),
+            ("Referrer-Policy", "no-referrer"),
+            ("Cross-Origin-Resource-Policy", "same-origin"),
+        ):
+            self.assertEqual(headers[name], value)
+        self.assertEqual(
+            self.host.poll(),
+            [Input("key_down", key="a"), Input("text", text="\u00e9"),
+             Input("key_up", key="a")],
+        )
+
+    def test_event_ack_does_not_change_document_asset_or_export_policy(self):
+        self.frame()
+        full_policy = self.request("GET", "/")[2]["Content-Security-Policy"]
+        self.assertIn("script-src 'self'", full_policy)
+        self.assertIn("style-src 'self' 'unsafe-inline'", full_policy)
+        ack_policy = self.request("POST", "/events", "{}")[2]["Content-Security-Policy"]
+        self.assertNotEqual(ack_policy, full_policy)
+        endpoints = ("/", "/live.js", "/font-sans.ttf", "/export.svg", "/export.html")
+        for endpoint in endpoints:
+            with self.subTest(endpoint=endpoint):
+                status, body, headers = self.request("GET", endpoint)
+                self.assertEqual(status, 200)
+                self.assertTrue(body)
+                self.assertEqual(headers["Content-Security-Policy"], full_policy)
+
+    def test_rejected_event_requests_keep_full_policy_and_security_checks(self):
+        full_policy = self.request("GET", "/")[2]["Content-Security-Policy"]
+        invalid_batch = '{"events":[{"kind":"text","text":"a"},{"kind":"shell"}]}'
+        oversized = {"headers": {"Content-Length": str(_MAX_REQUEST + 1)}}
+        cases = (
+            ("/events", "{}", {"authenticated": False}, 403),
+            ("/events", "{}", {"headers": {"Host": "attacker.invalid"}}, 403),
+            ("/events", "{}", {"headers": {"Origin": "https://evil.invalid"}}, 403),
+            ("/events", "{", {}, 400),
+            ("/events", invalid_batch, {}, 400),
+            ("/events", "{}", {"headers": {"Content-Type": "text/plain"}}, 415),
+            ("/events", "{}", oversized, 413),
+            ("/missing", "{}", {}, 404),
+        )
+        for endpoint, payload, options, expected in cases:
+            with self.subTest(endpoint=endpoint, options=options, expected=expected):
+                status, body, headers = self.request(
+                    "POST", endpoint, payload, **options
+                )
+                self.assertEqual(status, expected)
+                self.assertIn("error", json.loads(body))
+                self.assertEqual(headers["Content-Security-Policy"], full_policy)
+                self.assertEqual(headers["Content-Length"], str(len(body)))
+                self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+                self.assertEqual(headers["Cache-Control"], "no-store")
+                self.assertEqual(headers["Referrer-Policy"], "no-referrer")
+                self.assertEqual(headers["Cross-Origin-Resource-Policy"], "same-origin")
+        self.assertEqual(self.host.poll(), [])
+
     def test_browser_service_cancellation_and_save_acknowledgment(self):
         from importlib.resources import files
 
@@ -882,6 +959,7 @@ class LiveSVGHostTests(unittest.TestCase):
     def test_authorized_old_post_body_cannot_cross_launches(self):
         from pysual.backends import _web_native as adapter
 
+        full_policy = self.request("GET", "/")[2]["Content-Security-Policy"]
         old = urlsplit(self.host.url)
         connection = http.client.HTTPConnection(old.hostname, old.port, timeout=3)
         self.addCleanup(connection.close)
@@ -905,7 +983,10 @@ class LiveSVGHostTests(unittest.TestCase):
             self.host.close()
             self.host.open("New app", 320, 240, True, None)
             connection.send(body)
-            self.assertEqual(connection.getresponse().status, 410)
+            response = connection.getresponse()
+            self.assertEqual(response.status, 410)
+            self.assertEqual(response.read(), b"{}")
+            self.assertEqual(response.getheader("Content-Security-Policy"), full_policy)
         self.assertEqual(self.host.poll(), [])
 
     def test_reopen_session_writes_work_across_distinct_asyncio_loops(self):
@@ -968,8 +1049,8 @@ class LiveSVGHostTests(unittest.TestCase):
         finish_send = threading.Event()
         original = adapter._Handler._send
 
-        def send_then_wait(handler, status, body=b"", *args):
-            original(handler, status, body, *args)
+        def send_then_wait(handler, status, body=b"", *args, **kwargs):
+            original(handler, status, body, *args, **kwargs)
             if isinstance(body, str) and '"closed":true' in body:
                 # Receiving bytes does not imply the server write has returned.
                 # Force that ordering so this check never relies on scheduling.

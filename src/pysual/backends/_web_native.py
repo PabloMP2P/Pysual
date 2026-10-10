@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict, deque
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 import json
 from math import isfinite
+import re
 import secrets
 import socket
 from socketserver import TCPServer
@@ -23,16 +25,19 @@ import time
 from typing import cast
 from urllib.parse import parse_qs, urlsplit
 import webbrowser
+import zlib
 
 from ..host import CapabilityError, Input, MAX_TEXT_BYTES, TextFile, Viewport
 from . import _font
 from ._native import NativeServices
-from ._web_svg import SVGRenderer
+from ._web_svg import SVGRenderer, _FrameSnapshot
 
 
 # A legal UTF-8 result can expand sixfold as JSON (e.g. NUL -> \u0000).
 # The browser sends at most one large result in each bounded envelope.
 _MAX_REQUEST = MAX_TEXT_BYTES * 6 + 65536
+_MAX_CONNECTIONS = 12
+_COALESCED_CHUNK_LIMIT = 64 * 1024
 _INPUT_KINDS = frozenset(
     {
         "pointer_down",
@@ -62,6 +67,44 @@ def _number(value):
     return value
 
 
+def _accepts_gzip(value: str) -> bool:
+    """Select gzip only when a valid quality value permits it.
+
+    Explicit gzip settings take precedence over a wildcard. Malformed or
+    conflicting duplicate settings fail closed rather than enabling a coding
+    the client may have excluded. An explicit identity preference is honored.
+    """
+    qualities = {}
+    for item in value.split(","):
+        parts = item.split(";")
+        coding = parts[0].strip().lower()
+        if coding not in {"gzip", "identity", "*"}:
+            continue
+        quality = 1.0
+        if len(parts) > 1:
+            parameter, _, weight = parts[1].strip().partition("=")
+            weight = weight.strip()
+            if (
+                len(parts) != 2
+                or parameter.strip().lower() != "q"
+                or re.fullmatch(r"(?:0(?:\.[0-9]{0,3})?|1(?:\.0{0,3})?)", weight)
+                is None
+            ):
+                quality = 0.0
+            else:
+                quality = float(weight)
+        qualities[coding] = min(qualities.get(coding, 1.0), quality)
+    quality = qualities.get("gzip", qualities.get("*", 0.0))
+    return quality > 0 and quality >= qualities.get("identity", 0.0)
+
+
+@dataclass
+class _FrameCursor:
+    # One delivered base per stream, even if publication outruns socket writes.
+    snapshot: _FrameSnapshot | None = None
+    metadata_revision: int = -1
+
+
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
     block_on_close = False
@@ -70,7 +113,7 @@ class _Server(ThreadingHTTPServer):
     def __init__(self, address, adapter):
         self.adapter = adapter
         self.token = adapter._token
-        self.slots = threading.BoundedSemaphore(12)
+        self.slots = threading.BoundedSemaphore(_MAX_CONNECTIONS)
         super().__init__(address, _Handler)
 
     def server_bind(self):
@@ -129,19 +172,34 @@ class _Handler(BaseHTTPRequestHandler):
         status,
         body: bytes | str = b"",
         content_type="application/json; charset=utf-8",
+        *,
+        compress=False,
+        events_ack=False,
     ):
         if isinstance(body, str):
             body = body.encode("utf-8")
+        encoded = compress and _accepts_gzip(
+            ",".join(self.headers.get_all("Accept-Encoding", []))
+        )
+        if encoded:
+            compressor = zlib.compressobj(6, wbits=31)
+            body = compressor.compress(body) + compressor.flush()
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        if compress:
+            self.send_header("Vary", "Accept-Encoding")
+        if encoded:
+            self.send_header("Content-Encoding", "gzip")
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src data:; font-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+            "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+            if events_ack
+            else "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src data:; font-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
         )
         try:
             self.end_headers()
@@ -182,15 +240,27 @@ class _Handler(BaseHTTPRequestHandler):
         return True
 
     def _write_chunk(self, payload: bytes) -> None:
-        self.wfile.write(f"{len(payload):X}\r\n".encode("ascii"))
-        self.wfile.write(payload)
-        self.wfile.write(b"\r\n")
+        header = f"{len(payload):X}\r\n".encode("ascii")
+        if len(payload) <= _COALESCED_CHUNK_LIMIT:
+            # One socket write for small events; avoid copying large resets.
+            self.wfile.write(b"".join((header, payload, b"\r\n")))
+        else:
+            self.wfile.write(header)
+            self.wfile.write(payload)
+            self.wfile.write(b"\r\n")
         self.wfile.flush()
 
     def _stream(self, parsed):
         token = parse_qs(parsed.query).get("token", [""])[0]
         if not self._allowed(True, query_token=token):
             return
+        compressor = (
+            zlib.compressobj(6, wbits=31)
+            if _accepts_gzip(
+                ",".join(self.headers.get_all("Accept-Encoding", []))
+            )
+            else None
+        )
         self.close_connection = True
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -199,24 +269,35 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Vary", "Accept-Encoding")
+        if compressor is not None:
+            self.send_header("Content-Encoding", "gzip")
         self.send_header(
             "Content-Security-Policy",
             "default-src 'none'; connect-src 'self'",
         )
         self.end_headers()
         revision = -1
+        cursor = _FrameCursor()
         try:
             while True:
-                payload = self.adapter._frame_packet(revision, token=self.launch_token)
+                payload = self.adapter._frame_packet(
+                    revision, token=self.launch_token, cursor=cursor
+                )
                 # Metadata and services can change without a new scene revision.
                 # _frame_packet already waits when there is nothing to deliver.
                 body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-                self._write_chunk(f"data: {body}\n\n".encode("utf-8"))
+                event = f"data: {body}\n\n".encode("utf-8")
+                if compressor is not None:
+                    event = compressor.compress(event) + compressor.flush(zlib.Z_SYNC_FLUSH)
+                self._write_chunk(event)
                 revision = payload["revision"]
                 if payload["closed"]:
+                    if compressor is not None:
+                        self._write_chunk(compressor.flush(zlib.Z_FINISH))
+                    self._write_chunk(b"")
                     if self.launch_token == self.adapter._token:
                         self.adapter._closed_delivered.set()
-                    self._write_chunk(b"")
                     break
         except (
             BrokenPipeError,
@@ -276,7 +357,8 @@ class _Handler(BaseHTTPRequestHandler):
                     raise ValueError("Invalid revision")
                 payload = adapter._frame_packet(revision, token=self.launch_token)
                 self._send(
-                    200, json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+                    200, json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
+                    compress=True,
                 )
                 if payload["closed"] and self.launch_token == adapter._token:
                     adapter._closed_delivered.set()
@@ -303,7 +385,7 @@ class _Handler(BaseHTTPRequestHandler):
             if len(data) != length:
                 raise ValueError("Incomplete request")
             accepted = self.adapter._receive(json.loads(data), token=self.launch_token)
-            self._send(200 if accepted else 410, "{}")
+            self._send(200 if accepted else 410, "{}", events_ack=accepted)
         except (ValueError, TypeError, KeyError, UnicodeError) as exc:
             self._send(400, json.dumps({"error": str(exc)[:200]}))
         except (TimeoutError, ConnectionError):
@@ -354,6 +436,7 @@ class LiveSVGHost(SVGRenderer, NativeServices):
         self._pending = {}
         self._operation = 0
         self._sent_metadata_revision = -1
+        self._delivered_frames = OrderedDict()
         self._closed = True
         self._server = None
         self._thread = None
@@ -376,6 +459,7 @@ class LiveSVGHost(SVGRenderer, NativeServices):
             self._closed = False
             self._closed_delivered.clear()
             self._events.clear()
+            self._delivered_frames.clear()
             self._session_lock = asyncio.Lock()
             self._disconnect_at = None
             self._last_contact = None
@@ -564,7 +648,7 @@ class LiveSVGHost(SVGRenderer, NativeServices):
             "closed": True,
         }
 
-    def _frame_packet(self, revision, *, token: str | None = None):
+    def _frame_packet(self, revision, *, token: str | None = None, cursor=None):
         with self._condition:
             if token is not None and token != self._token:
                 return self._ended_packet()
@@ -573,9 +657,13 @@ class LiveSVGHost(SVGRenderer, NativeServices):
             if revision == -1:
                 self._disconnect_at = None
             self._last_contact = time.monotonic()
+            metadata_revision = (
+                cursor.metadata_revision if cursor is not None
+                else self._sent_metadata_revision
+            )
             self._condition.wait_for(
                 lambda: revision != self._revision
-                or self._metadata_revision != self._sent_metadata_revision
+                or self._metadata_revision != metadata_revision
                 or self._closed
                 or (token is not None and token != self._token),
                 timeout=15,
@@ -583,8 +671,26 @@ class LiveSVGHost(SVGRenderer, NativeServices):
             if token is not None and token != self._token:
                 return self._ended_packet()
             self._sent_metadata_revision = self._metadata_revision
+            base = (
+                cursor.snapshot if cursor is not None
+                else self._delivered_frames.get(revision)
+            )
+            packet = self.frame_packet(revision, _base=base)
+            snapshot = self._frame_snapshot()
+            if cursor is not None:
+                cursor.snapshot = snapshot
+                cursor.metadata_revision = self._metadata_revision
+            elif not self._closed:
+                # Polls can move between HTTP connections. Retain recently sent
+                # bases rather than every produced revision. This cache and the
+                # connection limit bound retention independently of frame rate;
+                # all snapshots share immutable nodes and image strings.
+                self._delivered_frames[snapshot.revision] = snapshot
+                self._delivered_frames.move_to_end(snapshot.revision)
+                while len(self._delivered_frames) > _MAX_CONNECTIONS:
+                    self._delivered_frames.popitem(last=False)
             return {
-                **self.frame_packet(revision),
+                **packet,
                 "commands": list(self._commands.values()),
                 "closed": self._closed,
             }
@@ -716,6 +822,7 @@ class LiveSVGHost(SVGRenderer, NativeServices):
                     loop.call_soon_threadsafe(finish)
             self._pending.clear()
             self._commands.clear()
+            self._delivered_frames.clear()
             self._condition.notify_all()
         server, self._server = self._server, None
         if server is not None:

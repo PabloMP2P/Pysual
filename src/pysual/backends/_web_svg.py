@@ -85,6 +85,16 @@ class _Surface:
     released: bool = False
 
 
+@dataclass(frozen=True)
+class _FrameSnapshot:
+    """References to one immutable scene, independent of publication history."""
+
+    epoch: object
+    revision: int
+    nodes: tuple
+    images: dict
+
+
 class SVGRenderer:
     """A local scene builder; subclasses supply services and frame delivery."""
 
@@ -97,6 +107,7 @@ class SVGRenderer:
         self._nodes = []
         self._frame_gradients = {}
         self._frames = OrderedDict()
+        self._frame_epoch = object()
         self._frame_image_sources = {}
         self._node_image_sources = {}
         self._revision = 0
@@ -112,6 +123,7 @@ class SVGRenderer:
         self._saved_group = None
         self._group_serial = 0
         self._segments = {}
+        self._segment_ids = {}
         self._segment_order = []
         self._segment_open = False
         self._segment_id = None
@@ -139,6 +151,7 @@ class SVGRenderer:
         self._title = str(title)
         self._nodes = []
         self._frames.clear()
+        self._frame_epoch = object()
         self._frame_image_sources.clear()
         self._revision = 0
         self._clip = None
@@ -157,6 +170,7 @@ class SVGRenderer:
         self._paint_group = None
         self._saved_group = None
         self._segments = {}
+        self._segment_ids.clear()
         self._segment_order = []
         self._segment_open = False
         self._segment_id = None
@@ -198,8 +212,20 @@ class SVGRenderer:
             self._text_rect = value
             self._metadata_revision += 1
 
-    def frame_packet(self, revision):
+    def _frame_snapshot(self):
+        return _FrameSnapshot(
+            self._frame_epoch, self._revision,
+            self._frames.get(self._revision, ()),
+            self._frame_image_sources.get(self._revision, {}),
+        )
+
+    def frame_packet(self, revision, *, _base=None):
         """Send changed paint groups and independently retained resources."""
+        if _base is not None and _base.epoch is not self._frame_epoch:
+            # Revision numbers restart on opening. A previous opening's base
+            # cannot use a coincidentally equal revision from the current one.
+            revision, _base = -1, None
+
         def split(frame):
             if frame and frame[0]["tag"] == "defs":
                 return frame[1:], {
@@ -208,9 +234,15 @@ class SVGRenderer:
             return frame, {}
 
         current, definitions = split(self._frames.get(self._revision, ()))
-        previous, old_definitions = split(self._frames.get(revision, ()))
+        retained = (
+            _base is not None and _base.epoch is self._frame_epoch
+            and _base.revision == revision
+        )
+        previous, old_definitions = split(
+            _base.nodes if retained else self._frames.get(revision, ())
+        )
         images = self._frame_image_sources.get(self._revision, {})
-        old_images = self._frame_image_sources.get(revision, {})
+        old_images = _base.images if retained else self._frame_image_sources.get(revision, {})
 
         def references(node):
             if not images:
@@ -224,11 +256,12 @@ class SVGRenderer:
                 return {**node, "children": [references(child) for child in node["children"]]}
             return node
 
-        reset = revision not in self._frames
+        reset = not retained and revision not in self._frames
         updates = [
             [index, references(node)]
             for index, node in enumerate(current)
-            if reset or index >= len(previous) or node != previous[index]
+            if reset or index >= len(previous)
+            or (node is not previous[index] and node != previous[index])
         ]
         return {
             "revision": self._revision,
@@ -296,9 +329,12 @@ class SVGRenderer:
     def begin_segment(self, identity, bounds):
         if not self._scene_recording or self._segment_open:
             raise RuntimeError("Invalid retained segment recording state")
-        self._segment_serial += 1
+        identity = str(identity)
+        if identity not in self._segment_ids:
+            self._segment_serial += 1
+            self._segment_ids[identity] = self._segment_serial
         self._segment_open = True
-        self._segment_id = str(identity)
+        self._segment_id = identity
         self._saved_recording = (
             self._nodes, self._frame_gradients, self._clip, self._serial,
             self._clip_group, self._paint_group,
@@ -329,7 +365,9 @@ class SVGRenderer:
             raise RuntimeError("Invalid retained scene recording state")
         self._scene_recording = False
         for identity in remove:
-            self._segments.pop(str(identity), None)
+            identity = str(identity)
+            self._segments.pop(identity, None)
+            self._segment_ids.pop(identity, None)
         if order is not None:
             self._segment_order = [str(identity) for identity in order]
         nodes = []
@@ -406,9 +444,12 @@ class SVGRenderer:
 
     def _id(self):
         self._serial += 1
+        # A segment keeps its namespace across recordings. Local operation
+        # numbers can then compare equal when its drawing has not changed.
+        # Surfaces have independent recordings, even inside a segment.
         prefix = (
-            f"s{self._segment_serial}" if self._segment_open
-            else f"p{self._target.serial}" if self._target is not None
+            f"p{self._target.serial}" if self._target is not None
+            else f"s{self._segment_ids[self._segment_id]}" if self._segment_open
             else f"g{self._group_serial}" if self._paint_group is not None
             else "p0"
         )

@@ -24,6 +24,33 @@ for embedding. Its `url` is available after opening. `export_svg(path)` and
 `export_html(path)` save portable pictures of the current frame; these snapshots
 contain fonts and images but do not contain a running Python application.
 
+### Live scene delivery
+
+The host publishes on visual changes, rather than continuously sending a full
+screen. Retained controls keep stable SVG resource identifiers, so repainting
+identical content does not create a new scene revision. A changed control still
+sends its complete paint group; this is not a per-attribute patch protocol.
+
+Live browsers receive an SSE stream, with long polling as a fallback. Each
+stream retains its last delivered scene as the next delta's base, even when
+Python produces more frames while the socket is writing. Intermediate visual
+revisions can be skipped without replaying them. Input events and service
+replies retain their existing semantics.
+
+Retention is bounded by snapshot count: four recently published scenes, one
+base per active stream (within the host's 12-connection limit), and up to 12
+recently delivered polling bases. Snapshots share immutable nodes and image
+strings. This bounds history growth with frame rate; it is not a fixed byte
+limit on application scenes. A polling client whose base has been evicted,
+or a newly attached stream, receives a full scene to recover.
+
+When a browser accepts gzip, the host compresses the scene stream and polling
+responses automatically. Every SSE event flushes the compressor immediately;
+there is no timer or batch delay waiting for more frames. Stream compression
+can reuse previous event content. Polling responses compress independently.
+Clients without gzip support receive the same JSON protocol uncompressed.
+Static assets, exports and input requests keep their delivery format.
+
 ## Build a complete HTML application
 
 ```sh
