@@ -255,31 +255,35 @@ class Runtime:
             self.host.text_input(control._rect)
         return moved
 
-    def _paint_frame(self):
+    def _paint_frame(self, prepared_changed=False, prepared_seconds=0.0):
         from ._engine import critical_phase
 
         previous = self._phase
         self._phase = "paint"
         try:
             with critical_phase("layout and paint"):
-                return self._paint_content()
+                return self._paint_content(prepared_changed, prepared_seconds)
         finally:
             self._phase = previous
 
-    def _paint_content(self):
+    def _layout_pending(self):
+        environment = _measure_environment(self.host)
+        return (
+            self._force_layout
+            or self._measure_host is not self.host
+            or environment != self._measure_environment
+            or bool(self.app._dirty & (Dirty.MEASURE | Dirty.ARRANGE))
+            or self.router._focus_to_reveal is not None
+        )
+
+    def _arrange_scene(self):
+        """Place the tree. Returns whether geometry changed and the elapsed seconds."""
         app = self.app
         environment = _measure_environment(self.host)
         if self._measure_host is not self.host or environment != self._measure_environment:
             self._measure_host = self.host
             self._measure_environment = environment
             self._force_layout = True
-        # Consume this request before painting so a request made during the
-        # pass (including by the host) survives for the next eligible frame.
-        self._dirty = False
-        self._last_frame_started = perf_counter()
-        self.motion.tick(self._last_frame_started)
-        layout_seconds = 0.0
-        layout_changed = False
         # Consume only propagated hit-policy paths before arrangement can clear
         # their ancestors. Focus/capture reconcile below uses the current policy,
         # independently of whether this frame also changes sibling geometry.
@@ -289,25 +293,44 @@ class Runtime:
             if int(control._dirty) & _HIT_MASK:
                 control._dirty = int(control._dirty) & ~_HIT_MASK
                 pending.extend(getattr(control, "_children", ()))
+        changed = False
+        elapsed = 0.0
         if self._force_layout or app._dirty & (Dirty.MEASURE | Dirty.ARRANGE):
+            started = perf_counter() if app.profile_frames else 0.0
             arrange(app, self.host)
-            layout_changed = True
             if self.popup is not None:
                 self.popup.reconcile()
             if self.popup is not None:
                 self.popup.reposition()
                 arrange(app, self.host)
             self._force_layout = False
+            changed = True
             if app.profile_frames:
-                layout_seconds = perf_counter() - self._last_frame_started
+                elapsed += perf_counter() - started
         self.router.reconcile()
         focus_to_reveal = self.router.take_focus_reveal()
         if focus_to_reveal is not None:
-            reveal_started = perf_counter() if app.profile_frames else 0.0
+            started = perf_counter() if app.profile_frames else 0.0
             if self._reveal_focus(focus_to_reveal):
-                layout_changed = True
+                changed = True
                 if app.profile_frames:
-                    layout_seconds += perf_counter() - reveal_started
+                    elapsed += perf_counter() - started
+        return changed, elapsed
+
+    def _paint_content(self, prepared_changed=False, prepared_seconds=0.0):
+        app = self.app
+        # Consume this request before painting so a request made during the
+        # pass (including by the host) survives for the next eligible frame.
+        self._dirty = False
+        self._last_frame_started = perf_counter()
+        self.motion.tick(self._last_frame_started)
+        if self._layout_pending():
+            changed, elapsed = self._arrange_scene()
+            layout_changed = changed or prepared_changed
+            layout_seconds = elapsed + prepared_seconds
+        else:
+            layout_changed = prepared_changed
+            layout_seconds = prepared_seconds
         self.host.set_title(app.title)
         paint_started = perf_counter() if app.profile_frames else 0.0
         self.render_cache.configure(app.render_cache_bytes)
@@ -575,9 +598,12 @@ class Runtime:
             # Only requests present now are served, so a frame is never
             # postponed indefinitely by a busy producer.
             engine.drain_pending()
+            prepared_changed, prepared_seconds = False, 0.0
             if perf_counter() >= self._next_frame_at():
-                # Give ready handler continuations one turn before painting.
-                # Startup presents its first frame synchronously in start().
+                # Place controls before yielding. sleep(0) runs every ready task,
+                # so an observer must not see the default rect. Handler
+                # continuations still get this turn before pixels are submitted.
+                prepared_changed, prepared_seconds = self._arrange_scene()
                 await asyncio.sleep(0)
             if self._stop.is_set():
                 break
@@ -588,7 +614,7 @@ class Runtime:
             rendered = perf_counter() >= self._next_frame_at()
             if rendered:
                 with critical_phase("layout and paint"):
-                    self._paint_frame()
+                    self._paint_frame(prepared_changed, prepared_seconds)
             if getattr(self.host, "event_driven", False):
                 deadline = min(
                     self._next_frame_at(),
