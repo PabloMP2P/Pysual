@@ -163,6 +163,35 @@ class FocusNavigationTests(AsyncUIOwnerTestCase):
 
 
 class FocusTimingTests(UIOwnerTestCase):
+    def test_pending_shrink_is_applied_before_focus_is_revealed(self):
+        app = App(width=320, height=480, layout="stack")
+        host = RecordingHost()
+        host.size = (320, 480)
+        runtime = Runtime(app, host)
+        app._runtime = runtime
+        try:
+            area = ScrollArea(parent=app, layout="stack", spacing=0, flex=1)
+            for _ in range(6):
+                Button(parent=area, height=50)
+            target = Button(parent=area, height=40)
+            runtime._paint_frame()
+            self.assertEqual(host.size, (320, 480))
+            self.assertEqual(area.scroll_y, 0)
+            self.assertEqual(target._clip, target.bounds)
+            app.update(height=160)
+            target.focus()
+            runtime._paint_frame()
+            self.assertEqual(host.size, (320, 160))
+            self.assertGreater(area.scroll_y, 0)
+            self.assertEqual(target._clip, target.bounds)
+            with patch.object(runtime, "_submit_size") as submit:
+                runtime._arrange_scene()
+                runtime._paint_frame()
+            submit.assert_not_called()
+        finally:
+            app._runtime = None
+            app.destroy()
+
     def test_reveal_layout_is_profiled_once_and_idle_focus_adds_no_clock_reads(self):
         app, host = App(profile_frames=True), RecordingHost()
         runtime = Runtime(app, host)

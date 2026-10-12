@@ -278,6 +278,10 @@ class Runtime:
 
     def _arrange_scene(self):
         """Place the tree. Returns whether geometry changed and the elapsed seconds."""
+        # A caller resize must land before placement so focus reveal uses the
+        # requested host size. Stable frames have nothing pending and skip this.
+        if self._pending_size:
+            self._submit_size()
         app = self.app
         environment = _measure_environment(self.host)
         if self._measure_host is not self.host or environment != self._measure_environment:

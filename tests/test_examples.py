@@ -322,11 +322,19 @@ def test_theme_gallery_short_desktop_keeps_motion_preference_reachable():
         app.update(width=1100, height=640)
         app.reduce.focus()
         deadline = time.monotonic() + 5
+        def reachable_focused():
+            return app.reduce.focused
+        def reachable_scroll_y():
+            return app.sidebar.scroll_y > 0
+        def reachable_clip_height():
+            return app.reduce._clip.height == app.reduce.bounds.height
         def reachable():
-            return (app.reduce.focused and app.sidebar.scroll_y > 0
-                    and app.reduce._clip.height == app.reduce.bounds.height)
+            return (reachable_focused() and reachable_scroll_y() and reachable_clip_height())
         while not call(reachable) and time.monotonic() < deadline:
             time.sleep(.005)
+        assert call(reachable_focused)
+        assert call(reachable_scroll_y)
+        assert call(reachable_clip_height)
         assert call(reachable)
         app.reduce.activate()
         deadline = time.monotonic() + 5
