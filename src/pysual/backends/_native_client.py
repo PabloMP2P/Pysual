@@ -17,6 +17,7 @@ import time
 
 HEADER = struct.Struct('<4sIII')
 MAX_PAYLOAD = 16 * 1024 * 1024
+RECEIVE_CHUNK = 256 * 1024
 U32 = struct.Struct('<I')
 
 
@@ -250,34 +251,47 @@ class NativeClient:
         finally:
             stream.close()
 
-    def _receive_exact(self, length):
+    def _receive_frames(self):
+        """Parse each received burst before waiting, retaining a partial frame.
+
+        Reading the header and payload separately creates two socket/GIL
+        handoffs per message. A burst normally contains several complete
+        messages, while the buffer remains bounded by one maximum-size frame.
+        """
         received = bytearray()
-        while len(received) < length:
+        while True:
+            offset = 0
+            while len(received) - offset >= HEADER.size:
+                magic, opcode, request, length = HEADER.unpack_from(received, offset)
+                if magic != b'PXN1' or length > MAX_PAYLOAD:
+                    raise NativeHostError('Invalid response framing')
+                end = offset + HEADER.size + length
+                if end > len(received):
+                    break
+                yield opcode, request, bytes(received[offset + HEADER.size:end])
+                offset = end
+            if offset:
+                del received[:offset]
             sock = self._socket
             if sock is None:
                 raise EOFError('Native host transport is closed')
             select.select([sock], [], [])  # Indefinite event wait, no polling interval.
             try:
-                part = sock.recv(length - len(received))
+                part = sock.recv(min(RECEIVE_CHUNK, HEADER.size + MAX_PAYLOAD - len(received)))
             except BlockingIOError:
                 continue
             if not part:
                 raise EOFError('Native host disconnected')
             received.extend(part)
-        return bytes(received)
 
     def _read_loop(self):
         try:
-            while True:
-                magic, opcode, request, length = HEADER.unpack(self._receive_exact(HEADER.size))
-                if magic != b'PXN1' or length > MAX_PAYLOAD:
-                    raise NativeHostError('Invalid response framing')
-                raw = self._receive_exact(length)
+            for opcode, request, raw in self._receive_frames():
                 payload = json.loads(raw.decode('utf-8'))
                 if not isinstance(payload, dict):
                     raise NativeHostError('Host response is not an object')
                 with self._state_lock:
-                    self._counts['bytes_received'] += HEADER.size + length
+                    self._counts['bytes_received'] += HEADER.size + len(raw)
                 if opcode == 200:
                     with self._state_lock:
                         pending = self._pending.pop(request, None)

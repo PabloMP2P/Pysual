@@ -70,6 +70,7 @@ class NativeHost(NativeServices):
         self._event_lock = threading.Lock()
         self._wake = None
         self._wake_loop = None
+        self._wake_token = None
         self._overflow = False
         self._commands = []
         self._scene_background = None
@@ -101,13 +102,22 @@ class NativeHost(NativeServices):
         return {} if self._client is None else self._client.diagnostics
 
     def set_wake_callback(self, callback):
-        """Bind once on the asyncio owner; the reader never touches UI state."""
+        """Bind on the asyncio owner; invalidate any previous owner's wake."""
         loop = asyncio.get_running_loop() if callback is not None else None
         with self._event_lock:
             self._wake = callback
             self._wake_loop = loop
-            pending = bool(self._events)
-        if pending and callback is not None:
+            token = object() if self._events and callback is not None else None
+            self._wake_token = token
+        if token is not None:
+            self._deliver_wake(token)
+
+    def _deliver_wake(self, token):
+        with self._event_lock:
+            if token is not self._wake_token or self._closed:
+                return
+            callback = self._wake
+        if callback is not None:
             callback()
 
     def _on_event(self, value):
@@ -120,13 +130,21 @@ class NativeHost(NativeServices):
                 self._overflow = True
             else:
                 self._events.append(value)
-            loop, callback = self._wake_loop, self._wake
-        if loop is not None and callback is not None:
+            loop = self._wake_loop
+            # Keep one wake outstanding until poll consumes the whole batch.
+            # The lock also covers poll, so a racing new event always either
+            # joins that batch or schedules the next one.
+            token = None
+            if self._wake_token is None and loop is not None and self._wake is not None:
+                token = self._wake_token = object()
+        if token is not None:
             try:
-                loop.call_soon_threadsafe(callback)
+                loop.call_soon_threadsafe(self._deliver_wake, token)
             except RuntimeError:
                 # A terminal callback can race the bounded owner shutdown.
-                pass
+                with self._event_lock:
+                    if token is self._wake_token:
+                        self._wake_token = None
 
     def _request(self, op, **kwargs):
         if self._client is None or self._closed:
@@ -186,6 +204,7 @@ class NativeHost(NativeServices):
         with self._event_lock:
             values = tuple(self._events)
             self._events.clear()
+            self._wake_token = None
         allowed = {field.name for field in fields(Input)}
         events = []
         for value in values:
@@ -483,6 +502,7 @@ class NativeHost(NativeServices):
                 return
             self._closed = True
             self._wake = self._wake_loop = None
+            self._wake_token = None
             self._events.clear()
         try:
             if self._client is not None:
