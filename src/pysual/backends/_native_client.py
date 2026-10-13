@@ -360,6 +360,28 @@ class NativeClient:
             self._counts['requests_sent'] += 1
             self._counts['bytes_sent'] += len(frame)
 
+    def _await_reply(self, pending, timeout):
+        """Wait until the reader stores this reply, or the monotonic deadline passes.
+
+        ``Event.wait`` can report success on a spurious wakeup without setting
+        its flag, which on macOS accepted a still-missing acknowledgement.
+        Trust the flag and the clock.
+        """
+        event = pending['event']
+        if timeout is None:
+            while not event.is_set():
+                if event.wait() and not event.is_set():
+                    time.sleep(0.005)
+            return True
+        deadline = time.monotonic() + timeout
+        while not event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if event.wait(remaining) and not event.is_set():
+                time.sleep(min(0.005, max(0.0, deadline - time.monotonic())))
+        return True
+
     def _request(self, opcode, payload=b'', *, timeout):
         if len(payload) > MAX_PAYLOAD:
             raise ValueError('Request exceeds the 16 MiB protocol limit')
@@ -379,7 +401,7 @@ class NativeClient:
             self._transport_error = NativeHostError(str(exc))
             self._abort('transport_error')
             raise
-        if not pending['event'].wait(timeout):
+        if not self._await_reply(pending, timeout):
             self._transport_error = NativeHostError('Native acknowledgement timed out')
             self._abort('transport_error')
             raise TimeoutError('Native acknowledgement timed out; session closed because commit status is unknown')
