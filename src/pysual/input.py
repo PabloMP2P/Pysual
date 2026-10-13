@@ -48,7 +48,12 @@ class _HitIndex:
             for child in ordered:
                 visit(child, clip)
 
-        visit(root, inherited_clip)
+        try:
+            visit(root, inherited_clip)
+        finally:
+            # The function recurses through its own closure cell. Clear that
+            # cell or this index pass stays reachable until cyclic collection.
+            visit = None
         # Increase spatial resolution with control density. Large containers
         # stay in one shared list instead of filling every cell in the window.
         area = max(1, root._clip.width * root._clip.height)
@@ -430,7 +435,12 @@ class Router:
             for x in getattr(c, "_children", ()):
                 visit(x)
 
-        visit(self.runtime.popup or self.runtime.modal or self.runtime.app)
+        try:
+            visit(self.runtime.popup or self.runtime.modal or self.runtime.app)
+        finally:
+            # The function recurses through its own closure cell. Clear that
+            # cell or the focus walk stays reachable until cyclic collection.
+            visit = None
         targets.sort(key=lambda c: c._values["tab_index"])
         if targets:
             index = (

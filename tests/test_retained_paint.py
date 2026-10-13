@@ -6,7 +6,7 @@ from unittest.mock import patch
 from _ui_testcase import UIOwnerTestCase, ui_timeout
 from test_library import RecordingHost
 
-from pysual import App, Button, Container, Control, Dropdown, Rect, ScrollArea, Style, get_theme
+from pysual import App, Button, Container, Control, Dropdown, Label, Rect, ScrollArea, Style, get_theme
 from pysual import SplitPane, TabControl, TabPage
 from pysual.layout import arrange
 from pysual.painting import RetainedPaintTree, paint_tree
@@ -485,3 +485,26 @@ class RetainedPaintTests(UIOwnerTestCase):
         self.frame()
         self.assertIn(removed_id, self.host.removed)
         self.assert_direct_matches()
+
+    def test_repeated_local_edits_release_reconcile_scratch_without_cyclic_gc(self):
+        import gc
+
+        box = Container(parent=self.app, layout="stack")
+        labels = [Label(parent=box, text=f"Item {index}", height=20) for index in range(40)]
+        self.frame(layout=True)
+        gc.collect()
+        gc.disable()
+        try:
+            for index in range(12):
+                labels[0].text = f"Item {index}"
+                self.frame(layout=True)
+            retained = [
+                obj for obj in gc.get_objects()
+                if isinstance(obj, dict) and obj
+                and type(next(iter(obj.values()))).__name__ == "_PaintSegment"
+                and len(obj) > 10
+            ]
+            self.assertEqual(len(retained), 1)
+        finally:
+            gc.enable()
+            gc.collect()

@@ -1055,7 +1055,12 @@ class RetainedPaintTree:
                     visit(child, inherited_changed)
             record.end_index = len(order)
 
-        visit(root)
+        try:
+            visit(root)
+        finally:
+            # The function recurses through its own closure cell. Clear that
+            # cell or this scratch tree stays reachable until cyclic collection.
+            visit = None
         removed = [record.identity for control, record in previous.items() if control not in records]
         changed = order != self._order
         self._records, self._control_order, self._order, self._uncached_custom = records, controls, order, uncached
@@ -1275,7 +1280,12 @@ def _paint_tree(root, host, focus=None, cache=None):
             host.clip(c._clip)
             host.rect(c._rect.inset(2), "", 0, theme.tokens.accent, 3)
 
-    visit(root)
+    try:
+        visit(root)
+    finally:
+        # The function recurses through its own closure cell. Clear that cell
+        # or the paint traversal stays reachable until cyclic collection.
+        visit = None
     if cache is not None:
         cache.finish_frame()
     host.clip(None)
