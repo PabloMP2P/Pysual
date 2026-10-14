@@ -3,7 +3,9 @@
 from .geometry import Rect
 
 
-def image_rects(width, height, rect, fit="stretch"):
+def image_rects(
+    width: float, height: float, rect: Rect, fit: str = "stretch"
+) -> tuple[Rect, Rect]:
     if fit not in ("stretch", "contain", "cover"):
         raise ValueError("Image fit must be stretch, contain or cover")
     source = Rect(0, 0, width, height)

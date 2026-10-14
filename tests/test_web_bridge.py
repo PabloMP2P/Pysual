@@ -21,7 +21,7 @@ from pysual.backends import _SingleSurfaceHost, _SingleSurfaceSession
 from pysual.backends import _font
 from pysual.backends._web_pyodide import BundledSVGHost
 from pysual.geometry import Rect
-from pysual.host import CapabilityError
+from pysual.host import CapabilityError, MAX_TEXT_BYTES, TextFile
 from pysual.image_resources import MAX_IMAGE_BYTES, image_source
 
 
@@ -64,6 +64,100 @@ class WebBundleClipboardTests(unittest.IsolatedAsyncioTestCase):
             await task
         self.assertEqual(calls, [("copied", 1), ("closed", 2), ("cancelled", 3), ("pending", 4)])
         self.assertEqual(cancelled, [4])
+
+
+class WebBundleServiceTests(unittest.IsolatedAsyncioTestCase):
+    def host(self, **services):
+        bridge = SimpleNamespace(**services)
+        with patch.dict("sys.modules", {"js": SimpleNamespace(pysualHost=bridge)}):
+            return BundledSVGHost()
+
+    async def test_typed_bridge_services_preserve_arguments_results_and_ids(self):
+        calls = []
+
+        def service(name, result):
+            async def invoke(*args):
+                calls.append((name, args))
+                return result
+            return invoke
+
+        host = self.host(
+            readClipboard=service("read", "copied"),
+            openTextFile=service("open", '{"name":"note.txt","text":"hello"}'),
+            saveTextFile=service("save", "saved.txt"),
+            readSessionJSON=service("session_read", '"stored"'),
+            writeSessionJSON=service("session_write", None),
+            openUrl=service("url", True),
+            cancelSession=lambda operation: self.fail("Completed service cancelled"),
+        )
+        self.assertEqual(await host.clipboard_read(), "copied")
+        self.assertEqual(await host.open_text_file(), TextFile("note.txt", "hello"))
+        self.assertEqual(await host.save_text_file("hello", "note.txt", None),
+                         TextFile("saved.txt", "hello"))
+        self.assertEqual(await host.read_session("draft"), "stored")
+        await host.write_session("draft", None)
+        await host.open_url("https://example.com")
+        self.assertEqual(calls, [
+            ("read", (1,)), ("open", (MAX_TEXT_BYTES, 2)),
+            ("save", ("hello", "note.txt", 3)), ("session_read", ("draft", 4)),
+            ("session_write", ("draft", "null", 5)),
+            ("url", ("https://example.com", 6)),
+        ])
+
+    async def test_cancelling_a_session_does_not_cancel_another_service(self):
+        started = asyncio.Event()
+        operations, cancelled = {}, []
+
+        async def session(key, operation):
+            operations[key] = operation
+            if len(operations) == 2:
+                started.set()
+            await asyncio.Future()
+
+        host = self.host(readSessionJSON=session, cancelSession=cancelled.append)
+        first = asyncio.create_task(host.read_session("first"))
+        second = asyncio.create_task(host.read_session("second"))
+        try:
+            await asyncio.wait_for(started.wait(), 1)
+            first.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await first
+            self.assertEqual(cancelled, [operations["first"]])
+            self.assertFalse(second.done())
+        finally:
+            for task in (first, second):
+                task.cancel()
+            await asyncio.gather(first, second, return_exceptions=True)
+        self.assertEqual(cancelled, [operations["first"], operations["second"]])
+
+    async def test_bridge_cleanup_failure_preserves_task_cancellation(self):
+        for session in (False, True):
+            with self.subTest(session=session):
+                started = asyncio.Event()
+                cleanup_error = RuntimeError("Browser bridge already closed")
+
+                async def pending(*args):
+                    started.set()
+                    await asyncio.Future()
+
+                def cancel(operation):
+                    raise cleanup_error
+
+                host = self.host(readClipboard=pending, cancelOperation=cancel,
+                                 readSessionJSON=pending, cancelSession=cancel)
+                task = asyncio.create_task(
+                    host.read_session("draft") if session else host.clipboard_read()
+                )
+                try:
+                    await asyncio.wait_for(started.wait(), 1)
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError) as raised:
+                        await task
+                    self.assertTrue(task.cancelled())
+                    self.assertIs(raised.exception.__cause__, cleanup_error)
+                finally:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
 
 
 class WebBundleBridgeTests(unittest.TestCase):

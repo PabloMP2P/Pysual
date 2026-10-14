@@ -1,11 +1,13 @@
 """Tree transactions stage derived state before hooks and event delivery."""
 
 import asyncio
+from unittest.mock import patch
 
 from _ui_testcase import AsyncUIOwnerTestCase, UIOwnerTestCase
 from test_library import RecordingHost, eventually
 
 from pysual import App, Button, Container, TreeNode, TreeView
+from pysual.geometry import Rect
 from pysual.runtime import Runtime
 
 
@@ -78,6 +80,69 @@ class TreeUpdateTests(UIOwnerTestCase):
                 self.assertIsNone(tree.selected_node)
                 self.assertEqual(tree.expanded_keys, ())
                 self.assertEqual(tuple(tree._positions), ("root",))
+
+    def test_selection_batches_reuse_rows_and_reveal_before_changed_hooks(self):
+        observed = []
+
+        class ObservedTree(TreeView):
+            def _changed(self, field, old, value):
+                observed.append((self.selected_key, self._scroll, self.selected_node))
+                super()._changed(field, old, value)
+
+        for route in ROUTES:
+            with self.subTest(route=route):
+                root = self.keep(Container())
+                nodes = tuple(TreeNode(str(i), f"Row {i}") for i in range(1000))
+                tree = ObservedTree(parent=root, nodes=nodes, selected_key="0")
+                tree._rect = Rect(0, 0, 240, 90)
+                rows, positions = tree._rows, tree._positions
+                observed.clear()
+                with patch.object(TreeView, "_rebuild_rows", side_effect=AssertionError(
+                    "Selection must not rebuild unchanged rows"
+                )):
+                    replace_tree(root, tree, route, nodes, selected_key="999")
+                self.assertIs(tree._rows, rows)
+                self.assertIs(tree._positions, positions)
+                self.assertEqual(observed, [("999", 997, nodes[-1])])
+
+    def test_selection_batch_reclamps_shared_rows_with_new_row_height(self):
+        for batched in (False, True):
+            with self.subTest(batched=batched):
+                root = self.keep(Container())
+                tree = TreeView(parent=root,
+                                nodes=tuple(TreeNode(str(i), str(i)) for i in range(20)),
+                                selected_key="19")
+                tree._rect = Rect(0, 0, 240, 90)
+                tree._scroll = 17
+                rows = tree._rows
+                values = {"selected_key": None, "row_height": 15}
+                if batched:
+                    root.update_children({tree: values})
+                else:
+                    tree.update(**values)
+                self.assertIs(tree._rows, rows)
+                self.assertEqual(tree._scroll, 14)
+                self.assertIsNone(tree.selected_node)
+
+    def test_selecting_hidden_descendant_rebuilds_rows_before_changed_hooks(self):
+        observed = []
+
+        class ObservedTree(TreeView):
+            def _changed(self, field, old, value):
+                observed.append((self.selected_key, self.expanded_keys,
+                                 tuple(self._positions), self._scroll))
+                super()._changed(field, old, value)
+
+        root = self.keep(Container())
+        tree = ObservedTree(parent=root, nodes=NODES, selected_key="root")
+        rows = tree._rows
+        observed.clear()
+        tree.update(selected_key="child")
+        self.assertIsNot(tree._rows, rows)
+        self.assertEqual(observed, [
+            ("child", ("root",), ("root", "child"), 1),
+            ("child", ("root",), ("root", "child"), 1),
+        ])
 
     def test_expansion_only_collapses_but_explicit_selection_reveals(self):
         nodes = (TreeNode("root", "Root", (

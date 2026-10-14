@@ -1,16 +1,34 @@
 """Pure layout algorithms over the control tree; computes shared hit/paint geometry."""
 
+from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import contextmanager
 from math import isfinite
+from typing import Literal, Protocol
 
 from ._engine import ui_method
+from .controls import Container, Control
 from .geometry import Rect
-from .host import text_row_height
+from .host import Host, text_row_height
 from .schema import _LAYOUT_MASK
 
 
+class _LimitedMeasure(Protocol):
+    def __call__(
+        self,
+        child: Control,
+        *,
+        width: float | None = None,
+        height: float | None = None,
+    ) -> tuple[float, float]: ...
+
+
+_TrackKind = Literal["fixed", "auto", "star"]
+_Size = tuple[float, float]
+_Demand = tuple[int, int, float]
+
+
 @contextmanager
-def _measurement_rows(c, host):
+def _measurement_rows(c: Control, host: Host) -> Generator[None, None, None]:
     """Expose requested measurement metrics without changing arranged geometry."""
     root = c._root()
     previous = root._measurement_row_height
@@ -21,12 +39,14 @@ def _measurement_rows(c, host):
         root._measurement_row_height = previous
 
 
-def _size(c, host, *, width=None, height=None):
+def _size(
+    c: Control, host: Host, *, width: float | None = None, height: float | None = None
+) -> _Size:
     with _measurement_rows(c, host):
         if c._measure_cache_host is not host:
             c._measure_cache.clear()
             c._measure_cache_host = host
-        ancestors = []
+        ancestors: list[tuple[Control, int, Rect]] = []
         parent = c._parent
         while parent is not None:
             # Local parent changes affect inherited/private sizing context;
@@ -53,19 +73,20 @@ def _size(c, host, *, width=None, height=None):
                 del entries[4:]
         w, h = preferred
         values = c._values
+        declared_width, declared_height = values["width"], values["height"]
         return c._layout_size(
             _clamp(
-                values["width"] if values["width"] is not None else w,
+                declared_width if declared_width is not None else w,
                 values["min_width"], values["max_width"],
             ),
             _clamp(
-                values["height"] if values["height"] is not None else h,
+                declared_height if declared_height is not None else h,
                 values["min_height"], values["max_height"],
             ),
         )
 
 
-def _measure_environment(host):
+def _measure_environment(host: Host) -> tuple[object, ...]:
     """Host facts that can change preferred sizes without property writes."""
     return (
         getattr(host, "resource_revision", 0), getattr(host, "render_scale", 1),
@@ -73,7 +94,7 @@ def _measure_environment(host):
     )
 
 
-def _clear_measurements(root):
+def _clear_measurements(root: Control) -> None:
     """Release host/context references and invalidate placement on host reuse."""
     pending = [root]
     while pending:
@@ -87,19 +108,21 @@ def _clear_measurements(root):
         pending.extend(getattr(c, "_children", ()))
 
 
-def _clamp(value, minimum, maximum):
+def _clamp(value: float, minimum: float, maximum: float | None) -> float:
     if maximum is not None and maximum < minimum:
         raise ValueError("Maximum size cannot be smaller than minimum")
     return max(minimum, min(value, maximum if maximum is not None else value))
 
 
-def _grid_cells(c, normal):
-    cells = {}
-    occupied = set()
+def _grid_cells(
+    c: Control, normal: Sequence[Control]
+) -> dict[Control, tuple[int, int]]:
+    cells: dict[Control, tuple[int, int]] = {}
+    occupied: set[tuple[int, int]] = set()
     auto = 0
     parent = c._values
     columns = len(parent["column_tracks"]) or parent["columns"]
-    entries = []
+    entries: list[tuple[Control, int, int, int, int]] = []
     for x in normal:
         child = x._values
         entries.append((
@@ -133,12 +156,12 @@ def _grid_cells(c, normal):
     return cells
 
 
-def _dock_order(normal):
+def _dock_order(normal: Sequence[Control]) -> None:
     if any(x._values["dock"] == "fill" for x in normal[:-1]):
         raise ValueError("A dock layout accepts at most one fill child, placed last")
 
 
-def _track(value):
+def _track(value: object) -> tuple[_TrackKind, float]:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         if value >= 0 and isfinite(value):
             return "fixed", float(value)
@@ -154,26 +177,28 @@ def _track(value):
     raise ValueError("Grid tracks accept nonnegative pixels, 'auto', '*' or '2*'")
 
 
-def _distribute(total, constraints):
+def _distribute(
+    total: float, constraints: Sequence[tuple[float, float, float | None]]
+) -> list[float]:
     """Solve sum(clamp(weight * unit, minimum, maximum)) with explicit overflow."""
-    minimum_total = sum(minimum for weight, minimum, maximum in constraints)
+    minimum_total = sum(minimum for _weight, minimum, _maximum in constraints)
     if not isfinite(minimum_total):
         raise ValueError("Combined flex minimums must remain finite")
     if total <= minimum_total:
-        return [minimum for weight, minimum, maximum in constraints]
-    weights = _normalized_weights([weight for weight, minimum, maximum in constraints])
+        return [minimum for _weight, minimum, _maximum in constraints]
+    weights = _normalized_weights([weight for weight, _minimum, _maximum in constraints])
     constraints = [
         (weight, minimum, maximum)
         for weight, (_, minimum, maximum) in zip(weights, constraints)
     ]
-    events = []
+    events: list[tuple[float, float]] = []
     for weight, minimum, maximum in constraints:
         lower = minimum / weight
         upper = maximum / weight if maximum is not None else None
         if not isfinite(lower) or (upper is not None and not isfinite(upper)):
             raise ValueError("Flex constraint ratios exceed the supported finite range")
         events.append((lower, weight))
-        if maximum is not None:
+        if maximum is not None and upper is not None:
             events.append((upper, -weight))
     used, slope, unit = minimum_total, 0.0, 0.0
     for boundary, change in sorted(events):
@@ -192,7 +217,7 @@ def _distribute(total, constraints):
     ]
 
 
-def _normalized_weights(weights):
+def _normalized_weights(weights: Sequence[float]) -> list[float]:
     scale = max(weights, default=1.0)
     result = [weight / scale for weight in weights]
     if any(weight == 0 for weight in result):
@@ -200,7 +225,13 @@ def _normalized_weights(weights):
     return result
 
 
-def _tracks(declared, count, demands, spacing, available=None):
+def _tracks(
+    declared: Sequence[object],
+    count: int,
+    demands: Iterable[_Demand],
+    spacing: float,
+    available: float | None = None,
+) -> list[float]:
     specs = [_track(value) for value in declared] + [("star", 1.0)] * (
         count - len(declared)
     )
@@ -214,7 +245,7 @@ def _tracks(declared, count, demands, spacing, available=None):
         if autos:
             for i in autos:
                 sizes[i] += deficit / len(autos)
-    stars = [i for i, (kind, weight) in enumerate(specs) if kind == "star"]
+    stars = [i for i, (kind, _weight) in enumerate(specs) if kind == "star"]
     if stars:
         weights = _normalized_weights([specs[i][1] for i in stars])
         for i, value in zip(stars, weights):
@@ -242,7 +273,15 @@ def _tracks(declared, count, demands, spacing, available=None):
     return sizes
 
 
-def _grid_tracks(c, normal, measure, area=None, *, width=None, width_limit=None):
+def _grid_tracks(
+    c: Control,
+    normal: Sequence[Control],
+    measure: _LimitedMeasure,
+    area: Rect | None = None,
+    *,
+    width: float | None = None,
+    width_limit: float | None = None,
+) -> tuple[dict[Control, tuple[int, int]], list[float], list[float]]:
     cells = _grid_cells(c, normal)
     parent = c._values
     column_tracks, row_tracks = parent["column_tracks"], parent["row_tracks"]
@@ -250,7 +289,10 @@ def _grid_tracks(c, normal, measure, area=None, *, width=None, width_limit=None)
     columns = len(column_tracks) or parent["columns"]
     rows = max(
         len(row_tracks),
-        max((r + x._values["grid_row_span"] for x, (r, col) in cells.items()), default=1),
+        max(
+            (r + x._values["grid_row_span"] for x, (r, _col) in cells.items()),
+            default=1,
+        ),
     )
     # Allocated fixed/star tracks depend only on the available rectangle. Child
     # measurements matter for auto tracks and for the grid's intrinsic size.
@@ -259,8 +301,12 @@ def _grid_tracks(c, normal, measure, area=None, *, width=None, width_limit=None)
     needs_rows = area is None or "auto" in row_tracks
     sizes = {x: measure(x) for x in normal} if needs_columns else {}
     column_demands = [
-        (col, x._values["grid_col_span"], sizes[x][0] + x._values["margin"] * 2)
-        for x, (r, col) in cells.items()
+        (
+            col,
+            x._values["grid_col_span"],
+            sizes[x][0] + x._values["margin"] * 2,
+        )
+        for x, (_r, col) in cells.items()
     ] if needs_columns else ()
     widths = _tracks(
         column_tracks, columns, column_demands, spacing, available_width,
@@ -276,10 +322,11 @@ def _grid_tracks(c, normal, measure, area=None, *, width=None, width_limit=None)
     if needs_rows:
         # Row demands depend on the allocated column span, including explicit
         # dimensions and limits that can make a child narrower than its tracks.
-        for x, (r, col) in cells.items():
+        for x, (_r, col) in cells.items():
             child = x._values
+            declared_width = child["width"]
             child_width = _clamp(
-                child["width"] if child["width"] is not None else max(
+                declared_width if declared_width is not None else max(
                     0, sum(widths[col:col + child["grid_col_span"]])
                     + spacing * (child["grid_col_span"] - 1) - child["margin"] * 2
                 ), child["min_width"], child["max_width"],
@@ -295,8 +342,12 @@ def _grid_tracks(c, normal, measure, area=None, *, width=None, width_limit=None)
         row_tracks,
         rows,
         [
-            (r, x._values["grid_row_span"], sizes[x][1] + x._values["margin"] * 2)
-            for x, (r, col) in cells.items()
+            (
+                r,
+                x._values["grid_row_span"],
+                sizes[x][1] + x._values["margin"] * 2,
+            )
+            for x, (r, _col) in cells.items()
         ]
         if needs_rows
         else (),
@@ -306,13 +357,18 @@ def _grid_tracks(c, normal, measure, area=None, *, width=None, width_limit=None)
     return cells, widths, heights
 
 
-def _flow_boxes(c, normal, area, measure):
+def _flow_boxes(
+    c: Control,
+    normal: Sequence[Control],
+    area: Rect,
+    measure: Callable[[Control], _Size],
+) -> dict[Control, Rect]:
     parent = c._values
     vertical = parent["direction"] == "vertical"
     spacing = parent["spacing"]
     available = area.height if vertical else area.width
     main, cross, line_cross = 0.0, 0.0, 0.0
-    boxes = {}
+    boxes: dict[Control, Rect] = {}
     for x in normal:
         w, h = measure(x)
         margin = x._values["margin"]
@@ -328,7 +384,13 @@ def _flow_boxes(c, normal, area, measure):
     return boxes
 
 
-def _natural_size(c, measure, *, width=None, height=None):
+def _natural_size(
+    c: Container,
+    measure: _LimitedMeasure,
+    *,
+    width: float | None = None,
+    height: float | None = None,
+) -> _Size:
     normal = [
         x for x in c._children
         if x._values["visible"] and not x._disposed and not x._overlay
@@ -339,14 +401,15 @@ def _natural_size(c, measure, *, width=None, height=None):
         layout == "grid" and (parent["column_tracks"] or parent["row_tracks"])
     ):
         return 100, c._fast_theme().tokens.control_height
+    declared_width, declared_height = parent["width"], parent["height"]
     area = Rect(
         0,
         0,
         max(
             0,
             _clamp(
-                parent["width"]
-                if parent["width"] is not None
+                declared_width
+                if declared_width is not None
                 else width
                 if width is not None
                 else float("inf"),
@@ -358,8 +421,8 @@ def _natural_size(c, measure, *, width=None, height=None):
         max(
             0,
             _clamp(
-                parent["height"]
-                if parent["height"] is not None
+                declared_height
+                if declared_height is not None
                 else height
                 if height is not None
                 else float("inf"),
@@ -379,15 +442,17 @@ def _natural_size(c, measure, *, width=None, height=None):
     if layout == "stack":
         vertical = parent["direction"] == "vertical"
         main = sum(
-            sizes[x][1 if vertical else 0] + x._values["margin"] * 2 for x in normal
+            sizes[x][1 if vertical else 0] + x._values["margin"] * 2
+            for x in normal
         ) + gap
         cross = max(
-            sizes[x][0 if vertical else 1] + x._values["margin"] * 2 for x in normal
+            sizes[x][0 if vertical else 1] + x._values["margin"] * 2
+            for x in normal
         )
         w, h = (cross, main) if vertical else (main, cross)
     elif layout == "grid":
         allocated = parent["width"] is not None or width is not None
-        cells, widths, heights = _grid_tracks(
+        _cells, widths, heights = _grid_tracks(
             c, normal, measure,
             width=area.width if allocated and isfinite(area.width) else None,
             width_limit=area.width if not allocated and isfinite(area.width) else None,
@@ -401,12 +466,13 @@ def _natural_size(c, measure, *, width=None, height=None):
         sizes = _dock_sizes(c, normal, area, measure, stretch=False)
         w, h = 0.0, 0.0
         for i, x in reversed(list(enumerate(normal))):
-            margin = x._values["margin"]
+            stored = x._values
+            margin = stored["margin"]
             cw, ch = sizes[x][0] + margin * 2, sizes[x][1] + margin * 2
             space = spacing if i < len(normal) - 1 else 0
-            if x._values["dock"] in ("left", "right"):
+            if stored["dock"] in ("left", "right"):
                 w, h = w + cw + space, max(h, ch)
-            elif x._values["dock"] in ("top", "bottom"):
+            elif stored["dock"] in ("top", "bottom"):
                 w, h = max(w, cw), h + ch + space
             else:
                 w, h = max(w, cw), max(h, ch)
@@ -414,7 +480,12 @@ def _natural_size(c, measure, *, width=None, height=None):
         boxes = (
             _flow_boxes(c, normal, area, sizes.__getitem__)
             if layout == "flow"
-            else {x: Rect(x._values["left"], x._values["top"], *sizes[x]) for x in normal}
+            else {
+                x: Rect(
+                    x._values["left"], x._values["top"], *sizes[x]
+                )
+                for x in normal
+            }
         )
         w = max(
             box.right + (x._values["margin"] if layout == "flow" else 0)
@@ -427,40 +498,62 @@ def _natural_size(c, measure, *, width=None, height=None):
     return max(0, w) + parent["padding"] * 2, max(0, h) + parent["padding"] * 2
 
 
-def _stack_sizes(c, children, area, measure):
+def _stack_sizes(
+    c: Control, children: Sequence[Control], area: Rect, measure: _LimitedMeasure
+) -> dict[Control, _Size]:
     vertical = c._values["direction"] == "vertical"
     cross = area.width if vertical else area.height
     if not isfinite(cross):
         return {child: measure(child) for child in children}
-    axis = "width" if vertical else "height"
     return {
-        child: measure(child, **{axis: max(0, cross - child._values["margin"] * 2)})
+        child: (
+            measure(
+                child,
+                width=max(0.0, cross - child._values["margin"] * 2),
+            )
+            if vertical
+            else measure(
+                child,
+                height=max(0.0, cross - child._values["margin"] * 2),
+            )
+        )
         for child in children
     }
 
 
-def _dock_sizes(c, children, area, measure, *, stretch=True):
+def _dock_sizes(
+    c: Control,
+    children: Sequence[Control],
+    area: Rect,
+    measure: _LimitedMeasure,
+    *,
+    stretch: bool = True,
+) -> dict[Control, _Size]:
     """Measure each child at the cross axis left by preceding docked children."""
     remaining_width, remaining_height = area.width, area.height
     spacing = c._values["spacing"]
-    sizes = {}
+    sizes: dict[Control, _Size] = {}
     for i, child in enumerate(children):
         values = child._values
-        dock, margin = values["dock"], values["margin"]
-        constraints = {}
+        dock = values["dock"]
+        margin = values["margin"]
+        declared_width, declared_height = values["width"], values["height"]
+        constraints: dict[str, float] = {}
         if dock in ("top", "bottom", "fill") and isfinite(remaining_width):
             constraints["width"] = _clamp(
-                values["width"] if values["width"] is not None else max(
+                declared_width if declared_width is not None else max(
                     0, remaining_width - margin * 2
                 ), values["min_width"], values["max_width"],
             )
         if dock in ("left", "right", "fill") and isfinite(remaining_height):
             constraints["height"] = _clamp(
-                values["height"] if values["height"] is not None else max(
+                declared_height if declared_height is not None else max(
                     0, remaining_height - margin * 2
                 ), values["min_height"], values["max_height"],
             )
-        w, h = measure(child, **constraints)
+        w, h = measure(
+            child, width=constraints.get("width"), height=constraints.get("height")
+        )
         if stretch:
             w, h = constraints.get("width", w), constraints.get("height", h)
         sizes[child] = w, h
@@ -473,7 +566,7 @@ def _dock_sizes(c, children, area, measure, *, stretch=True):
 
 
 @ui_method
-def validate(root):
+def validate(root: Control) -> None:
     """Validate structural layout constraints without a host or measurement."""
     children = [
         c for c in getattr(root, "_children", ())
@@ -488,7 +581,9 @@ def validate(root):
         validate(child)
 
 
-def _absolute_box(x, area, measure):
+def _absolute_box(
+    x: Control, area: Rect, measure: Callable[[Control], _Size]
+) -> Rect:
     values = x._values
     w, h = measure(x)
     left, top = values["left"], values["top"]
@@ -497,7 +592,8 @@ def _absolute_box(x, area, measure):
         raise ValueError("Unknown anchor")
     if x._anchor_base is None:
         x._anchor_base = (
-            area.width, area.height, left, top, w, h, values["width"], values["height"]
+            area.width, area.height, left, top, w, h,
+            values["width"], values["height"],
         )
     bw, bh, bl, bt, bwidth, bheight, declared_width, declared_height = x._anchor_base
     dx, dy = area.width - bw, area.height - bh
@@ -524,7 +620,9 @@ def _absolute_box(x, area, measure):
     return Rect(area.x + left, area.y + top, w, h)
 
 
-def _declared_boxes(c, area, measure):
+def _declared_boxes(
+    c: Container, area: Rect, measure: _LimitedMeasure
+) -> dict[Control, Rect]:
     """Compute ordinary child boxes before scrolling, using the declared layout."""
     normal = [
         x for x in c._children
@@ -543,7 +641,11 @@ def _declared_boxes(c, area, measure):
             c, [x for x in normal if not x._values["flex"]], area, measure
         )
         fixed = sum(
-            (sizes[x][1 if vertical else 0] if not x._values["flex"] else 0)
+            (
+                sizes[x][1 if vertical else 0]
+                if not x._values["flex"]
+                else 0
+            )
             + x._values["margin"] * 2
             for x in normal
         )
@@ -557,8 +659,16 @@ def _declared_boxes(c, area, measure):
                     [
                         (
                             x._values["flex"],
-                            x._values["min_height"] if vertical else x._values["min_width"],
-                            x._values["max_height"] if vertical else x._values["max_width"],
+                            (
+                                x._values["min_height"]
+                                if vertical
+                                else x._values["min_width"]
+                            ),
+                            (
+                                x._values["max_height"]
+                                if vertical
+                                else x._values["max_width"]
+                            ),
                         )
                         for x in flexible
                     ],
@@ -569,11 +679,12 @@ def _declared_boxes(c, area, measure):
         for x in normal:
             child = x._values
             margin = child["margin"]
+            declared_width, declared_height = child["width"], child["height"]
             length = allocations[x] if child["flex"] else sizes[x][1 if vertical else 0]
             if vertical:
                 w = _clamp(
-                    child["width"]
-                    if child["width"] is not None
+                    declared_width
+                    if declared_width is not None
                     else max(0, area.width - margin * 2),
                     child["min_width"],
                     child["max_width"],
@@ -582,8 +693,8 @@ def _declared_boxes(c, area, measure):
                 boxes[x] = Rect(area.x + margin, area.y + cursor + margin, w, h)
             else:
                 h = _clamp(
-                    child["height"]
-                    if child["height"] is not None
+                    declared_height
+                    if declared_height is not None
                     else max(0, area.height - margin * 2),
                     child["min_height"],
                     child["max_height"],
@@ -601,17 +712,18 @@ def _declared_boxes(c, area, measure):
         for x, (r, col) in cells.items():
             child = x._values
             margin = child["margin"]
+            declared_width, declared_height = child["width"], child["height"]
             col_span, row_span = child["grid_col_span"], child["grid_row_span"]
             w = (
-                child["width"]
-                if child["width"] is not None
+                declared_width
+                if declared_width is not None
                 else sum(widths[col : col + col_span])
                 + spacing * (col_span - 1)
                 - margin * 2
             )
             h = (
-                child["height"]
-                if child["height"] is not None
+                declared_height
+                if declared_height is not None
                 else sum(heights[r : r + row_span])
                 + spacing * (row_span - 1)
                 - margin * 2
@@ -667,10 +779,10 @@ def _declared_boxes(c, area, measure):
 
 
 @ui_method
-def arrange(root, host):
+def arrange(root: Control, host: Host) -> None:
     environment = _measure_environment(host)
-    if (getattr(root, "_layout_measure_host", None) is not host
-            or getattr(root, "_layout_measure_environment", None) != environment):
+    if (root._layout_measure_host is not host
+            or root._layout_measure_environment != environment):
         _clear_measurements(root)
         root._layout_measure_host = host
         root._layout_measure_environment = environment
@@ -682,11 +794,11 @@ def arrange(root, host):
     if retained is not None:
         retained.layout_started()
 
-    def place(c, rect, clip, effect_clip):
+    def place(c: Control, rect: Rect, clip: Rect, effect_clip: Rect) -> None:
         intersection = rect.intersect(clip)
         theme = c._fast_theme()
         if (
-            getattr(c, "_layout_valid", False)
+            c._layout_valid
             and c._rect == rect
             and c._clip == intersection
             and c._paint_clip == effect_clip
@@ -706,40 +818,45 @@ def arrange(root, host):
         c._paint_clip = effect_clip
         c._layout_valid, c._layout_theme = True, theme
         c._dirty = 0
+        if not isinstance(c, Container):
+            return
+        parent_box = c
         children = [
-            x for x in getattr(c, "_children", ())
+            x for x in parent_box._children
             if x._values["visible"] and not x._disposed
         ]
-        if not hasattr(c, "_children"):
-            return
-        area = c.content_bounds(rect)
+
+        def measure_limited(
+            child: Control, *, width: float | None = None, height: float | None = None
+        ) -> _Size:
+            return _size(child, host, width=width, height=height)
+
+        area = parent_box.content_bounds(rect)
         normal = [x for x in children if not x._overlay]
-        custom = c.arrange_children(
-            area, lambda child, **limits: _size(child, host, **limits)
-        )
+        custom = parent_box.arrange_children(area, measure_limited)
         # A custom arranger may settle its scrollbar gutters while measuring.
         # Clip children to that final viewport in the same layout pass.
-        children_clip = c.content_bounds(rect).intersect(c._clip)
-        children_effect_clip = c._child_effect_clip(rect, children_clip, effect_clip)
-        boxes = custom if custom is not None else {}
+        children_clip = parent_box.content_bounds(rect).intersect(c._clip)
+        children_effect_clip = parent_box._child_effect_clip(
+            rect, children_clip, effect_clip
+        )
+        boxes: dict[Control, Rect] = custom if custom is not None else {}
         if custom is not None:
             if set(custom) != set(normal):
                 raise ValueError(
                     "arrange_children must provide every visible non-overlay child"
                 )
         else:
-            boxes = _declared_boxes(
-                c, area, lambda child, **limits: _size(child, host, **limits)
-            )
+            boxes = _declared_boxes(parent_box, area, measure_limited)
         for x in children:
             if x not in boxes:
-                boxes[x] = _absolute_box(x, area, lambda child: _size(child, host))
+                boxes[x] = _absolute_box(x, area, measure_limited)
             b = boxes[x]
             if not x._overlay:
-                parent = c._values
+                stored = c._values
                 b = Rect(
-                    b.x - (parent["scroll_x"] if "scroll_x" in parent else 0),
-                    b.y - (parent["scroll_y"] if "scroll_y" in parent else 0),
+                    b.x - (stored["scroll_x"] if "scroll_x" in stored else 0.0),
+                    b.y - (stored["scroll_y"] if "scroll_y" in stored else 0.0),
                     b.width,
                     b.height,
                 )

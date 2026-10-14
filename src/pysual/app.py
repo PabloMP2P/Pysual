@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 from ._engine import call, call_async, call_opening, caller_side, check_origin
 from ._namespace_handlers import capture_handlers
@@ -18,13 +18,15 @@ from .host import (
     RenderDiagnostics,
     TextFile,
     Viewport,
+    native_frame_count,
+    read_native_stats,
     validate_session_key,
     validate_session_text,
 )
 from .inspection import ControlSnapshot, inspect_tree
 from .render_cache import CacheStats
 from .presentation import Outcome, Presentation, ensure_wait_allowed
-from .schema import Dirty, check_ui_thread, prop
+from .schema import Dirty, Field, _dynamic_properties, check_ui_thread, expect_number, prop
 from .theme import Theme, dark
 
 if TYPE_CHECKING:
@@ -73,7 +75,7 @@ class Window(Container, metaclass=_ControlMeta):
         def __init__(self, **properties: object) -> None:
             from ._config import window_defaults
 
-            values = cast(dict[str, Any], {**window_defaults(), **properties})
+            values = _dynamic_properties({**window_defaults(), **properties})
             super().__init__(**values)
 
     def _initialize(self) -> None:
@@ -87,7 +89,7 @@ class Window(Container, metaclass=_ControlMeta):
         self._generation = 0
         self._presentation: Presentation | None = None
 
-    def _validate_live_update(self, name, value) -> None:
+    def _validate_live_update(self, name: str, value: object) -> None:
         super()._validate_live_update(name, value)
         if name == "visible" and not value and self._runtime is not None:
             if self._runtime.presentation.modal or self._runtime._owned:
@@ -110,10 +112,12 @@ class Window(Container, metaclass=_ControlMeta):
     def build(self) -> None:
         """Override to create the interface. Called once by the runtime."""
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         super()._changed(field, old, value)
         if field.name in ("width", "height") and self._runtime is not None:
-            self._runtime._pending_size[field.name] = value
+            self._runtime._pending_size[field.name] = (
+                None if value is None else float(expect_number(value))
+            )
         if field.name == "reduce_motion" and value and self._runtime is not None:
             self._runtime.motion.clear()
 
@@ -150,7 +154,7 @@ class Window(Container, metaclass=_ControlMeta):
         return self
 
     @staticmethod
-    def _prepare_caller_side(backend) -> None:
+    def _prepare_caller_side(backend: Host | BackendName | None) -> None:
         # Signal handlers belong to the main thread; the UI owner cannot install
         # them. A terminal opening restores the console on SIGTERM/SIGHUP.
         from .backends.terminal import prepare_signal_restoration
@@ -293,9 +297,13 @@ class Window(Container, metaclass=_ControlMeta):
         if self._runtime is None or not self._runtime.frames:
             # build() runs with a Runtime attached before its host is open.
             return 0
-        if self._runtime is not None and getattr(self._runtime.host, "native_retained", False):
-            return int(self._runtime.host.native_stats()["frames"])
-        return self._runtime.frames if self._runtime is not None else 0
+        stats = read_native_stats(self._runtime.host)
+        if stats is not None:
+            count = native_frame_count(stats)
+            if count is None:
+                raise TypeError("native_stats must include frames")
+            return count
+        return self._runtime.frames
 
     def diagnostics(self, *, include_native: bool = False) -> RenderDiagnostics:
         """Snapshot submissions and host identity without invalidating or polling.
@@ -339,13 +347,13 @@ class Window(Container, metaclass=_ControlMeta):
         self._runtime.frame_timings.clear()
         return samples
 
-    def close(self, result=None) -> None:
+    def close(self, result: object = None) -> None:
         """Request closure; return without waiting for closing handlers or a veto."""
         check_ui_thread()
         if self._runtime is not None:
             self._runtime.request_close(result)
 
-    async def close_async(self, result=None) -> bool:
+    async def close_async(self, result: object = None) -> bool:
         """Await the shared close decision; True is accepted, False is vetoed."""
         import asyncio
 
@@ -353,6 +361,11 @@ class Window(Container, metaclass=_ControlMeta):
         if runtime is None:
             return True
         dispatcher, task = runtime.dispatcher, asyncio.current_task()
+        if task is runtime._close_task:
+            raise LifecycleError(
+                "A closing handler cannot await its own close decision; "
+                "return normally to accept closure or cancel the closing event"
+            )
         dispatcher.preserve_task(task)
         accepted = False
         try:
@@ -380,7 +393,13 @@ class Window(Container, metaclass=_ControlMeta):
             raise ValueError("suggested_name must be a filename, without directories")
         return await self._file_operation("save", text, suggested_name, location)
 
-    async def _file_operation(self, operation, *args):
+    async def _file_operation(
+        self,
+        operation: Literal["open", "save"],
+        text: str | None = None,
+        suggested_name: str | None = None,
+        location: str | None = None,
+    ) -> TextFile | None:
         self._check_live()
         if self._runtime is None:
             raise LifecycleError("This window is not open")
@@ -393,7 +412,9 @@ class Window(Container, metaclass=_ControlMeta):
             host = self._runtime.host
             if operation == "open":
                 return await host.open_text_file()
-            return await host.save_text_file(*args)
+            if text is None or suggested_name is None:
+                raise TypeError("save requires text and a suggested name")
+            return await host.save_text_file(text, suggested_name, location)
         finally:
             self._file_busy = False
 

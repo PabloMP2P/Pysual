@@ -14,6 +14,8 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable, Iterable
+from typing import Any, NotRequired, TypedDict, TypeGuard, cast, overload
 
 HEADER = struct.Struct('<4sIII')
 MAX_PAYLOAD = 16 * 1024 * 1024
@@ -21,7 +23,7 @@ RECEIVE_CHUNK = 256 * 1024
 U32 = struct.Struct('<I')
 
 
-def native_executable():
+def native_executable() -> Path:
     """Resolve the helper without importing graphics libraries or starting it."""
     return Path(os.environ.get('PYSUAL_HOST') or (Path(__file__).resolve().parents[1] /
                 'bin' / ('pysual-host.exe' if sys.platform == 'win32' else 'pysual-host')))
@@ -34,8 +36,24 @@ class NativeHostError(RuntimeError):
 # Keep this text equal to the rejection in native/host.c. Raw frames bypass Python.
 _NUL_ERROR = 'Embedded NUL is not representable in a native C string'
 
+# One shape for a native payload. Declared at the request boundary so the
+# embedded-NUL walk can use isinstance and dict.items directly.
+_Json = None | bool | int | float | str | list['_Json'] | tuple['_Json', ...] | dict[str, '_Json']
 
-def display_text(value):
+
+def _is_json_object(value: object) -> TypeGuard[dict[str, _Json]]:
+    return isinstance(value, dict)
+
+
+@overload
+def display_text(value: str) -> str: ...
+
+
+@overload
+def display_text(value: object) -> object: ...
+
+
+def display_text(value: object) -> object:
     """Drop U+0000 from text that is measured, drawn, or shown as a title.
 
     Characters on either side stay in order. Terminal painting removes this
@@ -46,7 +64,7 @@ def display_text(value):
     return value
 
 
-def _contains_embedded_nul(value):
+def _contains_embedded_nul(value: _Json) -> bool:
     if isinstance(value, str):
         return '\0' in value
     if isinstance(value, dict):
@@ -57,44 +75,56 @@ def _contains_embedded_nul(value):
     return False
 
 
-def _sanitize_commands(commands):
+def _sanitize_commands(commands: _Json) -> _Json:
     if not isinstance(commands, (list, tuple)):
         return commands
-    sanitized = None
+    sanitized: list[_Json] | None = None
     for index, command in enumerate(commands):
-        if (isinstance(command, (list, tuple)) and len(command) > 1 and command[0] == 'text'
-                and isinstance(command[1], str) and '\0' in command[1]):
-            if sanitized is None:
-                sanitized = list(commands)
-            sanitized[index] = [command[0], display_text(command[1]), *command[2:]]
+        if not isinstance(command, (list, tuple)) or len(command) < 2:
+            continue
+        text = command[1]
+        if command[0] != 'text' or not isinstance(text, str) or '\0' not in text:
+            continue
+        if sanitized is None:
+            sanitized = list(commands)
+        sanitized[index] = [command[0], display_text(text), *command[2:]]
     return commands if sanitized is None else sanitized
 
 
-def _sanitize_segment(segment):
+def _sanitize_segment(segment: _Json) -> _Json:
     if not isinstance(segment, dict):
         return segment
-    commands = _sanitize_commands(segment.get('commands'))
-    if commands is segment.get('commands'):
+    commands = segment.get('commands')
+    sanitized = _sanitize_commands(commands)
+    if sanitized is commands:
         return segment
-    return {**segment, 'commands': commands}
+    return {**segment, 'commands': sanitized}
 
 
-def _sanitize_display_nuls(op, fields):
-    fields = dict(fields)
-    if op == 'measure' and isinstance(fields.get('text'), str):
-        fields['text'] = display_text(fields['text'])
-    elif op == 'measure_many' and isinstance(fields.get('texts'), (list, tuple)):
-        fields['texts'] = [display_text(item) for item in fields['texts']]
-    elif op in ('set_title', 'open') and isinstance(fields.get('title'), str):
-        fields['title'] = display_text(fields['title'])
+def _sanitize_display_nuls(op: str, fields: dict[str, _Json]) -> dict[str, _Json]:
+    copied = dict(fields)
+    if op == 'measure':
+        text = copied.get('text')
+        if isinstance(text, str):
+            copied['text'] = display_text(text)
+    elif op == 'measure_many':
+        texts = copied.get('texts')
+        if isinstance(texts, (list, tuple)):
+            copied['texts'] = [display_text(item) if isinstance(item, str) else item for item in texts]
+    elif op in ('set_title', 'open'):
+        title = copied.get('title')
+        if isinstance(title, str):
+            copied['title'] = display_text(title)
     elif op == 'frame':
-        fields['commands'] = _sanitize_commands(fields.get('commands'))
-    elif op == 'patch' and isinstance(fields.get('upsert'), (list, tuple)):
-        fields['upsert'] = [_sanitize_segment(segment) for segment in fields['upsert']]
-    return fields
+        copied['commands'] = _sanitize_commands(copied.get('commands'))
+    elif op == 'patch':
+        upsert = copied.get('upsert')
+        if isinstance(upsert, (list, tuple)):
+            copied['upsert'] = [_sanitize_segment(segment) for segment in upsert]
+    return copied
 
 
-def prepare_native_request(op, fields):
+def prepare_native_request(op: str, fields: object) -> dict[str, _Json]:
     """Apply the embedded-NUL policy before a native request is serialized.
 
     Display text, measurements and titles drop U+0000. Clipboard text, paths,
@@ -102,7 +132,7 @@ def prepare_native_request(op, fields):
     with a terminating zero, so leaving the character in place would hide the
     suffix during measurement, drawing, JSON duplication and service calls.
     """
-    if not isinstance(fields, dict):
+    if not _is_json_object(fields):
         raise TypeError('Native request fields must be a dictionary')
     if '\0' not in op and not _contains_embedded_nul(fields):
         return fields
@@ -112,12 +142,12 @@ def prepare_native_request(op, fields):
     return sanitized
 
 
-def _read_handshake(sock, check_startup):
+def _read_handshake(sock: socket.socket, check_startup: Callable[[], None]) -> bytes:
     # Poll actual cancellation/process failure without imposing an elapsed
     # deadline on a live helper, including a partially received handshake.
     sock.settimeout(0.1)
 
-    def exact(length):
+    def exact(length: int) -> bytes:
         parts = bytearray()
         while len(parts) < length:
             check_startup()
@@ -129,10 +159,18 @@ def _read_handshake(sock, check_startup):
                 raise NativeHostError('Native host disconnected during handshake')
             parts.extend(data)
         return bytes(parts)
-    magic, opcode, request, length = HEADER.unpack(exact(HEADER.size))
+    magic, opcode, request, length = cast(
+        tuple[object, object, object, object], HEADER.unpack(exact(HEADER.size))
+    )
     if magic != b'PXN1' or opcode != 1 or request != 0 or length != 64:
         raise NativeHostError('Invalid native host handshake')
-    return exact(length)
+    return exact(cast(int, length))
+
+
+class _Pending(TypedDict):
+    event: threading.Event
+    result: NotRequired[object]
+    error: NotRequired[BaseException]
 
 
 class NativeClient:
@@ -141,53 +179,63 @@ class NativeClient:
     Public requests wait for explicit native acknowledgements. Reads block in
     select until real protocol data arrives; no per-frame polling is performed.
     """
-    def __init__(self, on_event=None, *, executable=None, timeout=10.0):
-        self._on_event = on_event or (lambda payload: None)
+    def __init__(
+        self,
+        on_event: Callable[[object], None] | None = None,
+        *,
+        executable: str | Path | None = None,
+        timeout: float = 10.0,
+    ) -> None:
+        self._on_event: Callable[[object], None] = on_event or (lambda payload: None)
         self._executable = Path(executable) if executable is not None else native_executable()
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError('timeout must be finite and positive')
         self._timeout = float(timeout)
         self._opening = True
-        self._process = None
-        self._socket = None
-        self._reader = None
-        self._stderr_reader = None
+        self._process: subprocess.Popen[bytes] | None = None
+        self._socket: socket.socket | None = None
+        self._reader: threading.Thread | None = None
+        self._stderr_reader: threading.Thread | None = None
         self._send_lock = threading.Lock()
         self._state_lock = threading.RLock()
         self._close_lock = threading.Lock()
-        self._pending = {}
+        self._pending: dict[int, _Pending] = {}
         self._next_id = 1
         self._closed = threading.Event()
-        self._closed_payload = None
-        self._transport_error = None
-        self._stderr = deque(maxlen=32)
-        self._counts = dict(requests_sent=0, replies_received=0,
+        self._closed_payload: object = None
+        self._transport_error: BaseException | None = None
+        self._stderr: deque[str] = deque(maxlen=32)
+        self._counts: dict[str, int] = dict(requests_sent=0, replies_received=0,
                             input_events=0, closed_events=0,
                             bytes_sent=0, bytes_received=0)
 
     @property
-    def is_alive(self):
-        return self._process is not None and self._process.poll() is None
+    def is_alive(self) -> bool:
+        process = self._process
+        return process is not None and process.poll() is None
 
     @property
-    def diagnostics(self):
+    def diagnostics(self) -> dict[str, object]:
         with self._state_lock:
             return {**self._counts, 'stderr_tail': ''.join(self._stderr)[-8192:],
                     'pid': self._process.pid if self._process else None,
                     'closed': self._closed.is_set()}
 
     @property
-    def process(self):
+    def process(self) -> subprocess.Popen[bytes] | None:
         return self._process
 
-    def _check_startup(self):
+    def _check_startup(self) -> None:
         if self._closed.is_set():
             raise NativeHostError('Native host closed during startup')
-        code = self._process.poll()
+        process = self._process
+        if process is None:
+            raise NativeHostError('Native host is not running')
+        code = process.poll()
         if code is not None:
             raise NativeHostError(f'Native host exited during startup (code {code})')
 
-    def _start(self, *, terminal=False):
+    def _start(self, *, terminal: bool = False) -> None:
         if self._process is not None or self._closed.is_set():
             raise NativeHostError('Create a new NativeClient for each opening')
         if not self._executable.is_file():
@@ -239,8 +287,11 @@ class NativeClient:
         finally:
             listener.close()
 
-    def _read_stderr(self):
-        stream = self._process.stderr
+    def _read_stderr(self) -> None:
+        process = self._process
+        if process is None or process.stderr is None:
+            return
+        stream = process.stderr
         try:
             while True:
                 chunk = stream.read(1024)
@@ -251,7 +302,7 @@ class NativeClient:
         finally:
             stream.close()
 
-    def _receive_frames(self):
+    def _receive_frames(self) -> Iterable[tuple[int, int, bytes]]:
         """Parse each received burst before waiting, retaining a partial frame.
 
         Reading the header and payload separately creates two socket/GIL
@@ -262,8 +313,15 @@ class NativeClient:
         while True:
             offset = 0
             while len(received) - offset >= HEADER.size:
-                magic, opcode, request, length = HEADER.unpack_from(received, offset)
-                if magic != b'PXN1' or length > MAX_PAYLOAD:
+                magic, opcode, request, length = cast(
+                    tuple[object, object, object, object],
+                    HEADER.unpack_from(received, offset),
+                )
+                if (
+                    not isinstance(magic, bytes) or magic != b'PXN1'
+                    or not isinstance(opcode, int) or not isinstance(request, int)
+                    or not isinstance(length, int) or length > MAX_PAYLOAD
+                ):
                     raise NativeHostError('Invalid response framing')
                 end = offset + HEADER.size + length
                 if end > len(received):
@@ -284,12 +342,13 @@ class NativeClient:
                 raise EOFError('Native host disconnected')
             received.extend(part)
 
-    def _read_loop(self):
+    def _read_loop(self) -> None:
         try:
             for opcode, request, raw in self._receive_frames():
-                payload = json.loads(raw.decode('utf-8'))
-                if not isinstance(payload, dict):
+                loaded: object = json.loads(raw.decode('utf-8'))
+                if not isinstance(loaded, dict):
                     raise NativeHostError('Host response is not an object')
+                payload = cast(dict[str, object], loaded)
                 with self._state_lock:
                     self._counts['bytes_received'] += HEADER.size + len(raw)
                 if opcode == 200:
@@ -322,7 +381,7 @@ class NativeClient:
             self._fail_pending(self._transport_error or NativeHostError('Native host closed'))
             self._disconnect()
 
-    def _notify_closed(self, payload):
+    def _notify_closed(self, payload: dict[str, object]) -> None:
         with self._state_lock:
             if self._closed.is_set():
                 return
@@ -330,16 +389,17 @@ class NativeClient:
             self._counts['closed_events'] += 1
             self._closed.set()
         if payload.get('reason') not in ('closed', 'not_started'):
-            self._on_event({'kind': 'error', 'text': payload.get('error', 'Native host closed unexpectedly')})
+            error = payload.get('error', 'Native host closed unexpectedly')
+            self._on_event({'kind': 'error', 'text': error})
 
-    def _fail_pending(self, error):
+    def _fail_pending(self, error: BaseException) -> None:
         with self._state_lock:
             pending, self._pending = self._pending, {}
         for value in pending.values():
             value['error'] = error
             value['event'].set()
 
-    def _send(self, frame, timeout):
+    def _send(self, frame: bytes, timeout: float | None) -> None:
         deadline = None if timeout is None else time.monotonic() + timeout
         remaining = memoryview(frame)
         while remaining:
@@ -360,10 +420,10 @@ class NativeClient:
             self._counts['requests_sent'] += 1
             self._counts['bytes_sent'] += len(frame)
 
-    def _request(self, opcode, payload=b'', *, timeout):
+    def _request(self, opcode: int, payload: bytes = b'', *, timeout: float | None) -> object:
         if len(payload) > MAX_PAYLOAD:
             raise ValueError('Request exceeds the 16 MiB protocol limit')
-        pending = {'event': threading.Event()}
+        pending: _Pending = {'event': threading.Event()}
         try:
             with self._send_lock:
                 with self._state_lock:
@@ -384,22 +444,29 @@ class NativeClient:
             self._abort('transport_error')
             raise TimeoutError('Native acknowledgement timed out; session closed because commit status is unknown')
         if 'error' in pending:
-            raise pending['error']
+            error = pending['error']
+            if isinstance(error, BaseException):
+                raise error
+            raise NativeHostError('Native host failed')
         return pending.get('result')
 
-    def request(self, op, **kwargs):
+    def request(self, op: str, **kwargs: object) -> Any:
+        """Send one native operation and return its decoded JSON result.
+
+        The payload shape depends on ``op`` (a mapping, a sequence, or none).
+        """
         if not isinstance(op, str):
             raise TypeError('op must be a string')
-        kwargs = prepare_native_request(op, kwargs)
-        payload = json.dumps({'op': op, **kwargs}, ensure_ascii=False,
+        prepared = prepare_native_request(op, kwargs)
+        payload = json.dumps({'op': op, **prepared}, ensure_ascii=False,
                              allow_nan=False, separators=(',', ':')).encode('utf-8')
         if len(payload) > MAX_PAYLOAD:
             raise ValueError('Request exceeds the 16 MiB protocol limit')
         if self._process is None:
             if op != 'open':
                 raise NativeHostError('Open the native host first')
-            self._start(terminal=kwargs.get('backend') == 'terminal' and not
-                        (kwargs.get('hidden') or kwargs.get('headless')))
+            self._start(terminal=prepared.get('backend') == 'terminal' and not
+                        (prepared.get('hidden') or prepared.get('headless')))
         try:
             # The first content frame can legitimately take longer than an
             # ordinary request. EOF, process exit and explicit errors still fail
@@ -414,7 +481,7 @@ class NativeClient:
                 self._abort('startup_failed')
             raise
 
-    def _disconnect(self):
+    def _disconnect(self) -> None:
         with self._state_lock:
             sock, self._socket = self._socket, None
         if sock is not None:
@@ -424,7 +491,7 @@ class NativeClient:
                 pass
             sock.close()
 
-    def _reap(self, timeout):
+    def _reap(self, timeout: float) -> None:
         if self._process is None:
             return
         try:
@@ -437,13 +504,13 @@ class NativeClient:
                 self._process.kill()
                 self._process.wait(timeout=1.0)
 
-    def _abort(self, reason):
+    def _abort(self, reason: str) -> None:
         self._disconnect()
         self._fail_pending(self._transport_error or NativeHostError(reason))
         self._reap(0.5)
         self._notify_closed({'reason': reason, 'error': str(self._transport_error or reason)})
 
-    def close(self):
+    def close(self) -> None:
         with self._close_lock:
             if self._process is None:
                 self._notify_closed({'reason': 'not_started'})
@@ -469,7 +536,7 @@ class NativeClient:
                 if worker and worker is not current:
                     worker.join(timeout=1.0)
 
-    def wait(self, timeout=None):
+    def wait(self, timeout: float | None = None) -> object:
         started = time.monotonic()
         if not self._closed.wait(timeout):
             raise TimeoutError('Native host is still running')
@@ -481,8 +548,8 @@ class NativeClient:
                 raise TimeoutError('Native process has not exited yet') from exc
         return self._closed_payload
 
-    def __enter__(self):
+    def __enter__(self) -> NativeClient:
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *args: object) -> None:
         self.close()

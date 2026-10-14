@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import ceil
+from collections.abc import Sequence
 from typing import ClassVar
 
 from ._text_display import single_line
@@ -12,11 +13,13 @@ from .controls import Control
 from .errors import LifecycleError
 from .events import ChangeEvent, Event, UiEvent
 from .geometry import Rect
-from .painting import resolve_style
-from .schema import Dirty, prop
+from .painting import resolve_style, Painter
+from .schema import Dirty, Field, prop
+from .theme import ResolvedStyle
+from .host import Host, Input
 
 
-def _caption(p, text, area, style):
+def _caption(p: Painter, text: str, area: Rect, style: ResolvedStyle) -> None:
     """Fit a caption within its own surface, including very narrow layouts."""
     if area.width <= 0 or area.height <= 0:
         return
@@ -36,22 +39,22 @@ class _PartControl(Control):
     cache_paint: bool = prop(default=True)
     focusable: bool = prop(default=True, affects=Dirty.HIT_TEST)
 
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
         self._press = PressBehavior()
-        self._hot_part = None
-        self._armed_part = None
+        self._hot_part: int | str | None = None
+        self._armed_part: int | str | None = None
 
-    def _clear_interaction(self):
+    def _clear_interaction(self) -> None:
         self._press.reset(self)
         self._hot_part = self._armed_part = None
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         # Model or geometry changes must never retarget an in-flight gesture.
         self._clear_interaction()
         super()._changed(field, old, value)
 
-    def _handle_press(self, event, part):
+    def _handle_press(self, event: Input, part: int | str | None) -> bool:
         self._check_live()
         if not self.effective_enabled or event.kind == "blur":
             self._clear_interaction()
@@ -75,7 +78,14 @@ class _PartControl(Control):
         # not end the gesture. Keep its target so moving back restores styling.
         return activated and part is not None
 
-    def _part_style(self, part, target, *, selected=False, enabled=True):
+    def _part_style(
+        self,
+        part: str,
+        target: int | str | None,
+        *,
+        selected: bool = False,
+        enabled: bool = True,
+    ) -> ResolvedStyle:
         state = (
             "disabled" if not enabled or not self.effective_enabled
             else "pressed" if target is not None and self._pressed and self._armed_part == target
@@ -84,7 +94,7 @@ class _PartControl(Control):
         )
         return resolve_style(self, part, selected=selected, state=state)
 
-    def destroy(self):
+    def destroy(self) -> None:
         self._clear_interaction()
         super().destroy()
 
@@ -104,20 +114,22 @@ class SegmentedControl(_PartControl):
     style_fallbacks: ClassVar[tuple[str, ...]] = ("Button",)
     style_parts: ClassVar[tuple[str, ...]] = ("body", "segment", "separator")
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
-        values = {**self._values, name: value}
-        if values["selected_index"] >= len(values["items"]):
+        if name not in ("selected_index", "items"):
+            return
+        pending = self._pending(name, value)
+        if pending.number("selected_index") >= len(pending.texts("items")):
             raise ValueError("Selected index is outside items")
 
     @property
     def selected_item(self) -> str | None:
         return self.items[self.selected_index] if self.selected_index >= 0 else None
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         return max(1, len(self.items)) * self.segment_width + 4, self._control_height(host)
 
-    def _geometry(self):
+    def _geometry(self) -> tuple[float, int]:
         available = max(0, self._rect.width - 4)
         count = max(1, len(self.items))
         pitch = max(32, available / count)
@@ -127,7 +139,7 @@ class SegmentedControl(_PartControl):
         start = max(0, self.selected_index - capacity + 1)
         return pitch, start
 
-    def _hit_part(self, event):
+    def _hit_part(self, event: Input) -> int | None:
         if not self._rect.contains(event.x, event.y):
             return None
         pitch, start = self._geometry()
@@ -135,12 +147,12 @@ class SegmentedControl(_PartControl):
         index = start + int(max(0, event.x - self._rect.x - 2) // pitch)
         return min(index, len(self.items) - 1) if self.items else None
 
-    def handle_input(self, event, /):
+    def handle_input(self, event: Input, /) -> bool | None:
         self._check_live()
         part = self._hit_part(event) if event.kind.startswith("pointer") else (
             max(0, self.selected_index) if self.items else None
         )
-        if self._handle_press(event, part):
+        if self._handle_press(event, part) and part is not None:
             self.selected_index = part
             if event.kind == "pointer_up":
                 # Selection invalidates the model and cancels the gesture; the
@@ -156,7 +168,7 @@ class SegmentedControl(_PartControl):
                     )))
                 )
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         p.body()
         pitch, start = self._geometry()
         visible = self._clip.intersect(self._rect.inset(2))
@@ -200,22 +212,22 @@ class Breadcrumb(_PartControl):
     style_fallbacks: ClassVar[tuple[str, ...]] = ("Hyperlink",)
     style_parts: ClassVar[tuple[str, ...]] = ("body", "item", "separator")
 
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
         self._focus_index = max(0, len(self.items) - 2)
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         if field.name == "items":
             self._focus_index = max(0, len(self.items) - 2)
         super()._changed(field, old, value)
 
-    def _shown_indices(self):
+    def _shown_indices(self) -> list[int | None]:
         count = len(self.items)
         if count <= 5:
-            return list(range(count))
+            return [*range(count)]
         middle = max(1, min(count - 4, self._focus_index - 1))
         indices = [0, *range(middle, middle + 3), count - 1]
-        shown = []
+        shown: list[int | None] = []
         previous = -1
         for index in indices:
             if previous >= 0 and index > previous + 1:
@@ -224,12 +236,14 @@ class Breadcrumb(_PartControl):
             previous = index
         return shown
 
-    def _parts(self, host=None, *, natural=False):
+    def _parts(
+        self, host: Host | None = None, *, natural: bool = False,
+    ) -> tuple[list[tuple[int | None, Rect, float]], float]:
         if host is None:
             host = getattr(self._root(), "_layout_measure_host", None)
         style = resolve_style(self, "item")
         shown = self._shown_indices()
-        widths = []
+        widths: list[float] = []
         for index in shown:
             if index is None:
                 width = 26
@@ -241,23 +255,23 @@ class Breadcrumb(_PartControl):
                     style.font_family == "mono",
                 )[0] + 16))
             widths.append(width)
-        separator = 16
+        separator: float = 16
         desired = sum(widths) + max(0, len(shown) - 1) * separator
         if not natural and desired > self._rect.width:
             ratio = max(0, self._rect.width) / max(1, desired)
             widths = [width * ratio for width in widths]
             separator *= ratio
         x = 0.0
-        result = []
+        result: list[tuple[int | None, Rect, float]] = []
         for index, width in zip(shown, widths):
             result.append((index, Rect(x, 0, width, self._rect.height), separator))
             x += width + separator
         return result, desired
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         return self._parts(host, natural=True)[1], self._control_height(host)
 
-    def _hit_part(self, event):
+    def _hit_part(self, event: Input) -> int | None:
         if not self._rect.contains(event.x, event.y):
             return None
         for index, area, _ in self._parts()[0]:
@@ -281,12 +295,12 @@ class Breadcrumb(_PartControl):
                 source=self, origin=self._origin, index=index, item=self.items[index],
             ))
 
-    def handle_input(self, event, /):
+    def handle_input(self, event: Input, /) -> bool | None:
         self._check_live()
         part = self._hit_part(event) if event.kind.startswith("pointer") else (
             self._focus_index if len(self.items) > 1 else None
         )
-        if self._handle_press(event, part):
+        if self._handle_press(event, part) and isinstance(part, int):
             if self._focus_index != part:
                 self._focus_index = part
                 self.invalidate(Dirty.MEASURE | Dirty.PAINT)
@@ -302,7 +316,7 @@ class Breadcrumb(_PartControl):
                 )
                 self.invalidate(Dirty.MEASURE | Dirty.PAINT)
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         p.body()
         parts, _ = self._parts(p.host)
         for position, (index, area, separator_width) in enumerate(parts):
@@ -340,22 +354,26 @@ class Pagination(_PartControl):
     style_fallbacks: ClassVar[tuple[str, ...]] = ("Button",)
     style_parts: ClassVar[tuple[str, ...]] = ("body", "page", "arrow", "ellipsis")
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
-        values = {**self._values, name: value}
-        if values["page"] > values["page_count"]:
+        if name not in ("page", "page_count", "visible_pages"):
+            return
+        pending = self._pending(name, value)
+        if pending.number("page") > pending.number("page_count"):
             raise ValueError("Pagination requires 1 <= page <= page_count")
-        if values["visible_pages"] > 15:
+        if pending.number("visible_pages") > 15:
             raise ValueError("visible_pages must be between 1 and 15")
 
-    def _parts(self):
+    def _parts(self) -> Sequence[int | str | None]:
         count = min(self.visible_pages, self.page_count)
         start = max(1, min(self.page - count // 2, self.page_count - count + 1))
-        pages = list(range(start, start + count))
-        if pages[0] > 1:
-            pages = [1, *([None] if pages[0] > 2 else []), *pages]
-        if pages[-1] < self.page_count:
-            pages.extend([None] if pages[-1] < self.page_count - 1 else [])
+        pages: list[int | None] = list(range(start, start + count))
+        first = pages[0]
+        if isinstance(first, int) and first > 1:
+            pages = [1, *([None] if first > 2 else []), *pages]
+        last = pages[-1]
+        if isinstance(last, int) and last < self.page_count:
+            pages.extend([None] if last < self.page_count - 1 else [])
             pages.append(self.page_count)
         result = ["previous", *pages, "next"]
         # A constrained layout keeps the selected page and both arrows visible.
@@ -367,25 +385,25 @@ class Pagination(_PartControl):
             result = ["previous", *range(start, start + count), "next"]
         return result
 
-    def _pitch(self):
+    def _pitch(self) -> float:
         style = resolve_style(self, "page")
         return max(36, len(str(self.page_count)) * style.font_size * 0.7 + 16)
 
-    def _display_pitch(self):
+    def _display_pitch(self) -> float:
         return min(self._pitch(), max(4, (self._rect.width + 4) / 3))
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         # Reserve the maximum window width so page changes do not shift layout.
         slots = min(self.page_count, self.visible_pages + 4) + 2
         return slots * self._pitch() - 4, self._control_height(host)
 
-    def _enabled_part(self, part):
+    def _enabled_part(self, part: int | str | None) -> bool:
         return part is not None and not (
             (part == "previous" and self.page == 1)
             or (part == "next" and self.page == self.page_count)
         )
 
-    def _hit_part(self, event):
+    def _hit_part(self, event: Input) -> int | str | None:
         if not self._rect.contains(event.x, event.y):
             return None
         pitch = self._display_pitch()
@@ -397,11 +415,16 @@ class Pagination(_PartControl):
         part = parts[index]
         return part if self._enabled_part(part) else None
 
-    def handle_input(self, event, /):
+    def handle_input(self, event: Input, /) -> bool | None:
         self._check_live()
         part = self._hit_part(event) if event.kind.startswith("pointer") else self.page
         if self._handle_press(event, part):
-            self.page = self.page - 1 if part == "previous" else self.page + 1 if part == "next" else part
+            if part == "previous":
+                self.page = self.page - 1
+            elif part == "next":
+                self.page = self.page + 1
+            elif isinstance(part, int):
+                self.page = part
         elif self.effective_enabled and event.kind == "key_down":
             if event.key in ("ArrowLeft", "ArrowUp", "ArrowRight", "ArrowDown", "Home", "End"):
                 self._clear_interaction()
@@ -412,7 +435,7 @@ class Pagination(_PartControl):
                     )))
                 )
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         p.body()
         pitch = self._display_pitch()
         for index, part in enumerate(self._parts()):

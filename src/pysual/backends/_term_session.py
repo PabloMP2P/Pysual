@@ -13,13 +13,15 @@ import threading
 import time
 import weakref
 from collections import OrderedDict, deque
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from types import FrameType
+from typing import TypedDict, cast
 
 from ..host import MAX_TEXT_BYTES, CapabilityError, Input, Viewport
 from ._native import NativeServices
 from ._term_input import TerminalInput
-from ._term_io import TerminalIO
+from ._term_io import TerminalIO, TerminalTransport
 
 
 @dataclass
@@ -54,8 +56,13 @@ _LEAVE = (
 # signal handlers. The window gateways install one process-wide handler from
 # the caller's thread; it restores every open session before the process ends.
 _open_sessions: "weakref.WeakSet[TerminalSession]" = weakref.WeakSet()
-_restoration_signals: dict[int, Any] = {}
+_SignalHandler = Callable[[int, FrameType | None], object] | int | None
+_restoration_signals: dict[int, _SignalHandler] = {}
 _RESTORATION_NAMES = ("SIGTERM", "SIGHUP")
+
+
+class _SpawnOptions(TypedDict, total=False):
+    creationflags: int
 
 
 def install_signal_restoration() -> bool:
@@ -70,17 +77,17 @@ def install_signal_restoration() -> bool:
     if _restoration_signals:
         return True
     for name in _RESTORATION_NAMES:
-        signum = getattr(signal, name, None)
-        if signum is None:
+        number = getattr(signal, name, None)
+        if not isinstance(number, int):
             continue
         try:
-            _restoration_signals[signum] = signal.signal(signum, _restore_terminals)
+            _restoration_signals[number] = signal.signal(number, _restore_terminals)
         except (ValueError, OSError):
             continue
     return bool(_restoration_signals)
 
 
-def _restore_terminals(signum, frame):
+def _restore_terminals(signum: int, frame: FrameType | None) -> None:
     for session in tuple(_open_sessions):
         try:
             session.close()
@@ -110,12 +117,19 @@ class TerminalSession(NativeServices):
     PROBE = _PROBE
     GEOMETRY_QUERY = b"\x1b[14t\x1b[16t\x1b[18t"
 
-    def __init__(self, *, io=None, protocol=None, probe_timeout=0.15, environ=None):
+    def __init__(
+        self,
+        *,
+        io: TerminalTransport | None = None,
+        protocol: str | None = None,
+        probe_timeout: float = 0.15,
+        environ: Mapping[str, str] | None = None,
+    ) -> None:
         if protocol not in (None, "kitty", "sixel", "iterm", "halfblock", "text"):
             raise ValueError("Invalid terminal session protocol")
         if not 0 <= probe_timeout <= 2:
             raise ValueError("probe_timeout must be between zero and two seconds")
-        self.io = TerminalIO() if io is None else io
+        self.io: TerminalTransport = TerminalIO() if io is None else io
         self.features = TerminalFeatures()
         self.size = (800.0, 576.0)
         self.scale = 1.0
@@ -124,40 +138,40 @@ class TerminalSession(NativeServices):
         self._probe_timeout = probe_timeout
         self._environ = dict(os.environ if environ is None else environ)
         self._parser = TerminalInput()
-        self._pending = []
+        self._pending: list[Input] = []
         self._resource_events: deque[Input] = deque(maxlen=32)
         self._image_errors: OrderedDict[tuple[int, str], None] = OrderedDict()
         self._active = False
         self._title = ""
-        self._previous_frame = None
-        self._last_dimensions = None
+        self._previous_frame: bytes | None = None
+        self._last_dimensions: tuple[int, int, int, int] | None = None
         self._last_size_check = 0.0
         self._last_size_query = 0.0
         self._session_lock = asyncio.Lock()
         self._clipboard_lock = asyncio.Lock()
-        self._clipboard_reply = None
+        self._clipboard_reply: asyncio.Future[str] | None = None
         self._session_generation = 0
-        self._explicit_scale = None
+        self._explicit_scale: float | None = None
         self._sixel_mode = False
         self._sixel_restore = False
         # Own one image slot, never issue a terminal-wide image deletion.
         self._image_id = (os.getpid() % 1000000) * 2 + 100
 
     @property
-    def viewport(self):
+    def viewport(self) -> Viewport:
         return Viewport(*self.size, self.scale)
 
     @property
-    def render_scale(self):
+    def render_scale(self) -> float:
         return self.scale
 
     @property
-    def protocol(self):
+    def protocol(self) -> str:
         return self.features.protocol
 
-    def _responses(self):
+    def _responses(self) -> None:
         f = self.features
-        responses, self._parser.replies = self._parser.replies, []
+        responses, self._parser.replies = self._parser.replies, list[bytes]()
         for response in responses:
             if re.fullmatch(rb"\x1b_Gi=31;OK\x1b\\", response):
                 f.protocol = "kitty"
@@ -203,7 +217,7 @@ class TerminalSession(NativeServices):
         if self._forced_protocol is not None:
             f.protocol = self._forced_protocol
 
-    def _reset_open_state(self):
+    def _reset_open_state(self) -> None:
         # A reusable Host can enter a different terminal on its next run.
         # Capabilities, partial input and owned modes belong to one opening;
         # constructor options and the monotonic resource revision persist.
@@ -224,7 +238,14 @@ class TerminalSession(NativeServices):
         self._clipboard_lock = asyncio.Lock()
         self._session_lock = asyncio.Lock()
 
-    def open(self, title, width, height, resizable, scale):
+    def open(
+        self,
+        title: str,
+        width: float,
+        height: float,
+        resizable: bool,
+        scale: float | None,
+    ) -> None:
         if self._active:
             raise RuntimeError("This terminal host is already open")
         if scale is not None:
@@ -268,7 +289,7 @@ class TerminalSession(NativeServices):
             self.close()
             raise
 
-    def _read_dimensions(self):
+    def _read_dimensions(self) -> bool:
         facts = self.io.dimensions()
         if facts == self._last_dimensions:
             return False
@@ -282,10 +303,10 @@ class TerminalSession(NativeServices):
         f.pixel_height = height or round(f.rows * f.cell_height)
         return True
 
-    def poll(self):
+    def poll(self) -> list[Input]:
         if not self._active:
             return []
-        result, self._pending = self._pending, []
+        result, self._pending = self._pending, list[Input]()
         result.extend(self._resource_events)
         self._resource_events.clear()
         previous_features = (
@@ -319,7 +340,7 @@ class TerminalSession(NativeServices):
             result.append(Input("close"))
         return result
 
-    def set_title(self, title):
+    def set_title(self, title: str) -> None:
         title = "".join(
             ch for ch in str(title) if ord(ch) >= 32 and not 127 <= ord(ch) <= 159
         )[:256]
@@ -328,13 +349,13 @@ class TerminalSession(NativeServices):
             if self._active:
                 self.io.write(b"\x1b]2;" + title.encode("utf-8") + b"\x07")
 
-    def set_size(self, width, height):
+    def set_size(self, width: float, height: float) -> None:
         # A terminal pane owns its size. Runtime synchronizes the application's
         # request back to this actual viewport, like a constrained native host.
         self._read_dimensions()
         self._geometry()
 
-    def close(self):
+    def close(self) -> None:
         if not self._active:
             return
         self._active = False
@@ -365,7 +386,7 @@ class TerminalSession(NativeServices):
                         CapabilityError("Terminal closed during clipboard access")
                     )
 
-    def _clipboard_command(self, write=False):
+    def _clipboard_command(self, write: bool = False) -> list[str] | None:
         if self._environ.get("SSH_CONNECTION") or self._environ.get("SSH_TTY"):
             return None
         if sys.platform == "win32":
@@ -406,8 +427,10 @@ class TerminalSession(NativeServices):
                 return [executable, "--clipboard", "--input" if write else "--output"]
         return None
 
-    async def _clipboard_process(self, command, data=None):
-        options: dict[str, Any] = (
+    async def _clipboard_process(
+        self, command: list[str], data: bytes | None = None
+    ) -> str:
+        options: _SpawnOptions = (
             {"creationflags": subprocess.CREATE_NO_WINDOW}
             if sys.platform == "win32"
             else {}
@@ -435,7 +458,7 @@ class TerminalSession(NativeServices):
             raise CapabilityError("Clipboard text exceeds 8 MiB")
         return out.decode("utf-8")
 
-    async def clipboard_read(self):
+    async def clipboard_read(self) -> str:
         generation = self._session_generation
         command = self._clipboard_command()
         if command:
@@ -450,7 +473,9 @@ class TerminalSession(NativeServices):
         async with self._clipboard_lock:
             if not self._active or generation != self._session_generation:
                 raise CapabilityError("Terminal closed during clipboard access")
-            reply = asyncio.get_running_loop().create_future()
+            reply = cast(
+                "asyncio.Future[str]", asyncio.get_running_loop().create_future()
+            )
             self._clipboard_reply = reply
             try:
                 self.io.write(b"\x1b]52;c;?\x07")
@@ -463,7 +488,7 @@ class TerminalSession(NativeServices):
                 if self._clipboard_reply is reply:
                     self._clipboard_reply = None
 
-    async def clipboard_write(self, text):
+    async def clipboard_write(self, text: str) -> None:
         generation = self._session_generation
         data = text.encode("utf-8")
         if len(data) > MAX_TEXT_BYTES:

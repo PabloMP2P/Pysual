@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import inspect
-from typing import Any
+from typing import cast
+from collections.abc import Callable
 
 from .controls import Container, Control
 from .errors import BindingError
@@ -14,7 +15,7 @@ from .events import annotate_error, validate_callback
 @dataclass(frozen=True)
 class NamespaceHandlers:
     aliases: tuple[str, ...]
-    callbacks: dict[str, Any]
+    callbacks: dict[str, object]
 
 
 def capture_handlers(window: Control) -> NamespaceHandlers | None:
@@ -69,7 +70,7 @@ def bind_handlers(window: Container, namespace: NamespaceHandlers | None) -> Non
                 for name, child in control._bindings.items()
             )
 
-    selected: dict[tuple[Control, str], tuple[str, Any]] = {}
+    selected: dict[tuple[Control, str], tuple[str, object]] = {}
     for name, matches in targets.items():
         if len(matches) != 1:
             raise BindingError(f"Namespace handler {name!r} matches multiple controls/events")
@@ -82,7 +83,10 @@ def bind_handlers(window: Container, namespace: NamespaceHandlers | None) -> Non
             )
         control, event_name = target
         try:
-            validate_callback(callback, control._event_definitions()[event_name].event_type)
+            validate_callback(
+                cast(Callable[..., object], callback),
+                control._event_definitions()[event_name].event_type,
+            )
         except Exception as error:
             annotate_error(error, f"Binding caller namespace handler {name}")
             raise

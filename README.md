@@ -161,6 +161,7 @@ Style and commit conventions are in [Contributing](https://github.com/PabloMP2P/
 
 ```sh
 python -m pytest
+python tools/check_typing.py
 ```
 
 After changing control properties, run `python tools/generate_factory_types.py`

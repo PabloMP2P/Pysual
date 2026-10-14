@@ -7,6 +7,7 @@ returned separately; probing never consumes keystrokes or bracketed paste.
 import codecs
 import re
 import time
+from collections.abc import Callable
 
 from ..host import Input, MAX_TEXT_BYTES
 
@@ -72,7 +73,7 @@ _CODES.update({57364 + n: f"F{n + 1}" for n in range(35)})
 class TerminalInput:
     """Decode VT, SGR mouse, xterm keys and the Kitty keyboard protocol."""
 
-    def __init__(self, *, clock=time.monotonic):
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
         self.buffer = bytearray()
         self.replies: list[bytes] = []
         self.cell_width = 8.0
@@ -87,7 +88,9 @@ class TerminalInput:
         self._pointer = (0.0, 0.0)
 
     @staticmethod
-    def _keys(key: str, *, shift=False, ctrl=False, event=0):
+    def _keys(
+        key: str, *, shift: bool = False, ctrl: bool = False, event: int = 0
+    ) -> list[Input]:
         # Legacy terminals have no release events. Pairing them makes button
         # activation and focus navigation behave like native host input.
         if ctrl and key.lower() == "q" and event != 3:
@@ -99,8 +102,8 @@ class TerminalInput:
             result.append(Input("key_up", key=key, shift=shift, ctrl=ctrl))
         return result
 
-    def _plain(self, data):
-        result = []
+    def _plain(self, data: bytes) -> list[Input]:
+        result: list[Input] = []
         for ch in self._decoder.decode(data):
             code = ord(ch)
             if ch in "\r\n\t\b\x7f":
@@ -114,7 +117,7 @@ class TerminalInput:
                 result.append(Input("text", text=ch))
         return result
 
-    def _sequence(self, sequence):
+    def _sequence(self, sequence: bytes) -> list[Input]:
         mouse = _MOUSE.fullmatch(sequence)
         if mouse:
             code, raw_x, raw_y = map(int, mouse.group(1, 2, 3))
@@ -175,14 +178,15 @@ class TerminalInput:
             event = (
                 int(parts[1].split(":")[1]) if len(parts) > 1 and ":" in parts[1] else 0
             )
-            common = dict(shift=bool(modifiers & 1), ctrl=bool(modifiers & (4 | 8)))
+            shift = bool(modifiers & 1)
+            ctrl = bool(modifiers & (4 | 8))
             if final == "u":
                 code = int(parts[0].split(":")[0])
                 if not 0 <= code <= 0x10FFFF or 0xD800 <= code <= 0xDFFF:
                     return []
                 key = _CODES.get(code, chr(code).lower())
-                result = self._keys(key, event=event, **common)
-                if event != 3 and not common["ctrl"] and not modifiers & 2:
+                result = self._keys(key, event=event, shift=shift, ctrl=ctrl)
+                if event != 3 and not ctrl and not modifiers & 2:
                     if len(parts) > 2 and parts[2]:
                         text = "".join(chr(int(n)) for n in parts[2].split(":"))
                         result.append(Input("text", text=text))
@@ -190,30 +194,28 @@ class TerminalInput:
                         shifted = parts[0].split(":")
                         value = (
                             chr(int(shifted[1]))
-                            if common["shift"] and len(shifted) > 1 and shifted[1]
+                            if shift and len(shifted) > 1 and shifted[1]
                             else chr(code)
                         )
                         result.append(
-                            Input(
-                                "text", text=value.upper() if common["shift"] else value
-                            )
+                            Input("text", text=value.upper() if shift else value)
                         )
                 return result
             if final in _ARROWS:
-                return self._keys(_ARROWS[final], event=event, **common)
+                return self._keys(_ARROWS[final], event=event, shift=shift, ctrl=ctrl)
             if final == "~":
                 code = int(parts[0])
                 if code == 27 and len(parts) == 3:  # xterm modifyOtherKeys
                     return self._sequence(f"\x1b[{parts[2]};{parts[1]}u".encode())
                 if code in _TILDE:
-                    return self._keys(_TILDE[code], event=event, **common)
+                    return self._keys(_TILDE[code], event=event, shift=shift, ctrl=ctrl)
         except (ValueError, OverflowError):
             # Malformed/unrecognised controls must never become typed text.
             pass
         return []
 
-    def feed(self, data=b"", *, flush=False):
-        result = []
+    def feed(self, data: bytes = b"", *, flush: bool = False) -> list[Input]:
+        result: list[Input] = []
         if data:
             if not self.buffer:
                 self._escape_at = self._clock()

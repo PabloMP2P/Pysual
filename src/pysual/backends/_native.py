@@ -8,7 +8,7 @@ import sys
 import webbrowser
 from pathlib import Path
 
-from ..host import CapabilityError, validate_session_key, validate_session_text
+from ..host import CapabilityError, TextFile, validate_session_key, validate_session_text
 from . import _files
 
 
@@ -19,16 +19,19 @@ class NativeServices:
     """
 
     _session_lock: asyncio.Lock
+    _session_app_id: str | None
 
-    async def open_text_file(self):
+    async def open_text_file(self) -> TextFile | None:
         path = await _files.choose_path()
         return await _files.read_text(path) if path is not None else None
 
-    async def save_text_file(self, text, suggested_name, location):
+    async def save_text_file(
+        self, text: str, suggested_name: str, location: str | None
+    ) -> TextFile | None:
         path = location or await _files.choose_path(True, suggested_name)
         return await _files.write_text(path, text) if path is not None else None
 
-    async def read_session(self, key):
+    async def read_session(self, key: str) -> str | None:
         validate_session_key(key)
         try:
             return (
@@ -41,10 +44,10 @@ class NativeServices:
                 "Desktop session storage is unavailable or invalid"
             ) from exc
 
-    def set_session_namespace(self, name):
+    def set_session_namespace(self, name: str) -> None:
         self._session_app_id = name
 
-    def _session_directory(self):
+    def _session_directory(self) -> Path:
         if sys.platform == "win32":
             root = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local"))
         elif sys.platform == "darwin":
@@ -56,12 +59,12 @@ class NativeServices:
         namespace = "app-" + readable + "-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
         return root / "pysual/sessions" / namespace
 
-    def _session_path(self, key):
+    def _session_path(self, key: str) -> Path:
         # Preserve case-sensitive key identity on Windows/macOS filesystems too.
         filename = hashlib.sha256(key.encode("ascii")).hexdigest() + ".session"
         return self._session_directory() / filename
 
-    async def write_session(self, key, text):
+    async def write_session(self, key: str, text: str | None) -> None:
         validate_session_key(key)
         validate_session_text(text)
         path = self._session_path(key)
@@ -71,7 +74,7 @@ class NativeServices:
                     path.unlink(missing_ok=True)
                 else:
 
-                    def prepare_directory():
+                    def prepare_directory() -> None:
                         path.parent.mkdir(parents=True, exist_ok=True)
                         files = [
                             entry
@@ -93,7 +96,7 @@ class NativeServices:
         except (OSError, UnicodeError) as exc:
             raise CapabilityError("Desktop session storage is unavailable") from exc
 
-    async def open_url(self, url):
+    async def open_url(self, url: str) -> None:
         try:
             opened = await asyncio.to_thread(webbrowser.open, url)
         except (OSError, webbrowser.Error) as exc:

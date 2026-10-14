@@ -1,12 +1,21 @@
 """Small original line-icon catalog, drawn through ordinary Painter primitives."""
 
+from __future__ import annotations
+
 from functools import lru_cache
 from itertools import pairwise
 from math import ceil, cos, isfinite, pi, sin
 from types import MappingProxyType
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .painting import Painter
+
+_Point = tuple[float, float]
+_Path = tuple[_Point, ...]
 
 
-def _arc(x, y, radius, start=0, end=360):
+def _arc(x: float, y: float, radius: float, start: float = 0, end: float = 360) -> _Path:
     """Original circular outlines, sampled once; each stays one batched path."""
     steps = max(1, ceil(abs(end - start) / 15))
     return tuple(
@@ -266,7 +275,7 @@ def icon_names() -> tuple[str, ...]:
     return tuple(_PATHS)
 
 
-def _validate_icon(name, size):
+def _validate_icon(name: str, size: float) -> None:
     if name not in _PATHS:
         raise ValueError(
             f"Unknown icon {name!r}; choose from {', '.join(_PATHS)}"
@@ -276,7 +285,7 @@ def _validate_icon(name, size):
 
 
 @lru_cache(maxsize=256)
-def _scaled_paths(name, size):
+def _scaled_paths(name: str, size: float) -> tuple[tuple[_Path, ...], float]:
     scale = size / 24
     return (
         tuple(tuple((x * scale, y * scale) for x, y in path) for path in _PATHS[name]),
@@ -284,7 +293,7 @@ def _scaled_paths(name, size):
     )
 
 
-def draw_icon(painter, name: str, x: float, y: float, size: float, color: str):
+def draw_icon(painter: Painter, name: str, x: float, y: float, size: float, color: str) -> None:
     _validate_icon(name, size)
     native = getattr(painter, "_native_icon", None)
     if native is not None and native(name, x, y, size, color):

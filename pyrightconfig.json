@@ -1,0 +1,15 @@
+{
+  "include": ["src/pysual"],
+  "exclude": ["**/__pycache__"],
+  "extraPaths": ["src"],
+  "typeCheckingMode": "strict",
+  "pythonVersion": "3.11",
+  "reportMissingImports": true,
+  "reportUnusedCallResult": "none",
+  "reportImplicitOverride": "none",
+  "reportPrivateUsage": "none",
+  "reportUnnecessaryIsInstance": "none",
+  "reportUnnecessaryComparison": "none",
+  "reportUnnecessaryCast": "none",
+  "reportUnusedFunction": "none"
+}

@@ -8,9 +8,32 @@ import struct
 import sys
 import threading
 import time
-from typing import Any
+from typing import Protocol
 
 from ..host import CapabilityError
+
+
+class _ConsoleStream(Protocol):
+    """stdin/stdout surface used to enter and leave console modes."""
+
+    def fileno(self) -> int: ...
+    def flush(self) -> None: ...
+    def isatty(self) -> bool: ...
+
+
+class TerminalTransport(Protocol):
+    """Byte transport owned by a terminal session."""
+
+    def enter(self) -> None: ...
+    def exit(self) -> None: ...
+    def read(self, timeout: float = 0) -> bytes: ...
+    def write(self, data: bytes) -> None: ...
+    def dimensions(self) -> tuple[int, int, int, int]: ...
+
+# POSIX termios.tcgetattr() list, or Windows (input mode, output mode, code page).
+_PosixMode = list[int | list[bytes | int]]
+_ConsoleMode = tuple[int, int, int]
+_SavedMode = _PosixMode | _ConsoleMode
 
 
 class TerminalIO:
@@ -21,16 +44,18 @@ class TerminalIO:
     CRT getwch(), which bypasses VT keyboard/mouse translation on Windows.
     """
 
-    def __init__(self, stdin=None, stdout=None):
-        self.stdin = sys.stdin if stdin is None else stdin
-        self.stdout = sys.stdout if stdout is None else stdout
+    def __init__(
+        self, stdin: _ConsoleStream | None = None, stdout: _ConsoleStream | None = None
+    ) -> None:
+        self.stdin: _ConsoleStream = sys.stdin if stdin is None else stdin
+        self.stdout: _ConsoleStream = sys.stdout if stdout is None else stdout
         self._active = False
-        self._saved: Any = None
-        self._thread = None
+        self._saved: _SavedMode | None = None
+        self._thread: threading.Thread | None = None
         self._stop = threading.Event()
-        self._input = queue.Queue(maxsize=32)
+        self._input: queue.Queue[bytes | BaseException] = queue.Queue(maxsize=32)
 
-    def _enqueue(self, value):
+    def _enqueue(self, value: bytes | BaseException) -> None:
         # ReadConsoleW can deliver large pastes while the app paints. Apply
         # bounded backpressure without stranding cleanup on a blocked put().
         while not self._stop.is_set():
@@ -40,7 +65,7 @@ class TerminalIO:
             except queue.Full:
                 continue
 
-    def enter(self):
+    def enter(self) -> None:
         if self._active:
             return
         if self._thread is not None:
@@ -57,7 +82,7 @@ class TerminalIO:
         self.stdout.flush()
         # Discard only bytes already consumed by the previous application.
         # The OS input queue is preserved, including typing during this open.
-        self._input = queue.Queue(maxsize=32)
+        self._input = queue.Queue[bytes | BaseException](maxsize=32)
         if sys.platform == "win32":
             self._enter_windows()
         else:
@@ -69,7 +94,7 @@ class TerminalIO:
             tty.setraw(self._in_fd, termios.TCSANOW)
             self._active = True
 
-    def _enter_windows(self):
+    def _enter_windows(self) -> None:
         if sys.platform != "win32":
             raise CapabilityError("Windows console input requires Windows")
         import ctypes
@@ -120,7 +145,7 @@ class TerminalIO:
                 raise CapabilityError("Windows could not enable UTF-8 terminal output")
             self._stop.clear()
 
-            def read_console():
+            def read_console() -> None:
                 pending_surrogate = ""
                 while not self._stop.is_set():
                     buffer = ctypes.create_unicode_buffer(4096)
@@ -155,7 +180,7 @@ class TerminalIO:
             self.exit()
             raise
 
-    def read(self, timeout=0.0):
+    def read(self, timeout: float = 0.0) -> bytes:
         if not self._active:
             return b""
         if sys.platform == "win32":
@@ -165,7 +190,7 @@ class TerminalIO:
                 return b""
             if isinstance(value, BaseException):
                 raise value
-            chunks = [value]
+            chunks: list[bytes] = [value]
             # Bound a poll so a flood of input cannot starve rendering.
             for _ in range(63):
                 try:
@@ -184,7 +209,7 @@ class TerminalIO:
             raise EOFError("The terminal input was disconnected")
         return value
 
-    def write(self, data):
+    def write(self, data: bytes) -> None:
         view = memoryview(data)
         while view:
             count = os.write(self._out_fd, view)
@@ -192,7 +217,7 @@ class TerminalIO:
                 raise OSError("The terminal output was disconnected")
             view = view[count:]
 
-    def dimensions(self):
+    def dimensions(self) -> tuple[int, int, int, int]:
         try:
             columns, rows = os.get_terminal_size(self.stdout.fileno())
         except (OSError, ValueError):
@@ -211,7 +236,7 @@ class TerminalIO:
                 pass
         return max(1, columns), max(1, rows), width, height
 
-    def exit(self):
+    def exit(self) -> None:
         if not self._active and self._thread is None:
             return
         self._active = False
@@ -239,7 +264,7 @@ class TerminalIO:
                     )
                 else:
                     self._thread = None
-            if self._saved is not None:
+            if isinstance(self._saved, tuple):
                 input_mode, output_mode, codepage = self._saved
                 self._kernel.SetConsoleMode(self._in_handle, input_mode)
                 self._kernel.SetConsoleMode(self._out_handle, output_mode)
@@ -253,5 +278,7 @@ class TerminalIO:
         else:
             import termios
 
-            termios.tcsetattr(self._in_fd, termios.TCSANOW, self._saved)
+            saved = self._saved
+            if isinstance(saved, list):
+                termios.tcsetattr(self._in_fd, termios.TCSANOW, saved)
         self._saved = None

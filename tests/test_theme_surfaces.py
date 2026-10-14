@@ -20,6 +20,7 @@ from pysual import (
     theme_names,
 )
 from pysual.painting import Painter
+from pysual.theme import as_resolved, style_instance
 
 
 class SurfaceThemeTests(unittest.TestCase):
@@ -653,6 +654,10 @@ class SurfaceThemeTests(unittest.TestCase):
         self.assertNotEqual(theme.resolve("Button").fill, "#123456")
         for i in range(1100):
             theme.resolve(f"Custom{i}")
+        face = theme.resolve("Button")
+        self.assertIs(style_instance(face), face)
+        with self.assertRaisesRegex(TypeError, "missing"):
+            as_resolved(Style(fill="#ffffff"))
         self.assertLessEqual(len(theme._resolved_styles), 1024)
         self.assertEqual(Theme.from_json(theme.to_json()), theme)
         parent = Container(theme_override=theme)
@@ -670,3 +675,26 @@ class SurfaceThemeTests(unittest.TestCase):
             )
         finally:
             parent.destroy()
+
+    def test_resolved_style_covers_every_style_field(self):
+        from types import UnionType
+        from typing import Union, get_args, get_origin
+        from dataclasses import fields as dataclass_fields
+
+        from pysual.theme import ResolvedStyle, Style, _RESOLVED_FIELDS
+
+        annotations = dict(ResolvedStyle.__annotations__)
+        self.assertEqual(
+            list(annotations), [item.name for item in dataclass_fields(Style)]
+        )
+
+        def allows_none(annotation):
+            origin = get_origin(annotation)
+            if origin in (Union, UnionType):
+                return type(None) in get_args(annotation)
+            return annotation is type(None)
+
+        required = tuple(
+            name for name, annotation in annotations.items() if not allows_none(annotation)
+        )
+        self.assertEqual(required, _RESOLVED_FIELDS)

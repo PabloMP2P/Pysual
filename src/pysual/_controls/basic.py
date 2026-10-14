@@ -9,8 +9,9 @@ from ..controls import Control
 from ..errors import LifecycleError
 from ..events import ClickEvent, Event
 from ..icons import icon_names
-from ..painting import resolve_style
-from ..schema import Dirty, prop
+from ..painting import resolve_style, Painter
+from ..schema import Dirty, expect_text, prop
+from ..host import Host, Input
 
 
 class Label(Control):
@@ -20,11 +21,11 @@ class Label(Control):
     )
     _style_kind: ClassVar[str] = "Label"
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         style = resolve_style(self)
         return host.measure(self.text, style.font_size, style.font_family == "mono")
 
-    def paint(self, painter, /):
+    def paint(self, painter: Painter, /) -> None:
         super().paint(painter)
         style = painter.style()
         size = style.font_size
@@ -51,12 +52,14 @@ class Button(Label):
     )
     shortcut: str = prop(default="", affects=Dirty.NONE)
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
-        if name == "icon" and value and value not in icon_names():
-            raise ValueError(f"Unknown icon {value!r}")
+        if name == "icon":
+            icon = expect_text(value)
+            if icon and icon not in icon_names():
+                raise ValueError(f"Unknown icon {icon!r}")
         if name == "shortcut":
-            normalize_shortcut(value)
+            normalize_shortcut(expect_text(value))
 
     def invoke_shortcut(self, shortcut: str) -> bool:
         if (
@@ -76,7 +79,7 @@ class Button(Label):
         super()._initialize()
         self._press = PressBehavior()
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         w, h = super().measure(host)
         padding = resolve_style(self).padding
         if self.icon and not self.text:
@@ -86,7 +89,7 @@ class Button(Label):
             h + padding * 2, self.effective_theme.tokens.control_height
         )
 
-    def paint(self, painter, /):
+    def paint(self, painter: Painter, /) -> None:
         s = painter.body()
         content = painter.content_rect()
         icon_size = min(20, content.width, painter.height) if self.icon else 0
@@ -133,7 +136,7 @@ class Button(Label):
         if self.effective_enabled:
             self.click.emit(ClickEvent(source=self, origin=self._origin))
 
-    def handle_input(self, event, /):
+    def handle_input(self, event: Input, /) -> bool | None:
         if self._press.handle_input(self, event):
             self.activate()
 

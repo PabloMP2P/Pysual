@@ -1,32 +1,84 @@
 """Focus, hit testing and pointer capture use layout's computed rectangles."""
 
+from __future__ import annotations
+
+from collections.abc import Coroutine, Iterator, Sequence
 from inspect import isawaitable, iscoroutine
 from math import ceil, floor, sqrt
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
+from ._modality import ModalManager
 from .commands import normalize_shortcut
+from .controls import Container, Control
 from .errors import LifecycleError
 from .events import DragEvent, DragPayload, KeyEvent, PointerEvent, UiEvent
+from .geometry import Rect
 from .host import CapabilityError, Input
 from .motion import interaction_state
 from .schema import Dirty
 
 
+def _child_controls(control: Control) -> Sequence[Control]:
+    if isinstance(control, Container):
+        return control._children
+    return ()
+
+if TYPE_CHECKING:
+    from .popup import Popup
+    from .runtime import Runtime
+
+
+_Record = tuple[int, Control, Rect]
+_Meta = tuple[Rect, bool, tuple[Control, ...]]
+
+
+class _CellCopy(Protocol):
+    selected_key: str | None
+    selected_column: int
+    selected_cell_text: str | None
+    _disposed: bool
+
+
+def _ignore_event(_event: Input) -> bool:
+    return False
+
+
+class _Editor(Protocol):
+    text: str
+    read_only: bool
+    password: bool
+    _disposed: bool
+    _origin: Literal["user", "program", "system"]
+    selection_range: tuple[int, int]
+    selection_text: str
+
+    def replace_selection(self, text: str) -> None: ...
+
+
 class _HitIndex:
     """Spatial candidates in the same order as the visible paint tree."""
 
-    def __init__(self, root, modality, *, excluded=None, inherited_clip=None):
-        records = []
+    def __init__(
+        self,
+        root: Control,
+        modality: ModalManager | None,
+        *,
+        excluded: Control | None = None,
+        inherited_clip: Rect | None = None,
+    ) -> None:
+        records: list[_Record] = []
         self.excluded = excluded
-        self.metadata = {}
+        self.metadata: dict[Control, _Meta] = {}
 
-        def state(control):
-            return (
-                control._clip, control._values["visible"],
-                tuple(child for child in getattr(control, "_children", ())
-                      if child is not excluded),
+        def state(control: Control) -> _Meta:
+            children = tuple(
+                child
+                for child in _child_controls(control)
+                if child is not excluded
             )
+            return (control._clip, control._values["visible"], children)
 
-        def visit(control, inherited_clip=None):
+        def visit(control: Control, inherited_clip: Rect | None = None) -> None:
             if control is excluded or control._disposed:
                 return
             metadata = self.metadata[control] = state(control)
@@ -53,7 +105,8 @@ class _HitIndex:
         # stay in one shared list instead of filling every cell in the window.
         area = max(1, root._clip.width * root._clip.height)
         self.cell_size = max(4, min(64, sqrt(area / max(1, len(records)))))
-        self.buckets, self.large = {}, []
+        self.buckets: dict[tuple[int, int], list[_Record]] = {}
+        self.large: list[_Record] = []
         for record in records:
             clip = record[2]
             x0, y0 = floor(clip.x / self.cell_size), floor(clip.y / self.cell_size)
@@ -65,17 +118,22 @@ class _HitIndex:
                 for cell_x in range(x0, x1):
                     self.buckets.setdefault((cell_x, cell_y), []).append(record)
 
-    def changed(self, control, popup):
+    def changed(self, control: Control, popup: Control | None) -> bool:
         previous = self.metadata.get(control)
         if previous is None:
             return False
         if control._disposed:
             return True
-        children = tuple(child for child in getattr(control, "_children", ())
-                         if child is not self.excluded and child is not popup)
-        return previous != (control._clip, control._values["visible"], children)
+        children = tuple(
+            child
+            for child in _child_controls(control)
+            if child is not self.excluded and child is not popup
+        )
+        return previous != (
+            control._clip, control._values["visible"], children
+        )
 
-    def candidates(self, x, y):
+    def candidates(self, x: float, y: float) -> Iterator[Control]:
         local = self.buckets.get((floor(x / self.cell_size), floor(y / self.cell_size)), ())
         local_index, large_index = len(local) - 1, len(self.large) - 1
         while local_index >= 0 or large_index >= 0:
@@ -92,26 +150,37 @@ class _HitIndex:
 
 
 class Router:
-    def __init__(self, runtime):
+    def __init__(self, runtime: Runtime) -> None:
         self.runtime = runtime
-        self.focus = None
-        self.capture = None
-        self.capture_id = None
-        self.hover = None
+        self.focus: Control | None = None
+        self.capture: Control | None = None
+        self.capture_id: int | None = None
+        self.hover: Control | None = None
         self._focus_revision = 0
-        self._focus_to_reveal = None
-        self.drag_source = None
+        self._focus_to_reveal: Control | None = None
+        self.drag_source: Control | None = None
         self.drag_payload: DragPayload[object] | None = None
-        self.drop_target = None
+        self.drop_target: Control | None = None
         self._pointer = Input("pointer_move")
         self._hit_revision = 0
         self._hit_index_revision = -1
-        self._hit_index = None
-        self._hit_order = None
-        self._hit_dirty = set()
-        self._popup_hit_index = None
-        self._popup_hit_scope = None
-        self._popup_hit_clip = None
+        self._hit_index: _HitIndex | None = None
+        self._hit_order: tuple[Control, ...] | None = None
+        self._hit_dirty: set[Control] = set()
+        self._popup_hit_index: _HitIndex | None = None
+        self._popup_hit_scope: Control | None = None
+        self._popup_hit_clip: Rect | None = None
+
+    def _invalidate(self) -> None:
+        getattr(self.runtime, "invalidate")()
+
+    @property
+    def _popup(self) -> Popup | None:
+        return cast("Popup | None", getattr(self.runtime, "popup"))
+
+    @property
+    def _modal(self) -> Control | None:
+        return cast(Control | None, getattr(self.runtime, "modal"))
 
     def clear(self):
         """Release input geometry and control references after session shutdown."""
@@ -125,7 +194,7 @@ class Router:
         self.drag_source = self.drag_payload = self.drop_target = None
         self._focus_revision += 1
 
-    def invalidate(self, affects, control=None):
+    def invalidate(self, affects: Dirty, control: Control | None = None) -> None:
         """Invalidate geometry/policy metadata for the next layout pass."""
         if affects & (Dirty.MEASURE | Dirty.ARRANGE | Dirty.HIT_TEST):
             self._hit_revision += 1
@@ -134,25 +203,27 @@ class Router:
             else:
                 self._hit_dirty.add(control)
 
-    def layout_control(self, control):
+    def layout_control(self, control: Control) -> None:
         """Observe controls whose layout cache was updated in this pass."""
         self._hit_dirty.add(control)
 
-    def layout_changed(self, *, observed=False):
+    def layout_changed(self, *, observed: bool = False) -> None:
         if not observed:
             # Private callers may replace computed clips directly. The normal
             # arranger reports only the controls whose geometry it visited.
             self._hit_index = self._popup_hit_index = None
-        app = getattr(self.runtime, "app", None)
+        app = cast(Control | None, getattr(self.runtime, "app", None))
         if app is not None and getattr(app, "_runtime", None) is self.runtime:
             # Prepare geometry with layout, so the first pointer event over a
             # newly arranged heavy scene does not have to build its hit index.
             self._refresh_hit_index(app)
 
-    def _refresh_hit_index(self, app):
-        modality = getattr(self.runtime, "_modality", None)
-        popup = getattr(self.runtime, "popup", None)
-        order = tuple(entry.control for entry in getattr(modality, "_openings", ()))
+    def _refresh_hit_index(self, app: Control) -> None:
+        modality = cast(ModalManager | None, getattr(self.runtime, "_modality", None))
+        popup = self._popup
+        order = tuple(
+            entry.control for entry in (() if modality is None else modality._openings)
+        )
         dirty, self._hit_dirty = self._hit_dirty, set()
         if (self._hit_index is None or self._hit_order != order
                 or any(self._hit_index.changed(control, popup) for control in dirty)):
@@ -175,7 +246,7 @@ class Router:
             self._popup_hit_index = _HitIndex(popup, modality, inherited_clip=clip)
             self._popup_hit_scope, self._popup_hit_clip = popup, clip
 
-    def _set_hover(self, control):
+    def _set_hover(self, control: Control | None) -> None:
         previous = self.hover
         if previous is control:
             return
@@ -191,7 +262,7 @@ class Router:
             node.invalidate()
 
     def begin_drag(
-        self, source, payload: DragPayload[object], *, pointer_id: int | None = None
+        self, source: Control, payload: DragPayload[object], *, pointer_id: int | None = None
     ) -> None:
         """Begin from a currently captured pointer; one gesture belongs to this Router."""
         source._check_live()
@@ -208,7 +279,7 @@ class Router:
             node = node._parent
         if node is None or (pointer_id is not None and pointer_id != self.capture_id):
             raise LifecycleError("Begin a drag from this control's captured pointer")
-        if self.runtime.popup is not None:
+        if self._popup is not None:
             raise LifecycleError("Dismiss the popup before beginning a drag")
         if self.capture is not None:
             self.capture._pressed = False
@@ -222,8 +293,15 @@ class Router:
             raise
 
     def _drag_event(
-        self, owner, name, event, *, target=None, accepted=False, cancelled=False
-    ):
+        self,
+        owner: Control | None,
+        name: str,
+        event: Input,
+        *,
+        target: Control | None = None,
+        accepted: bool = False,
+        cancelled: bool = False,
+    ) -> None:
         if owner is not None and not owner._disposed:
             assert self.drag_payload is not None
             getattr(owner, name).emit(
@@ -242,11 +320,11 @@ class Router:
                 )
             )
 
-    def _update_drop_target(self, event):
-        scope = self.runtime.modal or self.runtime.app
+    def _update_drop_target(self, event: Input) -> None:
+        scope = self._modal or self.runtime.app
         target = self.hit(scope, event.x, event.y)
         while target is not None:
-            accepted = target.accepts_drop(self.drag_payload)
+            accepted = target.accepts_drop(cast(DragPayload[object], self.drag_payload))
             if self.drag_source is None:
                 if iscoroutine(accepted):
                     accepted.close()
@@ -276,13 +354,13 @@ class Router:
         self._drag_event(target, "drag_over", event, target=target, accepted=True)
         if target is not None:
             target.invalidate()
-        self.runtime.invalidate()
+        self._invalidate()
 
     def cancel_drag(self) -> None:
         """Cancel capture and send terminal notifications to surviving owners."""
         self._finish_drag(cancelled=True)
 
-    def _finish_drag(self, *, cancelled, reset_source=True):
+    def _finish_drag(self, *, cancelled: bool, reset_source: bool = True) -> None:
         if self.drag_source is None:
             return
         source, target = self.drag_source, self.drop_target
@@ -319,21 +397,21 @@ class Router:
                             continue
                     control._pressed = False
                     control.invalidate()
-            self.runtime.invalidate()
+            self._invalidate()
 
-    def _visible(self, c):
+    def _visible(self, c: Control | None) -> bool:
         while c is not None:
             if c._disposed or not c._values["visible"] or not c._committed_enabled():
                 return False
             c = c._parent
         return True
 
-    def hit(self, c, x, y):
+    def hit(self, c: Control, x: float, y: float) -> Control | None:
         # Check geometry before inherited public policies, even for standalone
         # routers without a runtime-owned index.
         if not c._clip.contains(x, y) or not self._visible(c):
             return None
-        app = getattr(self.runtime, "app", None)
+        app = cast(Control | None, getattr(self.runtime, "app", None))
         if app is not None and getattr(app, "_runtime", None) is self.runtime:
             root = c
             while root._parent is not None:
@@ -356,22 +434,25 @@ class Router:
                 return None
         return self._hit_direct(c, x, y)
 
-    def _hit_direct(self, c, x, y):
+    def _hit_direct(self, c: Control, x: float, y: float) -> Control:
         for child in reversed(
-            sorted(getattr(c, "_children", ()), key=lambda c: c._overlay)
+            sorted(
+                _child_controls(c),
+                key=lambda child: child._overlay,
+            )
         ):
             hit = self.hit(child, x, y)
             if hit is not None:
                 return hit
         return c
 
-    def set_focus(self, c, *, reveal=True):
+    def set_focus(self, c: Control | None, *, reveal: bool = True) -> None:
         if c is not None and (
             not c._values["focusable"] or not self._visible(c)
             or not self.runtime._modality.allowed(c)
         ):
             return
-        popup = self.runtime.popup
+        popup = self._popup
         if popup is not None and c is not None and not popup.contains(c):
             popup.dismiss(restore_focus=False)
         previous = self.focus
@@ -405,9 +486,9 @@ class Router:
             focused._rect if focused is not None and not focused._disposed
             and getattr(focused, "_text_input", False) else None
         )
-        self.runtime.invalidate()
+        self._invalidate()
 
-    def take_focus_reveal(self):
+    def take_focus_reveal(self) -> Control | None:
         """Consume the latest valid request for the runtime's layout pass."""
         control, self._focus_to_reveal = self._focus_to_reveal, None
         if (
@@ -419,18 +500,18 @@ class Router:
             return control
         return None
 
-    def _tab(self, back=False):
-        targets = []
+    def _tab(self, back: bool = False) -> None:
+        targets: list[Control] = []
 
-        def visit(c):
+        def visit(c: Control) -> None:
             if not self._visible(c):
                 return
             if c._values["focusable"]:
                 targets.append(c)
-            for x in getattr(c, "_children", ()):
+            for x in _child_controls(c):
                 visit(x)
 
-        visit(self.runtime.popup or self.runtime.modal or self.runtime.app)
+        visit(self._popup or self._modal or self.runtime.app)
         targets.sort(key=lambda c: c._values["tab_index"])
         if targets:
             index = (
@@ -440,33 +521,40 @@ class Router:
             )
             self.set_focus(targets[(index + (-1 if back else 1)) % len(targets)])
 
-    def clipboard(self, key):
+    def clipboard(self, key: str) -> Coroutine[Any, Any, None]:
         """Capture this request before returning its scheduled I/O coroutine."""
         c = self.focus
         if c is not None and getattr(c, "_cell_copy", False):
+            grid = cast(_CellCopy, c)
             snapshot = (
-                (c.selected_key, c.selected_column, c.selected_cell_text)
+                (grid.selected_key, grid.selected_column, grid.selected_cell_text)
                 if key == "c" and not c._disposed else (None, None, None)
             )
-            return self._copy_grid(c, snapshot, self._focus_revision)
+            return self._copy_grid(grid, snapshot, self._focus_revision)
+        editor = cast(_Editor, c)
         snapshot = (
-            (c.text, c.selection_range)
+            (editor.text, editor.selection_range)
             if c is not None
             and not c._disposed
             and getattr(c, "_text_input", False)
-            and not (key in ("v", "x") and c.read_only)
-            and not (key in ("c", "x") and c.password)
+            and not (key in ("v", "x") and editor.read_only)
+            and not (key in ("c", "x") and editor.password)
             else None
         )
-        return self._clipboard(key, c, snapshot, self._focus_revision)
+        return self._clipboard(key, cast("_Editor | None", c), snapshot, self._focus_revision)
 
-    async def _copy_grid(self, grid, snapshot, focus_revision):
+    async def _copy_grid(
+        self,
+        grid: _CellCopy,
+        snapshot: tuple[str | None, int | None, str | None],
+        focus_revision: int,
+    ) -> None:
         if (
             snapshot[2] is None
             or grid._disposed
             or self.focus is not grid
             or self._focus_revision != focus_revision
-            or not self._visible(grid)
+            or not self._visible(cast(Control, grid))
             or (grid.selected_key, grid.selected_column, grid.selected_cell_text) != snapshot
         ):
             return
@@ -474,25 +562,33 @@ class Router:
             await self.runtime.host.clipboard_write(snapshot[2])
         except CapabilityError:
             return
-        self.runtime.invalidate()
+        self._invalidate()
 
-    async def _clipboard(self, key, c, snapshot, focus_revision):
-        def replace(text):
-            origin = c._origin
-            c._origin = "user"
+    async def _clipboard(
+        self,
+        key: str,
+        c: _Editor | None,
+        snapshot: tuple[str, tuple[int, int]] | None,
+        focus_revision: int,
+    ) -> None:
+        def replace(text: str) -> None:
+            editor = cast(_Editor, c)
+            origin = editor._origin
+            editor._origin = "user"
             try:
-                c.replace_selection(text)
+                editor.replace_selection(text)
             finally:
-                c._origin = origin
+                editor._origin = origin
 
-        def unchanged():
+        def unchanged() -> bool:
+            editor = cast(_Editor, c)
             return (
-                not c._disposed
+                not editor._disposed
                 and self.focus is c
                 and self._focus_revision == focus_revision
-                and self._visible(c)
-                and (key == "c" or not c.read_only)
-                and (c.text, c.selection_range) == snapshot
+                and self._visible(cast(Control, editor))
+                and (key == "c" or not editor.read_only)
+                and (editor.text, editor.selection_range) == snapshot
             )
 
         # Later events in the same host batch can change focus or selection
@@ -504,18 +600,18 @@ class Router:
                 text = await self.runtime.host.clipboard_read()
                 if unchanged():
                     replace(text)
-            elif key in ("c", "x") and not c.password:
-                await self.runtime.host.clipboard_write(c.selection_text)
+            elif key in ("c", "x") and not cast(_Editor, c).password:
+                await self.runtime.host.clipboard_write(cast(_Editor, c).selection_text)
                 if key == "x" and unchanged():
                     replace("")
         except CapabilityError:
             # Clipboard permission and availability are recoverable service
             # failures. In particular, a denied cut must retain the selection.
             return
-        self.runtime.invalidate()
+        self._invalidate()
 
-    def reconcile(self):
-        popup = self.runtime.popup
+    def reconcile(self) -> None:
+        popup = self._popup
         if popup is not None:
             popup.reconcile()
         if self.drag_source is not None and (
@@ -550,7 +646,7 @@ class Router:
                 else:
                     setattr(self, name, None)
 
-    def cancel_capture(self, *, clear_focus=False):
+    def cancel_capture(self, *, clear_focus: bool = False) -> None:
         control = self.capture
         before = (
             interaction_state(control)
@@ -574,7 +670,7 @@ class Router:
                     self.runtime.motion.changed(control, before)
                 control.invalidate()
 
-    def process(self, e):
+    def process(self, e: Input) -> None:
         self.reconcile()
         if getattr(self.runtime, "_native_blockers", ()):
             return
@@ -613,7 +709,7 @@ class Router:
             self.cancel_capture()
         if e.kind in ("pointer_cancel", "pointer_leave"):
             self._set_hover(None)
-            self.runtime.invalidate()
+            self._invalidate()
             return
         local_edit = (
             e.ctrl
@@ -632,15 +728,15 @@ class Router:
             except ValueError:
                 chord = ""
 
-            def invoke(node):
+            def invoke(node: Control) -> bool:
                 if not self._visible(node):
                     return False
                 origin = node._origin
                 node._origin = "user"
-                previous_popup = self.runtime.popup
+                previous_popup = self._popup
                 try:
                     if chord and node.invoke_shortcut(chord):
-                        popup = self.runtime.popup
+                        popup = self._popup
                         if (
                             popup is not None
                             and popup is previous_popup
@@ -650,13 +746,16 @@ class Router:
                         return True
                 finally:
                     node._origin = origin
-                return any(invoke(child) for child in getattr(node, "_children", ()))
+                return any(
+                    invoke(child)
+                    for child in _child_controls(node)
+                )
 
-            if invoke(self.runtime.modal or self.runtime.app):
+            if invoke(self._modal or self.runtime.app):
                 return
-        popup = self.runtime.popup
+        popup = self._popup
         if popup is not None:
-            if getattr(popup, "handle_owner_input", lambda event: False)(e):
+            if getattr(popup, "handle_owner_input", _ignore_event)(e):
                 return
             if (
                 e.kind == "key_down"
@@ -677,13 +776,13 @@ class Router:
                 owner = popup._owner
                 forward = (
                     e.kind == "pointer_down" and e.button == 1
-                    and getattr(owner, "_popup_press_passthrough", lambda event: False)(e)
+                    and getattr(owner, "_popup_press_passthrough", _ignore_event)(e)
                 )
                 popup.dismiss()
                 # Editing regions may use the dismissing press. Popup openers
                 # and unrelated controls still require a separate gesture.
                 if not forward or self.hit(
-                    self.runtime.modal or self.runtime.app, e.x, e.y
+                    self._modal or self.runtime.app, e.x, e.y
                 ) is not owner:
                     return
         if e.kind == "blur":
@@ -699,7 +798,7 @@ class Router:
         if e.kind.startswith("pointer"):
             if e.button == 3 and e.kind == "pointer_down":
                 target = self.hit(
-                    self.runtime.popup or self.runtime.modal or self.runtime.app,
+                    self._popup or self._modal or self.runtime.app,
                     e.x,
                     e.y,
                 )
@@ -718,7 +817,7 @@ class Router:
             if e.button != 1:
                 return
             hit = self.hit(
-                self.runtime.popup or self.runtime.modal or self.runtime.app, e.x, e.y
+                self._popup or self._modal or self.runtime.app, e.x, e.y
             )
             if e.kind == "pointer_move":
                 self._set_hover(hit)
@@ -743,8 +842,11 @@ class Router:
                     from ._controls.windows import SubWindow
 
                     owner = None
-                    if isinstance(target, SubWindow) and target._title_drag_at(
-                        e.x - target._rect.x, e.y - target._rect.y
+                    if isinstance(target, SubWindow) and cast(
+                        bool,
+                        getattr(target, "_title_drag_at")(
+                            e.x - target._rect.x, e.y - target._rect.y
+                        ),
                     ):
                         owner = self.focus
                         while owner is not None and owner is not target:
@@ -756,7 +858,7 @@ class Router:
                 self.capture = None
                 self.capture_id = None
         elif e.kind == "wheel":
-            scope = self.runtime.popup or self.runtime.modal or self.runtime.app
+            scope = self._popup or self._modal or self.runtime.app
             target = self.hit(scope, e.x, e.y)
             while target is not None and not target._disposed:
                 before = interaction_state(target)
@@ -773,7 +875,7 @@ class Router:
                 if consumed or target is scope:
                     break
                 target = parent
-            self.runtime.invalidate()
+            self._invalidate()
             return
         else:
             target = self.focus
@@ -789,8 +891,8 @@ class Router:
                 ):
                     self.runtime.app.create_task(self.clipboard(e.key.lower()))
                     return
-                if e.key == "Escape" and self.runtime.modal:
-                    target = self.runtime.modal
+                if e.key == "Escape" and self._modal:
+                    target = self._modal
         if target is not None and not target._disposed:
             before = interaction_state(target)
             target._origin = "user"
@@ -826,4 +928,4 @@ class Router:
                 if e.kind != "pointer_move":
                     target.invalidate(Dirty.PAINT)
         if e.kind != "pointer_move":
-            self.runtime.invalidate()
+            self._invalidate()

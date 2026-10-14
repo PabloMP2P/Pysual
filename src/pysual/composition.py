@@ -1,14 +1,18 @@
 """Tabs and split panes own arrangement through the ordinary container hooks."""
 
-from typing import ClassVar, Literal, cast
+from collections.abc import Callable
+from typing import ClassVar, Literal, TypeVar, cast
 
 from ._text_display import single_line
-from .controls import Container
+from .controls import Container, Control
 from .events import ChangeEvent, Event
 from .geometry import Rect
 from .icons import icon_names
-from .painting import resolve_style
-from .schema import Dirty, prop
+from .painting import resolve_style, Painter
+from .schema import Dirty, Field, expect_number, prop
+from .host import Host, Input
+
+_C = TypeVar("_C", bound=Control)
 
 
 class TabPage(Container):
@@ -16,14 +20,14 @@ class TabPage(Container):
     title: str = prop(default="Page", affects=Dirty.MEASURE)
     icon: str = prop(default="", doc="Optional catalog icon in the tab header")
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         super()._changed(field, old, value)
         # The header belongs to TabControl, including headers of hidden pages.
         # Edits inside a page otherwise remain local to that page's subtree.
         if field.name in ("title", "icon", "enabled") and isinstance(self._parent, TabControl):
             self._parent.invalidate()
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
         if name == "icon" and value and value not in icon_names():
             raise ValueError(f"Unknown tab icon {value!r}")
@@ -36,7 +40,7 @@ class TabPage(Container):
                 "TabControl owns page visibility; set selected_index instead"
             )
 
-    def destroy(self):
+    def destroy(self) -> None:
         if self._disposed:
             return
         parent = self.parent
@@ -61,19 +65,19 @@ class TabControl(Container):
     changed: ClassVar[Event[ChangeEvent[int]]] = Event(ChangeEvent)
     style_parts: ClassVar[tuple[str, ...]] = ("body", "tab", "indicator")
 
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
         self._syncing = False
         self._destroying = False
         self._scroll = 0
-        self._header_capacity = None
+        self._header_capacity: int | None = None
         self._reveal_header = True
 
     @property
     def pages(self) -> tuple[TabPage, ...]:
         return cast(tuple[TabPage, ...], self.children)
 
-    def add(self, control):
+    def add(self, control: _C) -> _C:
         if not isinstance(control, TabPage):
             raise TypeError(
                 "Add TabPage children to TabControl, then add controls to each page"
@@ -82,9 +86,9 @@ class TabControl(Container):
         self._pages_changed()
         return result
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
-        if name == "selected_index" and value >= max(1, len(self.children)):
+        if name == "selected_index" and expect_number(value) >= max(1, len(self.children)):
             raise ValueError("Selected tab index is outside the pages")
         if name == "selected_index":
             runtime = getattr(self._root(), "_runtime", None)
@@ -93,7 +97,7 @@ class TabControl(Container):
                 for index, page in enumerate(self.children):
                     modality.validate_visibility(page, index == value)
 
-    def _pages_changed(self, selected=None):
+    def _pages_changed(self, selected: Control | None = None) -> None:
         self.selected_index = (
             self.children.index(selected)
             if selected in self.children
@@ -101,7 +105,7 @@ class TabControl(Container):
         )
         self._sync_pages()
 
-    def _sync_pages(self):
+    def _sync_pages(self) -> None:
         self._syncing = True
         try:
             for index, page in enumerate(self.children):
@@ -110,16 +114,16 @@ class TabControl(Container):
             self._syncing = False
         self.invalidate(Dirty.MEASURE | Dirty.HIT_TEST)
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         if field.name == "selected_index":
             self._reveal_header = True
             self._sync_pages()
         super()._changed(field, old, value)
 
-    def _header_height(self):
+    def _header_height(self) -> float:
         return self.effective_row_height(self.header_height)
 
-    def content_bounds(self, bounds):
+    def content_bounds(self, bounds: Rect) -> Rect:
         area = super().content_bounds(bounds)
         return Rect(
             area.x,
@@ -128,13 +132,15 @@ class TabControl(Container):
             max(0, area.height - self._header_height()),
         )
 
-    def arrange_children(self, area, measure):
+    def arrange_children(
+        self, area: Rect, measure: Callable[[Control], tuple[float, float]]
+    ) -> dict[Control, Rect] | None:
         return {page: area for page in self.children if page.visible}
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         return 400, 260
 
-    def _headers(self):
+    def _headers(self) -> int:
         capacity = max(1, int(self.bounds.width / self.tab_width))
         if len(self.children) > capacity:
             capacity = max(1, int(max(0, self.bounds.width - 48) / self.tab_width))
@@ -147,7 +153,7 @@ class TabControl(Container):
         self._reveal_header = False
         return capacity
 
-    def scroll_input(self, e, /) -> bool:
+    def scroll_input(self, e: Input, /) -> bool:
         if (self.bounds.y <= e.y < self.bounds.y + self._header_height()
                 and len(self.children) > self._headers()):
             previous = self._scroll
@@ -155,7 +161,7 @@ class TabControl(Container):
             return self._scroll != previous
         return False
 
-    def handle_input(self, e, /):
+    def handle_input(self, e: Input, /) -> bool | None:
         if not self.children:
             return
         capacity = self._headers()
@@ -204,7 +210,7 @@ class TabControl(Container):
                     self.selected_index = index
                     break
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         p.body()
         capacity = self._headers()
         available = p.width - (48 if len(self.children) > capacity else 0)
@@ -264,7 +270,7 @@ class TabControl(Container):
             p.text("‹", p.width - 40, y, size=22)
             p.text("›", p.width - 18, y, size=22)
 
-    def destroy(self):
+    def destroy(self) -> None:
         self._destroying = True
         super().destroy()
 
@@ -282,12 +288,12 @@ class SplitPane(Container):
     changed: ClassVar[Event[ChangeEvent[float]]] = Event(ChangeEvent)
     style_parts: ClassVar[tuple[str, ...]] = ("body", "divider")
 
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
-        self._drag = None
+        self._drag: bool | None = None
         self._divider = Rect()
 
-    def _paint_layout_key(self):
+    def _paint_layout_key(self) -> Rect:
         # Child visibility and size constraints can move/remove the divider
         # without changing the pane's own properties or outer rectangle.
         return self._divider
@@ -307,19 +313,21 @@ class SplitPane(Container):
             self.add(Container())
         return cast(Container, self.children[-1])
 
-    def add(self, control):
+    def add(self, control: _C) -> _C:
         if not isinstance(control, Container) or len(self.children) >= 2:
             raise TypeError(
                 "SplitPane takes two containers; add content to split.first or split.second"
             )
         return super().add(control)
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
-        if name == "position" and value > 1:
+        if name == "position" and expect_number(value) > 1:
             raise ValueError("SplitPane.position must be between 0 and 1")
 
-    def arrange_children(self, area, measure):
+    def arrange_children(
+        self, area: Rect, measure: Callable[[Control], tuple[float, float]]
+    ) -> dict[Control, Rect] | None:
         children = [child for child in self.children if child.visible]
         self._divider = Rect()
         if len(children) < 2:
@@ -344,10 +352,10 @@ class SplitPane(Container):
             b: Rect(area.x, area.y + first + divider, area.width, available - first),
         }
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         return 400, 260
 
-    def _effective_position(self, position, available):
+    def _effective_position(self, position: float, available: float) -> float:
         children = [child for child in self.children if child.visible]
         if len(children) < 2 or available <= 0:
             return max(0, min(1, position))
@@ -366,7 +374,7 @@ class SplitPane(Container):
         # Incompatible caps retain the established minimum-size fallback.
         return max(amin / available, min(1 - bmin / available, position))
 
-    def handle_input(self, e, /):
+    def handle_input(self, e: Input, /) -> bool | None:
         if e.kind == "pointer_down" and self._divider.contains(e.x, e.y):
             self._drag = True
         elif e.kind in ("pointer_up", "blur"):
@@ -408,7 +416,7 @@ class SplitPane(Container):
                 available,
             )
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         super().paint(p)
         if len([child for child in self.children if child.visible]) == 2:
             r = self._divider

@@ -13,7 +13,7 @@ MAX_RGBA_BYTES = 32 * 1024 * 1024
 _SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
-def _dimensions(width, height):
+def _dimensions(width: int, height: int) -> None:
     if (
         type(width) is not int
         or type(height) is not int
@@ -24,7 +24,7 @@ def _dimensions(width, height):
         raise ValueError("PNG dimensions must fit within 32 MiB of RGBA pixels")
 
 
-def _chunk(kind, data):
+def _chunk(kind: bytes, data: bytes) -> bytes:
     return (
         struct.pack(">I", len(data))
         + kind
@@ -33,7 +33,7 @@ def _chunk(kind, data):
     )
 
 
-def rgba_png_data_uri(width, height, scanlines):
+def rgba_png_data_uri(width: int, height: int, scanlines: bytes) -> str:
     png = (
         b"\x89PNG\r\n\x1a\n"
         + _chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
@@ -57,7 +57,7 @@ def encode_png(width: int, height: int, rgba: bytes | bytearray) -> bytes:
     return (
         _SIGNATURE
         + _chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
-        + _chunk(b"IDAT", compressed)
+        + _chunk(b"IDAT", bytes(compressed))
         + _chunk(b"IEND", b"")
     )
 
@@ -87,9 +87,9 @@ def decode_png(data: bytes) -> tuple[int, int, bytes]:
     if data[:8] != _SIGNATURE:
         raise ValueError("Invalid PNG signature")
     position = 8
-    header = None
-    palette = None
-    transparent = None
+    header: tuple[int, int, int, int, int, int, int] | None = None
+    palette: bytes | None = None
+    transparent: bytes | None = None
     compressed = bytearray()
     ended = False
     idat_ended = False
@@ -185,7 +185,7 @@ def decode_png(data: bytes) -> tuple[int, int, bytes]:
             (0, 1, 1, 2),
         )
     )
-    layouts = []
+    layouts: list[tuple[int, int, int, int, int, int, int]] = []
     for x, y, dx, dy in passes:
         pw = max(0, (width - x + dx - 1) // dx)
         ph = max(0, (height - y + dy - 1) // dy)

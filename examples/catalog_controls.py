@@ -271,7 +271,7 @@ class Demo(App):
 
 
 if __name__ == "__main__":
-    from pysual import autoconfig
+    from pysual import autoconfig as autoconfig
     from argparse import ArgumentParser
 
     ArgumentParser(description=__doc__).parse_args()

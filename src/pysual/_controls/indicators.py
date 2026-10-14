@@ -11,12 +11,14 @@ from ..behaviors import PressBehavior
 from ..controls import Control
 from ..events import ChangeEvent, Event
 from ..geometry import Rect
-from ..painting import resolve_style
-from ..schema import Dirty, prop
+from ..painting import resolve_style, Painter
+from ..theme import ResolvedStyle
+from ..schema import Dirty, Field, prop
+from ..host import Host, Input
 
 
 @lru_cache(maxsize=128)
-def _ring_points(radius, fraction):
+def _ring_points(radius: float, fraction: float) -> tuple[tuple[float, float], ...]:
     """Reuse local arc geometry with at most 1/8px chord error at UI sizes.
 
     The 192-segment ceiling keeps huge constrained controls bounded. Clamping
@@ -63,14 +65,16 @@ class RangeSlider(Control):
         self._drag_pointer: int | None = None
         self._drag_update = False
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
-        values = {**self._values, name: value}
-        bounds = NumericRange(values["minimum"], values["maximum"])
-        lower, upper = values["value"]
+        if name not in ("minimum", "maximum", "value"):
+            return
+        pending = self._pending(name, value)
+        bounds = NumericRange(pending.number("minimum"), pending.number("maximum"))
+        lower, upper = pending.number_pair("value")
         if (not bounds.is_ordered(strict=True) or not bounds.contains(lower)
                 or not bounds.contains(upper) or lower > upper
-                or not isfinite(values["maximum"] - values["minimum"])):
+                or not isfinite(pending.number("maximum") - pending.number("minimum"))):
             raise ValueError(
                 "RangeSlider requires minimum <= lower <= upper <= maximum "
                 "and a finite positive range"
@@ -97,7 +101,7 @@ class RangeSlider(Control):
         self._drag_pointer = None
         self._press.reset(self)
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         if (field.name in ("minimum", "maximum", "step", "read_only", "enabled",
                            "visible", "active_thumb")
                 or field.name == "value" and not self._drag_update):
@@ -107,7 +111,7 @@ class RangeSlider(Control):
     def _label_height(self):
         return resolve_style(self).font_size * 1.2 + 6 if self.show_values else 0
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         style = resolve_style(self)
         labels = self._labels()
         label_width = sum(host.measure(label, style.font_size,
@@ -133,7 +137,7 @@ class RangeSlider(Control):
         span = self.maximum - self.minimum
         return tuple((value - self.minimum) / span for value in self.value)
 
-    def _move_thumb(self, candidate):
+    def _move_thumb(self, candidate: float) -> None:
         lower, upper = self.value
         self.value = (
             (max(self.minimum, min(upper, candidate)), upper)
@@ -141,7 +145,7 @@ class RangeSlider(Control):
             else (lower, min(self.maximum, max(lower, candidate)))
         )
 
-    def _move_pointer(self, event):
+    def _move_pointer(self, event: Input) -> None:
         left, width, _ = self._track()
         if width <= 0:
             return
@@ -160,7 +164,7 @@ class RangeSlider(Control):
         finally:
             self._drag_update = False
 
-    def handle_input(self, event, /):
+    def handle_input(self, event: Input, /) -> bool | None:
         self._check_live()
         if event.kind == "blur":
             self._clear_interaction()
@@ -210,7 +214,7 @@ class RangeSlider(Control):
                 )
                 self._move_thumb(candidate)
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         super().paint(p)
         left, width, y = self._track()
         low, high = (left + width * part for part in self._fractions())
@@ -262,10 +266,12 @@ class CircularProgress(Control):
     style_fallbacks: ClassVar[tuple[str, ...]] = ("ProgressBar",)
     style_parts: ClassVar[tuple[str, ...]] = ("body", "track", "fill")
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
-        values = {**self._values, name: value}
-        if not NumericRange(0, values["maximum"]).contains(values["value"]):
+        if name not in ("maximum", "value"):
+            return
+        pending = self._pending(name, value)
+        if not NumericRange(0, pending.number("maximum")).contains(pending.number("value")):
             raise ValueError("CircularProgress requires 0 <= value <= maximum")
 
     def set_range(self, maximum: float, *, value: float | None = None) -> None:
@@ -275,14 +281,14 @@ class CircularProgress(Control):
         candidate = NumericRange(0, maximum).clamp(self.value) if value is None else value
         self.update(maximum=maximum, value=candidate)
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         style = resolve_style(self)
         width, height = host.measure("100%", style.font_size, style.font_family == "mono")
         diameter = max(72, width + self.thickness * 2 + 20,
                        height + self.thickness * 2 + 20)
         return diameter, diameter
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         super().paint(p)
         diameter = max(0, min(p.width, p.height) - 2)
         if diameter <= 0:
@@ -292,7 +298,7 @@ class CircularProgress(Control):
         cx, cy = p.width / 2, p.height / 2
         ratio = self.value / self.maximum
 
-        def ring(fraction, style):
+        def ring(fraction: float, style: ResolvedStyle) -> None:
             if fraction <= 0:
                 return
             # Chord-error tessellation gives smooth curves with far fewer

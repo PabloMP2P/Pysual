@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import sys
 import warnings
+from collections.abc import Callable
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from math import inf
 from time import perf_counter
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 from ._engine import call, call_async, get_engine, prioritize_finalization
 from ._namespace_handlers import NamespaceHandlers, bind_handlers
@@ -18,17 +19,23 @@ from .backends import BackendName, resolve_backend
 from .errors import BindingWarning, LifecycleError
 from .events import ChangeEvent, ClosingEvent, Dispatcher, UiEvent
 from .hints import Hints
-from .host import CapabilityError, Host, Input, RenderDiagnostics, Viewport
+from .host import (
+    CapabilityError, Host, Input, RenderDiagnostics, Viewport, native_frame_count,
+    optional_host, read_native_stats,
+)
 from .input import Router
 from .layout import _clear_measurements, _measure_environment, arrange
 from .motion import Motion
-from .painting import RetainedPaintTree, paint_tree
+from . import painting as _painting
 from .render_cache import RenderCache
+from .controls import Control
 from .presentation import Presentation, ensure_wait_allowed
 from .schema import Dirty, _HIT_MASK, check_ui_thread
 
 if TYPE_CHECKING:
     from .app import App
+    from .popup import Popup
+    from .widgets import SubWindow
 
 
 @dataclass(frozen=True)
@@ -52,25 +59,26 @@ class FrameTiming:
 class _RuntimeDispatcher(Dispatcher):
     """Wake event-driven windows when an async callback fails while idle."""
 
-    def __init__(self, limit, wake):
+    def __init__(self, limit: int | None, wake: Callable[[], None]) -> None:
         super().__init__(limit)
         self._wake_runtime = wake
 
-    def _record_error(self, error):
+    def _record_error(self, error: BaseException) -> None:
         super()._record_error(error)
         self._wake_runtime()
 
 
 class Runtime:
     def __init__(
-        self, app: App, host: Host, *, modal=False, owner=None, presentation_owner=None
-    ):
+        self, app: App, host: Host, *, modal: bool = False, owner: Runtime | None = None,
+        presentation_owner: App | None = None,
+    ) -> None:
         from ._modality import ModalManager
 
         self.app = app
         self.host = host
         self.render_cache = RenderCache(host)
-        self._retained_paint = None
+        self._retained_paint: _painting.RetainedPaintTree | None = None
         self.dispatcher = _RuntimeDispatcher(
             app.max_pending_handlers, lambda: self._wake_event.set()
         )
@@ -78,31 +86,31 @@ class Runtime:
         self.router = Router(self)
         self.hints = Hints(self)
         self._modality = ModalManager(self)
-        self.popup = None
+        self.popup: Popup | None = None
         self._owner_runtime: Runtime | None = owner
-        self._presentation_owner = presentation_owner or (owner.app if owner else None)
+        self._presentation_owner: App | None = presentation_owner or (owner.app if owner else None)
         self._native_parented = False
         self._backend_name: BackendName | None = None
         self._owned: set[Runtime] = set()
         self._native_blockers: set[Runtime] = set()
-        self._owner_previous_focus = None
+        self._owner_previous_focus: Control | None = None
         self._modal = modal
         self.presentation: Presentation
         self._phase: str | None = None
         self._started = False
         self._cleaned = False
-        self._task: asyncio.Task | None = None
-        self._close_task = None
-        self._close_waiter = None
-        self._close_result = None
+        self._task: asyncio.Task[Any] | None = None
+        self._close_task: asyncio.Task[object] | None = None
+        self._close_waiter: asyncio.Future[object] | None = None
+        self._close_result: object = None
         self._close_reason = "closed"
         self._failure: BaseException | None = None
         self._stop = asyncio.Event()
         self._wake_event = asyncio.Event()
         self._dirty = True
         self._force_layout = True
-        self._measure_environment = None
-        self._measure_host = None
+        self._measure_environment: object = None
+        self._measure_host: Host | None = None
         self._host_open = False
         self.frames = 0
         # Resource failures are diagnostics, not fatal application exceptions.
@@ -116,19 +124,19 @@ class Runtime:
         self._pending_size: dict[str, float | None] = {}
 
     @property
-    def modal(self):
+    def modal(self) -> SubWindow | None:
         return self._modality.active
 
-    def diagnostics(self, *, include_native=False) -> RenderDiagnostics:
+    def diagnostics(self, *, include_native: bool = False) -> RenderDiagnostics:
         check_ui_thread()
         host = self.host
         backend = getattr(host, "backend", None) or self._backend_name
         native = None
-        if include_native and self.frames and self._host_open and getattr(host, "native_retained", False):
-            native = host.native_stats()
+        if include_native and self.frames and self._host_open:
+            native = read_native_stats(host)
         return RenderDiagnostics(
             scene_submissions=self.frames,
-            native_presentations=int(native["frames"]) if native is not None and "frames" in native else None,
+            native_presentations=None if native is None else native_frame_count(native),
             host_name=getattr(host, "diagnostic_name", type(host).__name__),
             backend=backend,
             web_execution=getattr(host, "web_execution", None),
@@ -136,7 +144,7 @@ class Runtime:
             hidden=getattr(host, "hidden", None),
         )
 
-    def _sync_viewport(self, viewport: Viewport | None = None, *, acknowledged=None) -> None:
+    def _sync_viewport(self, viewport: Viewport | None = None, *, acknowledged: dict[str, float | None] | None = None) -> None:
         previous = self.viewport
         host_viewport = (
             viewport
@@ -199,11 +207,11 @@ class Runtime:
             self.invalidate()
             self.app.resumed.emit(UiEvent(source=self.app, origin="system"))
 
-    def invalidate(self):
+    def invalidate(self) -> None:
         self._dirty = True
         self._wake_event.set()
 
-    def _next_frame_at(self):
+    def _next_frame_at(self) -> float:
         if self.suspended:
             return inf
         interval = self.app.redraw_interval
@@ -223,16 +231,16 @@ class Runtime:
         allowed = self._last_frame_started + 1 / limit if limit else 0.0
         return max(requested, allowed)
 
-    def _sync_render_policy(self):
-        configure = getattr(self.host, "configure_rendering", None)
-        if configure is not None:
-            configure(
+    def _sync_render_policy(self) -> None:
+        rendering = optional_host(self.host, "configure_rendering")
+        if rendering is not None:
+            rendering.configure_rendering(
                 redraw_interval=self.app.redraw_interval,
                 fps_limit=self.app.fps_limit,
                 reduce_motion=self.app.reduce_motion,
             )
 
-    def _reveal_focus(self, control):
+    def _reveal_focus(self, control: Control) -> bool:
         """Reveal focus through ancestor layout hooks after current arrangement."""
         bounds = control._rect
         child, parent = control, control._parent
@@ -255,7 +263,7 @@ class Runtime:
             self.host.text_input(control._rect)
         return moved
 
-    def _paint_frame(self, prepared_changed=False, prepared_seconds=0.0):
+    def _paint_frame(self, prepared_changed: bool = False, prepared_seconds: float = 0.0) -> None:
         from ._engine import critical_phase
 
         previous = self._phase
@@ -266,7 +274,7 @@ class Runtime:
         finally:
             self._phase = previous
 
-    def _layout_pending(self):
+    def _layout_pending(self) -> bool:
         environment = _measure_environment(self.host)
         return (
             self._force_layout
@@ -276,7 +284,7 @@ class Runtime:
             or self.router._focus_to_reveal is not None
         )
 
-    def _arrange_scene(self):
+    def _arrange_scene(self) -> tuple[bool, float]:
         """Place the tree. Returns whether geometry changed and the elapsed seconds."""
         # A caller resize must land before placement so focus reveal uses the
         # requested host size. Stable frames have nothing pending and skip this.
@@ -312,16 +320,16 @@ class Runtime:
             if app.profile_frames:
                 elapsed += perf_counter() - started
         self.router.reconcile()
-        focus_to_reveal = self.router.take_focus_reveal()
-        if focus_to_reveal is not None:
+        revealed = self.router.take_focus_reveal()
+        if revealed is not None:
             started = perf_counter() if app.profile_frames else 0.0
-            if self._reveal_focus(focus_to_reveal):
+            if self._reveal_focus(revealed):
                 changed = True
                 if app.profile_frames:
                     elapsed += perf_counter() - started
         return changed, elapsed
 
-    def _paint_content(self, prepared_changed=False, prepared_seconds=0.0):
+    def _paint_content(self, prepared_changed: bool = False, prepared_seconds: float = 0.0) -> None:
         app = self.app
         # Consume this request before painting so a request made during the
         # pass (including by the host) survives for the next eligible frame.
@@ -338,8 +346,10 @@ class Runtime:
         self.host.set_title(app.title)
         paint_started = perf_counter() if app.profile_frames else 0.0
         self.render_cache.configure(app.render_cache_bytes)
-        paint_tree(app, self.host, self.router.focus, self.render_cache,
-                   retained=self._retained_paint, layout_changed=layout_changed)
+        _painting.paint_tree(
+            app, self.host, self.router.focus, self.render_cache,
+            retained=self._retained_paint, layout_changed=layout_changed,
+        )
         completed = perf_counter()
         self.frames += 1
         if app.profile_frames:
@@ -359,7 +369,7 @@ class Runtime:
         self._input_seconds = 0.0
         self._last_presented = completed
 
-    def request_close(self, result=None):
+    def request_close(self, result: object = None) -> asyncio.Future[Any]:
         """Share a vetoable decision independently of the requesting control."""
         from ._engine import critical_phase
 
@@ -368,12 +378,20 @@ class Runtime:
         ):
             self._close_result = result
             self._close_waiter = asyncio.get_running_loop().create_future()
+            decision_waiter = self._close_waiter
             with critical_phase(None):
-                self._close_task = asyncio.create_task(
-                    self._decide_close(),
-                    name=f"{type(self.app).__name__}: close decision",
-                )
-            self._close_task.add_done_callback(self._close_finished)
+                decision = self._decide_close()
+                try:
+                    self._close_task = asyncio.create_task(
+                        decision,
+                        name=f"{type(self.app).__name__}: close decision",
+                    )
+                except BaseException:
+                    decision.close()
+                    raise
+            self._close_task.add_done_callback(
+                lambda task: self._close_finished(task, decision_waiter)
+            )
         assert self._close_waiter is not None
         waiter = asyncio.shield(self._close_waiter)
         waiter.add_done_callback(
@@ -381,20 +399,25 @@ class Runtime:
         )
         return waiter
 
-    def _close_finished(self, task):
+    def _close_finished(
+        self, task: asyncio.Task[object], waiter: asyncio.Future[object]
+    ) -> None:
         if task.cancelled():
-            if self._close_waiter is not None and not self._close_waiter.done():
-                self._close_waiter.set_result(self._stop.is_set())
+            if not waiter.done():
+                waiter.set_result(self._stop.is_set())
         elif (error := task.exception()) is not None:
-            if self._close_waiter is not None and not self._close_waiter.done():
-                self._close_waiter.set_exception(error)
+            if not waiter.done():
+                waiter.set_exception(error)
             self._failure = error
             self._stop.set()
             self._wake_event.set()
-        elif self._close_waiter is not None and not self._close_waiter.done():
-            self._close_waiter.set_result(task.result())
+        elif not waiter.done():
+            waiter.set_result(task.result())
 
-    async def _decide_close(self):
+    async def _decide_close(self) -> bool:
+        # Eager task factories enter here before request_close() receives the
+        # task. Publish its identity before a handler can request closure again.
+        self._close_task = asyncio.current_task()
         if self._stop.is_set():
             return True
         accepted = await self.dispatcher.decide(
@@ -406,7 +429,7 @@ class Runtime:
             self._wake_event.set()
         return accepted
 
-    def force_close(self, *, reason="owner_closed"):
+    def force_close(self, *, reason: str = "owner_closed") -> None:
         """End this opening without running veto handlers (owner/shutdown/disposal)."""
         self._close_reason = reason
         self.app._state = "CLOSING"
@@ -415,14 +438,14 @@ class Runtime:
         if self._close_waiter is not None and not self._close_waiter.done():
             self._close_waiter.set_result(True)
 
-    async def open_modal(self, control):
+    async def open_modal(self, control: SubWindow) -> object:
         presentation = self._modality.show(control, modal=True)
         return (await presentation.wait_async()).result
 
-    def finish_modal(self, control, result):
+    def finish_modal(self, control: Control, result: object) -> None:
         self._modality.finish(control, result)
 
-    def start(self, *, handlers: NamespaceHandlers | None = None):
+    def start(self, *, handlers: NamespaceHandlers | None = None) -> Presentation:
         """Build/open/paint atomically on UI; present is an acknowledged host call."""
         from ._engine import _origin, capture_origin, critical_phase, ensure_presentable
         from .controls import Container
@@ -486,7 +509,7 @@ class Runtime:
                 # platform metrics, or have been measured before opening.
                 _clear_measurements(app)
                 if "scene_patches" in getattr(self.host, "capabilities", ()):
-                    self._retained_paint = RetainedPaintTree(self.host)
+                    self._retained_paint = _painting.RetainedPaintTree(self.host)
                 if self._owner_runtime is not None:
                     owner = self._owner_runtime
                     self._set_modal_owner(owner.host)
@@ -542,11 +565,11 @@ class Runtime:
             _origin.reset(origin_token)
         return self.presentation
 
-    async def main(self):
+    async def main(self) -> object:
         """Run one opening on the shared owner; injected hosts remain testable."""
         return await call_async(self._main)
 
-    async def _main(self):
+    async def _main(self) -> None:
         from ._engine import _origin
 
         if not self._started:
@@ -571,7 +594,7 @@ class Runtime:
         finally:
             _origin.reset(token)
 
-    async def _pump(self):
+    async def _pump(self) -> None:
         from ._engine import critical_phase
 
         engine = get_engine()
@@ -632,7 +655,7 @@ class Runtime:
                 )
             await self._wait(delay)
 
-    def _process_input(self, event):
+    def _process_input(self, event: Input) -> None:
         from ._engine import critical_phase
 
         started = perf_counter() if self.app.profile_frames else None
@@ -645,7 +668,7 @@ class Runtime:
             if started is not None:
                 self._input_seconds += perf_counter() - started
 
-    def _submit_size(self):
+    def _submit_size(self) -> None:
         # build() can request a size before the host exists. Platforms that own
         # the viewport, such as the browser, never accept set_size; the startup
         # request must be dropped or the next real viewport crashes the window.
@@ -670,7 +693,7 @@ class Runtime:
         elif pending:
             self._sync_viewport(acknowledged=pending)
 
-    async def _wait(self, delay):
+    async def _wait(self, delay: float) -> None:
         """Yield fairly, waking idle scheduling immediately after a mutation."""
         if delay == 0:
             await asyncio.sleep(0)
@@ -688,7 +711,7 @@ class Runtime:
             finally:
                 timer.cancel()
 
-    def _close_host(self):
+    def _close_host(self) -> None:
         try:
             if self._host_open:
                 self._host_open = False
@@ -701,13 +724,13 @@ class Runtime:
                 self._retained_paint.clear()
             self.router.clear()
 
-    def _set_modal_owner(self, owner_host):
-        set_owner = getattr(self.host, "set_modal_owner", None)
+    def _set_modal_owner(self, owner_host: Host | None) -> None:
+        set_owner: object = getattr(self.host, "set_modal_owner", None)
         if set_owner is None:
             raise CapabilityError("This host does not support owner-scoped native modality")
-        set_owner(owner_host)
+        cast(Callable[[Host | None], None], set_owner)(owner_host)
 
-    def _unlink_owner(self):
+    def _unlink_owner(self) -> None:
         owner = self._owner_runtime
         if owner is None:
             return
@@ -727,11 +750,11 @@ class Runtime:
                     if previous is not None
                     and not previous._disposed
                     and owner._modality.allowed(previous)
-                    else None
+                    else None,
                 )
                 owner.invalidate()
 
-    async def _cleanup(self, failure=None):
+    async def _cleanup(self, failure: BaseException | None = None) -> None:
         from .controls import Container
 
         if self._cleaned:
@@ -741,7 +764,7 @@ class Runtime:
         app._state = "CLOSING"
         errors = [failure] if failure is not None else []
 
-        def attempt(callback):
+        def attempt(callback: Callable[[], object]) -> None:
             try:
                 callback()
             except BaseException as error:
@@ -822,7 +845,7 @@ class Runtime:
         if completion_error is not None:
             raise completion_error
 
-    def _emit_closed(self):
+    def _emit_closed(self) -> None:
         if self.app._disposed:
             return
         # A failed first frame also ends an opening. Completion precedes user
@@ -844,7 +867,7 @@ class _IdleFailure:
 
 
 class _IdleFuture(Future[None]):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.failure: _IdleFailure | None = None
 
@@ -857,7 +880,7 @@ _active_error: _IdleFailure | None = None
 _hook_registered = False
 
 
-def _register(runtime):
+def _register(runtime: Runtime) -> None:
     global _idle, _hook_registered
     if not _active:
         _idle = _IdleFuture()
@@ -874,7 +897,7 @@ def _register(runtime):
     prioritize_finalization()
 
 
-def _unregister(runtime, error=None):
+def _unregister(runtime: Runtime, error: BaseException | None = None) -> None:
     global _idle_error, _active_error
     _active.discard(runtime)
     if error is not None and _active_error is None:
@@ -892,7 +915,7 @@ def _unregister(runtime, error=None):
             _idle.set_result(None)
 
 
-async def _shutdown_windows():
+async def _shutdown_windows() -> None:
     runtimes = tuple(_active)
     for runtime in runtimes:
         runtime.force_close(reason="shutdown")
@@ -904,7 +927,7 @@ async def _shutdown_windows():
 
 
 def open_window(
-    app: App, backend: Host | BackendName | None = None, *, modal=False,
+    app: App, backend: Host | BackendName | None = None, *, modal: bool = False,
     owner: App | None = None, handlers: NamespaceHandlers | None = None,
 ) -> Presentation:
     """Owner-side admission; return the exact opening acknowledged by present."""
@@ -983,15 +1006,34 @@ def open_window(
         app, host, modal=modal, owner=owner_runtime, presentation_owner=owner
     )
     runtime._backend_name = selected if isinstance(selected, str) else None
-    presentation = runtime.start(handlers=handlers)
-    runtime._task = asyncio.create_task(
-        runtime._main(), name=f"{type(app).__name__}: window"
-    )
+    # Admit the pump before opening native resources. The gate prevents eager
+    # factories from entering _main until synchronous startup has acknowledged
+    # the first frame and bound this caller's namespace handlers.
+    started: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+    async def run_started() -> None:
+        await started
+        await runtime._main()
+
+    execution = run_started()
+    try:
+        runtime._task = asyncio.create_task(
+            execution, name=f"{type(app).__name__}: window"
+        )
+    except BaseException:
+        execution.close()
+        raise
     runtime._task.add_done_callback(_report_runtime_failure)
+    try:
+        presentation = runtime.start(handlers=handlers)
+    except BaseException:
+        runtime._task.cancel()
+        raise
+    started.set_result(None)
     return presentation
 
 
-def _report_runtime_failure(task):
+def _report_runtime_failure(task: asyncio.Task[object]) -> None:
     if not task.cancelled() and (error := task.exception()) is not None:
         asyncio.get_running_loop().call_exception_handler(
             {
@@ -1002,7 +1044,7 @@ def _report_runtime_failure(task):
         )
 
 
-def run(app: App, backend: Host | BackendName | None = None):
+def run(app: App, backend: Host | BackendName | None = None) -> App:
     """Open a window and return immediately after acknowledged first presentation."""
     from ._engine import call_opening
 
@@ -1030,7 +1072,7 @@ def wait(timeout: float | None = None) -> None:
     _idle_result(future, timeout)
 
 
-def _consume_idle_error(future):
+def _consume_idle_error(future: _IdleFuture) -> None:
     global _idle, _idle_error
     failure = future.failure
     # Compare occurrences, not exception identities: an application can raise
@@ -1045,7 +1087,7 @@ def _consume_idle_error(future):
         _idle.set_result(None)
 
 
-def _idle_result(future, timeout=None):
+def _idle_result(future: _IdleFuture, timeout: float | None = None) -> None:
     try:
         return future.result(timeout)
     except BaseException as error:
@@ -1061,7 +1103,7 @@ async def wait_async() -> None:
     await _wait_for_idle(future)
 
 
-async def _wait_for_idle(future):
+async def _wait_for_idle(future: _IdleFuture) -> None:
     bridge = asyncio.wrap_future(future)
     bridge.add_done_callback(
         lambda done: None if done.cancelled() else done.exception()

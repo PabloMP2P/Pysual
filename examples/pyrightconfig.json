@@ -1,0 +1,20 @@
+{
+  "include": ["*.py"],
+  "extraPaths": ["../src"],
+  "typeCheckingMode": "strict",
+  "pythonVersion": "3.11",
+  "reportMissingImports": true,
+  "reportUnknownParameterType": "none",
+  "reportUnknownArgumentType": "none",
+  "reportUnknownLambdaType": "none",
+  "reportUnknownVariableType": "none",
+  "reportUnknownMemberType": "none",
+  "reportMissingParameterType": "none",
+  "reportUnusedCallResult": "none",
+  "reportImplicitOverride": "none",
+  "reportPrivateUsage": "none",
+  "reportUnnecessaryIsInstance": "none",
+  "reportUnnecessaryComparison": "none",
+  "reportUnnecessaryCast": "none",
+  "reportUnusedFunction": "none"
+}

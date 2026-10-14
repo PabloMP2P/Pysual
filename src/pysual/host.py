@@ -1,15 +1,16 @@
 """The only platform substitution boundary; no concrete controls or runtime."""
 
 import re
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from math import isfinite
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, overload
 
 from .errors import PysualError
 from .geometry import Rect
 
 if TYPE_CHECKING:
-    from .theme import Style
+    from .theme import ResolvedStyle
 
 
 class CapabilityError(PysualError):
@@ -84,10 +85,14 @@ class Viewport:
             *self.safe_area,
             self.keyboard_occlusion,
         )
-        if any(
-            type(value) not in (int, float) or not isfinite(value) or value < 0
-            for value in values
-        ):
+        try:
+            valid = all(
+                type(value) in (int, float) and isfinite(value) and value >= 0
+                for value in values
+            )
+        except OverflowError:
+            valid = False
+        if not valid:
             raise ValueError(
                 "Viewport dimensions and insets must be finite and nonnegative"
             )
@@ -156,9 +161,12 @@ class StyledRectHost(Protocol):
     Semantic hooks receive absolute logical coordinates and honor the current
     clip. Return True after handling the whole operation; False keeps the shared
     primitive fallback. Hosts can implement any subset of these hook protocols.
+    Retained hosts may receive ``effect_clip``; other hosts are called without it.
     """
 
-    def styled_rect(self, rect: Rect, style: "Style") -> bool: ...
+    def styled_rect(
+        self, rect: Rect, style: "ResolvedStyle", *, effect_clip: Rect | None = None,
+    ) -> bool: ...
 
 
 class IconHost(Protocol):
@@ -168,11 +176,15 @@ class IconHost(Protocol):
 
 
 class MarkerHost(Protocol):
-    """Optional explicit choice indicator or circular thumb representation."""
+    """Optional explicit choice indicator or circular thumb representation.
+
+    Retained hosts may receive ``effect_clip``. Other hosts are called without it.
+    """
 
     def marker(
-        self, rect: Rect, style: "Style", *,
+        self, rect: Rect, style: "ResolvedStyle", *,
         shape: Literal["square", "circle"], checked: bool,
+        effect_clip: Rect | None = None,
     ) -> bool: ...
 
 
@@ -186,6 +198,119 @@ class FocusRingHost(Protocol):
     """Optional focus indication around the full control bounds."""
 
     def focus_ring(self, rect: Rect, color: str, radius: float = 0) -> bool: ...
+
+
+class MeasureManyHost(Protocol):
+    """Optional batch text measurement. Absent hosts measure one string at a time."""
+
+    def measure_many(
+        self, texts: Iterable[str], size: float, mono: bool = False
+    ) -> Iterable[tuple[float, float]]: ...
+
+
+class LineBatchHost(Protocol):
+    """Optional connected-stroke batch. Absent hosts draw each segment with line()."""
+
+    def lines(
+        self, points: Sequence[tuple[float, float]], color: str, width: float = 1
+    ) -> None: ...
+
+
+class SegmentBatchHost(Protocol):
+    """Optional independent-stroke batch."""
+
+    def segments(
+        self,
+        segments: Iterable[tuple[float, float, float, float]],
+        color: str,
+        width: float = 1,
+    ) -> None: ...
+
+
+class GradientHost(Protocol):
+    """Optional single-call gradient. Return True when the host painted it."""
+
+    def gradient_rect(
+        self,
+        rect: Rect,
+        first: str,
+        last: str,
+        axis: Literal["vertical", "horizontal"],
+        radius: float,
+        border_width: float = 0,
+    ) -> bool: ...
+
+
+class ImageFitHost(Protocol):
+    """image() with fit, present only when the image_fit capability is advertised.
+
+    Every host already has the two-argument image(), so this is not detected
+    with isinstance. The capability is the runtime proof.
+    """
+
+    def image(
+        self,
+        source: str,
+        rect: Rect,
+        *,
+        fit: Literal["stretch", "contain", "cover"] = "stretch",
+    ) -> None: ...
+
+
+class SpriteHost(Protocol):
+    """Optional native sprite-sheet playback."""
+
+    def sprite(
+        self,
+        source: str,
+        rect: Rect,
+        *,
+        frame_width: float,
+        frame_height: float,
+        frame_count: int,
+        fps: float = 12,
+        loop: bool = True,
+        tint: str = "#ffffff",
+    ) -> None: ...
+
+
+class AnimatedRectHost(Protocol):
+    """Optional native interpolation of a rectangle."""
+
+    def animated_rect(
+        self,
+        rect: Rect,
+        fill: str,
+        *,
+        radius: float = 0,
+        border: str = "",
+        border_width: float = 1,
+        property: Literal["x", "y", "opacity"] = "x",
+        from_value: float,
+        to_value: float,
+        duration: float = 1,
+        loop: bool = True,
+        yoyo: bool = True,
+    ) -> None: ...
+
+
+class NativeStatsHost(Protocol):
+    """Explicit presentation counters for a native_retained host."""
+
+    def native_stats(self) -> Mapping[str, Any]: ...
+
+
+class RenderingHost(Protocol):
+    """Optional rendering policy. Absent hosts keep their own defaults."""
+
+    def configure_rendering(
+        self,
+        *,
+        redraw_interval: float | None,
+        fps_limit: int | float | None,
+        reduce_motion: bool,
+        vsync: bool | None = None,
+    ) -> None: ...
 
 
 class Host(Protocol):
@@ -281,3 +406,130 @@ class Host(Protocol):
     async def read_session(self, key: str) -> str | None: ...
     async def write_session(self, key: str, text: str | None) -> None: ...
     async def open_url(self, url: str) -> None: ...
+
+
+_OPTIONAL_HOST_METHODS = frozenset({
+    "animated_rect",
+    "caret",
+    "configure_rendering",
+    "focus_ring",
+    "gradient_rect",
+    "icon",
+    "lines",
+    "marker",
+    "measure_many",
+    "native_stats",
+    "segments",
+    "sprite",
+    "styled_rect",
+})
+
+
+@overload
+def optional_host(host: Host, method: Literal["measure_many"]) -> MeasureManyHost | None: ...
+@overload
+def optional_host(host: Host, method: Literal["lines"]) -> LineBatchHost | None: ...
+@overload
+def optional_host(host: Host, method: Literal["segments"]) -> SegmentBatchHost | None: ...
+@overload
+def optional_host(host: Host, method: Literal["gradient_rect"]) -> GradientHost | None: ...
+@overload
+def optional_host(host: Host, method: Literal["sprite"]) -> SpriteHost | None: ...
+@overload
+def optional_host(host: Host, method: Literal["animated_rect"]) -> AnimatedRectHost | None: ...
+@overload
+def optional_host(host: Host, method: Literal["native_stats"]) -> NativeStatsHost | None: ...
+@overload
+def optional_host(host: Host, method: Literal["configure_rendering"]) -> RenderingHost | None: ...
+@overload
+def optional_host(host: Host, method: Literal["styled_rect"]) -> StyledRectHost | None: ...
+@overload
+def optional_host(host: Host, method: Literal["icon"]) -> IconHost | None: ...
+@overload
+def optional_host(host: Host, method: Literal["marker"]) -> MarkerHost | None: ...
+@overload
+def optional_host(host: Host, method: Literal["caret"]) -> CaretHost | None: ...
+@overload
+def optional_host(host: Host, method: Literal["focus_ring"]) -> FocusRingHost | None: ...
+
+
+def optional_host(host: Host, method: str) -> Any:
+    """Return the host when ``method`` is callable, including through ``__getattr__``.
+
+    Forwarding wrappers do not expose the method to ``isinstance`` on a protocol.
+    ``getattr`` follows that forwarding. The method name selects the protocol, so
+    a call cannot pair ``lines`` with a segment host. A missing or non-callable
+    attribute is absent. An unknown method name is rejected.
+    """
+    if method not in _OPTIONAL_HOST_METHODS:
+        raise ValueError(f"Unknown optional host method {method!r}")
+    if not callable(getattr(host, method, None)):
+        return None
+    return host
+
+
+def image_fit_host(host: Host) -> ImageFitHost | None:
+    """Return the host when it advertises ``image_fit``.
+
+    Every host has the two-argument ``image()``. The capability is the proof
+    that the same method accepts ``fit``.
+    """
+    if "image_fit" not in getattr(host, "capabilities", ()):
+        return None
+    return cast(ImageFitHost, host)
+
+
+def read_native_stats(host: Host) -> Mapping[str, Any] | None:
+    """Return the retained host's stats snapshot.
+
+    Other hosts return None. A retained host that does not implement
+    native_stats() is an incomplete adapter.
+    """
+    if not getattr(host, "native_retained", False):
+        return None
+    retained = optional_host(host, "native_stats")
+    if retained is None:
+        raise TypeError("A native_retained host must provide native_stats()")
+    stats = retained.native_stats()
+    if not isinstance(stats, Mapping):
+        raise TypeError("native_stats must return a mapping")
+    return stats
+
+
+def native_frame_count(stats: Mapping[str, Any]) -> int | None:
+    """Return presentation frames, or None when the snapshot omits them.
+
+    Whole numbers are counters. Booleans, fractions and non-finite values are
+    not. Callers that require a counter reject a missing key themselves.
+    """
+    if "frames" not in stats:
+        return None
+    value = stats["frames"]
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not isfinite(value)
+        or (isinstance(value, float) and not value.is_integer())
+    ):
+        raise TypeError("native_stats frames must be a whole finite number")
+    return int(value)
+
+
+def configure_rendering(
+    host: Host,
+    *,
+    redraw_interval: float | None,
+    fps_limit: int | float | None,
+    reduce_motion: bool,
+    vsync: bool | None = None,
+) -> None:
+    """Apply a rendering policy on a host that advertises configure_rendering."""
+    rendering = optional_host(host, "configure_rendering")
+    if rendering is None:
+        raise CapabilityError("This host does not provide rendering controls")
+    rendering.configure_rendering(
+        redraw_interval=redraw_interval,
+        fps_limit=fps_limit,
+        reduce_motion=reduce_motion,
+        vsync=vsync,
+    )

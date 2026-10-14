@@ -7,6 +7,7 @@ from ..controls import Control
 from ..geometry import Rect
 from ..host import CapabilityError
 from ..schema import prop
+from ..painting import Painter
 
 
 class Image(Control):
@@ -25,7 +26,7 @@ class Image(Control):
             reload_image(self.source)
         self.invalidate()
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         if self.source:
             rect = Rect(0, 0, p.width, p.height)
             if self.fit == "stretch":

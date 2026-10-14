@@ -9,11 +9,12 @@ from functools import lru_cache
 from importlib import resources
 from math import ceil, isfinite
 from struct import unpack_from
+from typing import cast
 from unicodedata import normalize
 
 
 @lru_cache(maxsize=2)
-def font_bytes(mono=False):
+def font_bytes(mono: bool = False) -> bytes:
     return (
         resources.files("pysual")
         .joinpath("assets", "DejaVuSansMono.ttf" if mono else "DejaVuSans.ttf")
@@ -24,9 +25,9 @@ def font_bytes(mono=False):
 class TrueTypeFont:
     """Read-only TrueType data. Input is the packaged, trusted font resource."""
 
-    def __init__(self, data):
+    def __init__(self, data: bytes) -> None:
         self.data = data
-        self.tables = {}
+        self.tables: dict[bytes, int] = {}
         for index in range(self.u16(4)):
             tag, _, offset, length = unpack_from(">4sIII", data, 12 + index * 16)
             if offset + length > len(data):
@@ -44,7 +45,7 @@ class TrueTypeFont:
             for i in range(self.glyph_count)
         )
         self._read_cmap()
-        self.kerning = {}
+        self.kerning: dict[tuple[int, int], int] = {}
         kern = self.tables.get(b"kern")
         if kern is not None and self.u16(kern) == 0:
             offset = kern + 4
@@ -65,12 +66,12 @@ class TrueTypeFont:
                         )
                 offset += length
 
-    def u16(self, offset):
+    def u16(self, offset: int) -> int:
         return unpack_from(">H", self.data, offset)[0]
 
-    def _read_cmap(self):
+    def _read_cmap(self) -> None:
         cmap = self.tables[b"cmap"]
-        choices = []
+        choices: list[tuple[bool, bool, int]] = []
         for index in range(self.u16(cmap + 2)):
             platform, encoding, relative = unpack_from(
                 ">HHI", self.data, cmap + 4 + index * 8
@@ -95,9 +96,17 @@ class TrueTypeFont:
         else:
             count = self.u16(self._cmap + 6) // 2
             offset = self._cmap + 14
-            ends = unpack_from(f">{count}H", self.data, offset)
-            starts = unpack_from(f">{count}H", self.data, offset + count * 2 + 2)
-            deltas = unpack_from(f">{count}h", self.data, offset + count * 4 + 2)
+            ends = cast(
+                "tuple[int, ...]", unpack_from(f">{count}H", self.data, offset)
+            )
+            starts = cast(
+                "tuple[int, ...]",
+                unpack_from(f">{count}H", self.data, offset + count * 2 + 2),
+            )
+            deltas = cast(
+                "tuple[int, ...]",
+                unpack_from(f">{count}h", self.data, offset + count * 4 + 2),
+            )
             ranges = offset + count * 6 + 2
             self._segments = tuple(
                 (
@@ -111,7 +120,7 @@ class TrueTypeFont:
             )
             self._starts = starts
 
-    def glyph_id(self, character):
+    def glyph_id(self, character: str) -> int:
         code = ord(character)
         index = bisect_right(self._starts, code) - 1
         if index < 0:
@@ -130,7 +139,7 @@ class TrueTypeFont:
                 glyph = (code + delta) & 0xFFFF
         return glyph if glyph < self.glyph_count else 0
 
-    def width(self, text, size):
+    def width(self, text: str, size: float) -> float:
         previous, total = 0, 0
         for character in text:
             glyph = self.glyph_id(character)
@@ -140,16 +149,16 @@ class TrueTypeFont:
 
 
 @lru_cache(maxsize=2)
-def font(mono=False):
+def font(mono: bool = False) -> TrueTypeFont:
     return TrueTypeFont(font_bytes(mono))
 
 
-def ascent(size, mono=False):
+def ascent(size: float, mono: bool = False) -> float:
     face = font(mono)
     return face.ascender * size / face.units
 
 
-def measure(text, size, mono=False):
+def measure(text: str, size: float, mono: bool = False) -> tuple[float, float]:
     if not isfinite(size) or size <= 0 or size > 2048:
         raise ValueError("Font size must be finite and between 0 and 2048 pixels")
     return (
@@ -159,7 +168,7 @@ def measure(text, size, mono=False):
     )
 
 
-def _measure(text, size, mono):
+def _measure(text: str, size: float, mono: bool) -> tuple[float, float]:
     face = font(mono)
     # Browsers compose canonical accents before positioning their glyphs.
     # Normalize only this measuring copy; document text and indices stay intact.

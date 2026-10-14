@@ -6,8 +6,8 @@ from ._text_display import single_line
 from .controls import Button, Container, Control
 from .errors import LifecycleError
 from .geometry import Rect
-from .host import CapabilityError
-from .painting import resolve_style
+from .host import CapabilityError, Host
+from .painting import resolve_style, Painter
 from .schema import Dirty, prop
 
 if TYPE_CHECKING:
@@ -23,10 +23,12 @@ class GroupBox(Container):
     style_parts: ClassVar[tuple[str, ...]] = ("body", "heading")
     _style_kind: ClassVar[str] = "GroupBox"
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         return self.measure_available(host)
 
-    def measure_available(self, host, *, width=None, height=None):
+    def measure_available(
+        self, host: Host, *, width: float | None = None, height: float | None = None
+    ) -> tuple[float, float]:
         style = resolve_style(self, "heading")
         heading = style.font_size * 1.4 + 8 if self.title else 0
         measured_width, measured_height = self.measure_content(
@@ -41,12 +43,12 @@ class GroupBox(Container):
             measured_width = max(measured_width, title_width + self.padding * 2)
         return measured_width, measured_height + heading
 
-    def content_bounds(self, bounds):
+    def content_bounds(self, bounds: Rect) -> Rect:
         area = super().content_bounds(bounds)
         height = resolve_style(self, "heading").font_size * 1.4 + 8 if self.title else 0
         return Rect(area.x, area.y + height, area.width, max(0, area.height - height))
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         p.body()
         if self.title:
             style = p.style("heading")
@@ -71,10 +73,10 @@ class Separator(Control):
     )
     _style_kind: ClassVar[str] = "Separator"
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         return (40, 9) if self.orientation == "horizontal" else (9, 40)
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         style = p.style()
         if self.orientation == "horizontal":
             p.line(0, p.height / 2, p.width, p.height / 2, style.foreground)

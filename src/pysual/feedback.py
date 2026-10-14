@@ -12,11 +12,15 @@ from .controls import Control
 from .errors import LifecycleError
 from .events import ChangeEvent, ClickEvent, Event, UiEvent
 from .geometry import Rect
-from .painting import resolve_style
-from .schema import Dirty, prop
+from .painting import resolve_style, Painter
+from .schema import Dirty, Field, prop
+from .theme import ResolvedStyle
+from .host import Host, Input
 
 
-def _caption(p, text, area, style, *, centered=False):
+def _caption(
+    p: Painter, text: str, area: Rect, style: ResolvedStyle, *, centered: bool = False,
+) -> None:
     if area.width <= 0 or area.height <= 0:
         return
     with p._clipped(area):
@@ -47,7 +51,7 @@ class Badge(Control):
         "body", "neutral", "info", "success", "warning", "danger",
     )
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         style = resolve_style(self, self.tone, state="normal")
         width, height = host.measure(single_line(self.text), style.font_size,
                                      style.font_family == "mono")
@@ -55,7 +59,7 @@ class Badge(Control):
         dot_width = (14 if self.text else 7) if self.show_dot else 0
         return max(24, width + padding * 2 + dot_width), max(24, height + 8)
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         style = resolve_style(self, self.tone,
                               state="normal" if self.effective_enabled else "disabled")
         p.surface(Rect(0, 0, p.width, p.height), style)
@@ -107,28 +111,30 @@ class AlertBanner(Control):
         "body", "info", "success", "warning", "danger", "action", "close",
     )
 
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
         self._press = PressBehavior(keys=("Enter", "Space", "Escape"))
-        self._hot_part = self._armed_part = self._key_part = None
-        self._pointer_id = None
-        self._focus_part = "action" if self.action_text else "close"
+        self._hot_part: str | None = None
+        self._armed_part: str | None = None
+        self._key_part: str | None = None
+        self._pointer_id: int | None = None
+        self._focus_part: str | None = "action" if self.action_text else "close"
 
-    def _clear_interaction(self):
+    def _clear_interaction(self) -> None:
         self._press.reset(self)
         self._hot_part = self._armed_part = self._key_part = None
         self._pointer_id = None
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         self._clear_interaction()
         if self._focus_part not in self._targets():
             self._focus_part = next(iter(self._targets()), None)
         super()._changed(field, old, value)
 
-    def _targets(self):
+    def _targets(self) -> tuple[str, ...]:
         return (("action",) if self.action_text else ()) + (("close",) if self.dismissible else ())
 
-    def _action_width(self, host=None):
+    def _action_width(self, host: Host | None = None) -> float:
         if not self.action_text:
             return 0
         host = host or getattr(self._root(), "_layout_measure_host", None)
@@ -138,7 +144,7 @@ class AlertBanner(Control):
                  if host is not None else len(text) * style.font_size * 0.65)
         return min(200, max(48, width + 20))
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         style = resolve_style(self, self.tone, state="normal")
         width, height = host.measure(single_line(self.text), style.font_size,
                                      style.font_family == "mono")
@@ -146,12 +152,12 @@ class AlertBanner(Control):
             self.effective_theme.tokens.control_height + 12, height + 24,
         )
 
-    def _areas(self):
+    def _areas(self) -> dict[str, Rect]:
         width, height = self._rect.width, self._rect.height
         inset = min(10, width / 2, height / 2)
         inner = Rect(0, 0, width, height).inset(inset)
         right = inner.right
-        areas = {}
+        areas: dict[str, Rect] = {}
         if self.dismissible:
             edge = min(28, inner.width, inner.height)
             areas["close"] = Rect(right - edge, (height - edge) / 2, edge, edge)
@@ -170,7 +176,7 @@ class AlertBanner(Control):
         areas["text"] = Rect(left, inner.y, max(0, right - left), inner.height)
         return areas
 
-    def _hit_part(self, event):
+    def _hit_part(self, event: Input) -> str | None:
         if not self._rect.contains(event.x, event.y):
             return None
         for part, area in self._areas().items():
@@ -180,7 +186,7 @@ class AlertBanner(Control):
                 return part
         return None
 
-    def _check_action(self):
+    def _check_action(self) -> None:
         self._check_live()
         if self._dispatcher is None or self._dispatcher._stopped:
             raise LifecycleError("Alert actions require a running App")
@@ -198,7 +204,7 @@ class AlertBanner(Control):
             self.visible = False
             self.dismissed.emit(UiEvent(source=self, origin=self._origin))
 
-    def handle_input(self, event, /):
+    def handle_input(self, event: Input, /) -> bool | None:
         self._check_live()
         if not self.effective_enabled or not self.visible or event.kind == "blur":
             self._clear_interaction()
@@ -258,7 +264,7 @@ class AlertBanner(Control):
             self._clear_interaction()
             self.activate() if part == "action" else self.dismiss()
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         style = resolve_style(self, self.tone,
                               state="normal" if self.effective_enabled else "disabled")
         p.surface(Rect(0, 0, p.width, p.height), style)
@@ -289,7 +295,7 @@ class AlertBanner(Control):
                 p.icon("close", area.x + (area.width - edge) / 2,
                        area.y + (area.height - edge) / 2, size=edge, color=face.foreground)
 
-    def destroy(self):
+    def destroy(self) -> None:
         self._clear_interaction()
         super().destroy()
 
@@ -316,18 +322,23 @@ class Meter(Control):
     style_fallbacks: ClassVar[tuple[str, ...]] = ("ProgressBar",)
     style_parts: ClassVar[tuple[str, ...]] = ("body", "track", "fill", "warning", "danger")
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
-        values = {**self._values, name: value}
-        bounds = NumericRange(values["minimum"], values["maximum"])
-        if (not bounds.is_ordered(strict=True) or not bounds.contains(values["value"])
-                or not isfinite(values["maximum"] - values["minimum"])):
+        if name not in (
+            "minimum", "maximum", "value", "warning_at", "danger_at", "segments",
+        ):
+            return
+        pending = self._pending(name, value)
+        bounds = NumericRange(pending.number("minimum"), pending.number("maximum"))
+        if (not bounds.is_ordered(strict=True) or not bounds.contains(pending.number("value"))
+                or not isfinite(pending.number("maximum") - pending.number("minimum"))):
             raise ValueError("Meter requires minimum <= value <= maximum and a finite positive range")
-        warning, danger = values["warning_at"], values["danger_at"]
+        warning = pending.optional_number("warning_at")
+        danger = pending.optional_number("danger_at")
         if (any(threshold is not None and not bounds.contains(threshold) for threshold in (warning, danger))
                 or warning is not None and danger is not None and warning > danger):
             raise ValueError("Meter thresholds must be ordered and inside the range")
-        if values["segments"] > 100:
+        if pending.number("segments") > 100:
             raise ValueError("Meter supports at most 100 segments")
 
     def set_range(self, minimum: float, maximum: float, *, value: float | None = None) -> None:
@@ -343,10 +354,10 @@ class Meter(Control):
                     warning_at=bounds.clamp(self.warning_at) if self.warning_at is not None else None,
                     danger_at=bounds.clamp(self.danger_at) if self.danger_at is not None else None)
 
-    def _value_text(self):
+    def _value_text(self) -> str:
         return f"{self.value:g}{(' ' + self.unit) if self.unit else ''}"
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         style = resolve_style(self)
         width, height = host.measure(single_line(self.label), style.font_size,
                                      style.font_family == "mono")
@@ -355,7 +366,7 @@ class Meter(Control):
                                   style.font_family == "mono")[0] + 20
         return max(160, width), 14 + (height + 8 if self.label or self.show_value else 0)
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         style = p.style()
         label_height = min(style.font_size * 1.2 + 8, max(0, p.height - 8)) if self.label or self.show_value else 0
         if label_height and p.height >= style.font_size * 1.2 + 8:

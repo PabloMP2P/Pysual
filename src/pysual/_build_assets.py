@@ -1,10 +1,11 @@
 """Validate application assets without traversing filesystem redirects."""
 
 from pathlib import Path
+import os
 import stat
 
 
-def _checked_path(root: Path, path: Path):
+def _checked_path(root: Path, path: Path) -> tuple[os.stat_result, Path]:
     # Check every component: an explicitly included file can itself have a
     # junction/symlink parent. st_file_attributes works on Python 3.11 too.
     current = root
@@ -19,7 +20,7 @@ def _checked_path(root: Path, path: Path):
     return path.lstat(), resolved
 
 
-def include_files(root: Path, item, output: Path):
+def include_files(root: Path, item: str | Path, output: Path) -> tuple[Path, list[Path]]:
     """Return a validated include root and its regular files, in stable order.
 
     Inputs must remain unchanged while a build runs. This is a packaging
@@ -35,7 +36,8 @@ def include_files(root: Path, item, output: Path):
         # Compare canonical paths only after checking lexical redirect parents.
         if output == resolved or stat.S_ISDIR(info.st_mode) and output.is_relative_to(resolved):
             raise ValueError("The generated output cannot be inside an included path")
-        pending, files = [candidate], []
+        pending: list[Path] = [candidate]
+        files: list[Path] = []
         while pending:
             path = pending.pop()
             info, _ = _checked_path(root, path)

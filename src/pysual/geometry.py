@@ -1,3 +1,4 @@
+# pyright: reportUnusedCallResult=true, reportImplicitOverride=true, reportPrivateUsage=true, reportUnnecessaryIsInstance=true, reportUnnecessaryComparison=true, reportUnnecessaryCast=true, reportUnusedFunction=true
 """Immutable logical geometry shared by layout, input, and adapters."""
 
 from dataclasses import dataclass
@@ -11,17 +12,17 @@ class Rect:
     height: float = 0
 
     @property
-    def right(self):
+    def right(self) -> float:
         return self.x + self.width
 
     @property
-    def bottom(self):
+    def bottom(self) -> float:
         return self.y + self.height
 
-    def contains(self, x, y):
+    def contains(self, x: float, y: float) -> bool:
         return self.x <= x < self.right and self.y <= y < self.bottom
 
-    def inset(self, amount):
+    def inset(self, amount: float) -> "Rect":
         return Rect(
             self.x + amount,
             self.y + amount,
@@ -29,7 +30,7 @@ class Rect:
             max(0, self.height - amount * 2),
         )
 
-    def intersect(self, other):
+    def intersect(self, other: "Rect") -> "Rect":
         x, y = max(self.x, other.x), max(self.y, other.y)
         return Rect(
             x,

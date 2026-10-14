@@ -23,6 +23,7 @@ from pathlib import Path
 import random
 import sys
 from time import perf_counter
+from typing import Any
 
 from pysual import (
     App, Button, CapabilityError, ChartSeries, ChartSlice, CheckBox, ColorPicker,
@@ -31,6 +32,7 @@ from pysual import (
     RadioButton, Separator, Slider, TextBox, Toggle, TreeNode, TreeView,
     get_theme, image_source, theme_names,
 )
+from pysual.host import Host, configure_rendering, read_native_stats
 
 
 PRESETS = {"small": 100, "medium": 500, "large": 2000, "extreme": 5000}
@@ -177,7 +179,7 @@ class Measurements:
     def summary(self, now, frames, native=None):
         elapsed = max(0.0, now - self.started_at)
         updates = max(0, frames - self.start_frames)
-        result = {
+        result: dict[str, Any] = {
             "elapsed_seconds": elapsed,
             "scene_submissions": updates,
             "scene_submissions_per_second": updates / elapsed if elapsed else 0.0,
@@ -229,9 +231,14 @@ class Measurements:
                 "vsync": native.get("vsync"),
             }
         result["full_cycle_fps"] = result["scene_submissions_per_second"]
-        presented = (result["native"] or {}).get("counters", {}).get("frames")
-        if presented is not None:
-            result["backend_fps"] = presented["per_second"]
+        native_summary = result["native"]
+        frames = None
+        if isinstance(native_summary, dict):
+            counters = native_summary.get("counters")
+            if isinstance(counters, dict):
+                frames = counters.get("frames")
+        if isinstance(frames, dict):
+            result["backend_fps"] = frames["per_second"]
             result["backend_fps_source"] = "native_presentations"
         else:
             result["backend_fps"] = result["full_cycle_fps"]
@@ -240,6 +247,29 @@ class Measurements:
 
 
 class StressTest(App):
+    # Editors are attached by name in build(); the declarations keep those
+    # setattr targets visible to type checkers.
+    preset_choice: Dropdown
+    count_input: NumericInput
+    mix_choice: Dropdown
+    workload_choice: Dropdown
+    fraction_input: NumericInput
+    rate_input: NumericInput
+    seed_input: NumericInput
+    theme_choice: Dropdown
+    limit_input: NumericInput
+    redraw_choice: Dropdown
+    interval_input: NumericInput
+    cache_input: NumericInput
+    body_cache: CheckBox
+    full_loop: CheckBox
+    vsync: CheckBox
+    telemetry: CheckBox
+    pause_button: Button
+    reset_button: Button
+    sample_button: Button
+    export_button: Button
+
     def __init__(self, config=None, **properties):
         super().__init__(**properties)
         self._configuration = config or StressConfig()
@@ -248,8 +278,8 @@ class StressTest(App):
         self._running = True
         self._measurements = None
         self._final_report = None
-        self._host = None
-        self._idle_event = None
+        self._host: Host | None = None
+        self._idle_event: asyncio.Event | None = None
         self._export_busy = False
 
     @property
@@ -391,8 +421,13 @@ class StressTest(App):
             if self._configuration.telemetry:
                 self._tasks.append(self.create_task(self._live_metrics()))
         if self.vsync.enabled and self._configuration.vsync is not None:
-            self._host.configure_rendering(redraw_interval=self.redraw_interval, fps_limit=self.fps_limit,
-                                           reduce_motion=self.reduce_motion, vsync=self._configuration.vsync)
+            configure_rendering(
+                self._host,
+                redraw_interval=self.redraw_interval,
+                fps_limit=self.fps_limit,
+                reduce_motion=self.reduce_motion,
+                vsync=self._configuration.vsync,
+            )
 
     def step_workload(self):
         """Run one deterministic mutation tick; return the touched control indices."""
@@ -443,9 +478,10 @@ class StressTest(App):
         return chosen
 
     def _native_snapshot(self):
-        if self._host is not None and getattr(self._host, "native_retained", False):
-            return self._host.native_stats()
-        return None
+        host = self._host
+        if host is None:
+            return None
+        return read_native_stats(host)
 
     async def _measurement_clock(self):
         async def wait_seconds(seconds):
@@ -485,7 +521,10 @@ class StressTest(App):
                 previous_frame = submitted
                 self.request_frame()
             if not dynamic and not cfg.full_loop:
-                await self._idle_event.wait()  # Idle means no polling timer.
+                idle = self._idle_event
+                if idle is None:
+                    raise RuntimeError("Stress lab is idle without an idle event")
+                await idle.wait()  # Idle means no polling timer.
             elif cfg.full_loop:
                 delay = max(cfg.redraw or 0, 1 / cfg.fps_limit if cfg.fps_limit else 0)
                 await asyncio.sleep(min(delay, max(0, next_mutation - perf_counter())) if dynamic else delay)
@@ -509,7 +548,7 @@ class StressTest(App):
         if measured is not None:
             measured.collect(self.drain_frame_timings())
         is_native = native is not None
-        return {
+        report: dict[str, Any] = {
             "format": "pysual-stress-1",
             "configuration": asdict(self._configuration),
             "reduce_motion": self.reduce_motion,
@@ -549,6 +588,7 @@ class StressTest(App):
                 "Mutation ticks may coalesce into fewer scene submissions. Dense cells are not necessarily readable, especially in a terminal.",
             ],
         }
+        return report
 
     def _show_fps(self, measurements):
         self.fps_readout.text = format_fps_readout(self._configuration.controls, measurements)
@@ -570,7 +610,10 @@ class StressTest(App):
     def StressTest_on_loaded(self, event):
         # Only the stress lab's detailed native timing/resource probes and VSync
         # control need the host adapter. Counts/identity use public diagnostics.
-        self._host = self._runtime.host
+        runtime = self._runtime
+        if runtime is None:
+            raise RuntimeError("Stress lab loaded without a runtime")
+        self._host = runtime.host
         self.vsync.enabled = self.diagnostics().backend == "window"
         if self.vsync.enabled and self._configuration.vsync is None:
             self.vsync.checked = bool((self._native_snapshot() or {}).get("vsync", False))
@@ -662,7 +705,7 @@ class StressTest(App):
 def main(argv=None):
     if argv is not None:
         sys.argv = [sys.argv[0], *argv]
-    from pysual import autoconfig  # Explicit CLI/env opt-in, before any UI objects.
+    from pysual import autoconfig as autoconfig  # Explicit CLI/env opt-in, before any UI objects.
 
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--preset", choices=PRESETS, default="large", help="Control-count preset (default: large)")

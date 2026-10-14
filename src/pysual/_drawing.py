@@ -4,15 +4,21 @@ from functools import lru_cache
 from math import ceil, floor
 
 from .geometry import Rect
+from .host import Host
 
 
 @lru_cache(maxsize=2048)
-def mix_colors(first, second, fraction):
-    def channels(color):
+def mix_colors(first: str, second: str, fraction: float) -> str:
+    def channels(color: str) -> tuple[int, int, int, int]:
         color = color[1:]
         if len(color) == 6:
             color += "ff"
-        return tuple(int(color[i : i + 2], 16) for i in range(0, 8, 2))
+        return (
+            int(color[0:2], 16),
+            int(color[2:4], 16),
+            int(color[4:6], 16),
+            int(color[6:8], 16),
+        )
 
     return "#" + "".join(
         f"{round(a + (b - a) * fraction):02x}"
@@ -20,7 +26,16 @@ def mix_colors(first, second, fraction):
     )
 
 
-def gradient_fallback(host, rect, first, last, axis, radius, border_width, clip):
+def gradient_fallback(
+    host: Host,
+    rect: Rect,
+    first: str,
+    last: str,
+    axis: str,
+    radius: float,
+    border_width: float,
+    clip: Rect | None,
+) -> None:
     """Paint bounded device-aligned bands in host coordinates, restoring clip."""
     scale = getattr(host, "render_scale", 1)
     horizontal = axis == "horizontal"

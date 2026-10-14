@@ -2,33 +2,40 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import ClassVar, Literal
 
 from .controls import Button, Container, Label
 from .events import ChangeEvent, Event, UiEvent
 from .geometry import Rect
-from .schema import Dirty, prop
+from .schema import Dirty, Field, expect_text, prop
 from .text import TextBox
+from .host import Host, Input
+from .painting import Painter
 
 
 class _SearchIcon(Label):
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         return 28, self._control_height(host)
 
-    def paint(self, painter, /):
+    def paint(self, painter: Painter, /) -> None:
         size = min(18, painter.width, painter.height)
         painter.icon(
             "search", (painter.width - size) / 2, (painter.height - size) / 2,
             size=size, color=painter.theme.tokens.muted,
         )
 
-    def handle_input(self, event, /):
-        if event.kind == "pointer_down" and event.button == 1 and self.effective_enabled:
-            self.parent.focus()
+    def handle_input(self, event: Input, /) -> bool | None:
+        parent = self.parent
+        if (
+            event.kind == "pointer_down" and event.button == 1
+            and self.effective_enabled and parent is not None
+        ):
+            parent.focus()
 
 
 class _SearchEntry(TextBox):
-    def paint(self, painter, /):
+    def paint(self, painter: Painter, /) -> None:
         # The owner supplies one continuous field surface. Keep TextBox's
         # selection, caret, composition and horizontal scrolling machinery.
         self._measure_host = painter.host
@@ -36,24 +43,24 @@ class _SearchEntry(TextBox):
         with painter._clipped(self._text_viewport()):
             self._paint_text(painter, painter.style(), self._text_viewport())
 
-    def paint_focus(self, painter, /):
+    def paint_focus(self, painter: Painter, /) -> None:
         # SearchField paints the shared outline, including the search icon.
         pass
 
-    def _validate_live_update(self, name, value):
+    def _validate_live_update(self, name: str, value: object) -> None:
         super()._validate_live_update(name, value)
         owner = self._parent
         if name == "text" and isinstance(owner, SearchField) and not owner._syncing:
             # Validate before TextBox commits its text, selection or history.
             owner._validate_candidate({"text": value})
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         super()._changed(field, old, value)
         owner = self._parent
         if field.name == "text" and isinstance(owner, SearchField) and not owner._syncing:
             owner._accept_text(value, self._origin)
 
-    def handle_input(self, event, /):
+    def handle_input(self, event: Input, /) -> bool | None:
         super().handle_input(event)
         owner = self._parent
         if event.kind in ("focus", "blur") and isinstance(owner, SearchField):
@@ -69,7 +76,7 @@ class _ClearButton(Button):
     style_excludes: ClassVar[tuple[str, ...]] = ("Button",)
     style_fallbacks: ClassVar[tuple[str, ...]] = ("TextBox",)
 
-    def paint(self, painter, /):
+    def paint(self, painter: Painter, /) -> None:
         owner = self._parent
         if not isinstance(owner, SearchField) or not owner.text:
             return
@@ -81,7 +88,7 @@ class _ClearButton(Button):
         painter.icon("close", (painter.width - size) / 2, (painter.height - size) / 2,
                      size=size, color=painter.theme.tokens.muted)
 
-    def activate(self):
+    def activate(self) -> None:
         self._check_activation()
         owner = self._parent
         if self.effective_enabled and isinstance(owner, SearchField):
@@ -116,18 +123,18 @@ class SearchField(Container):
     changed: ClassVar[Event[ChangeEvent[str]]] = Event(ChangeEvent)
     submitted: ClassVar[Event[UiEvent]] = Event(UiEvent)
 
-    def __setattr__(self, name, value):
+    def __setattr__(self, name: str, value: object) -> None:
         if name == "text" and isinstance(value, str):
             value = TextBox._normalize_text(value, False)
         super().__setattr__(name, value)
 
-    def _prepare_update(self, values):
+    def _prepare_update(self, values: Mapping[str, object]) -> Mapping[str, object]:
         values = super()._prepare_update(values)
         if "text" in values and isinstance(values["text"], str):
             return {**values, "text": TextBox._normalize_text(values["text"], False)}
         return values
 
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
         self._values["text"] = TextBox._normalize_text(self.text, False)
         self._syncing = False
@@ -141,16 +148,16 @@ class SearchField(Container):
             enabled=bool(self.text) and not self.read_only,
         )
 
-    def paint(self, painter, /):
+    def paint(self, painter: Painter, /) -> None:
         style = painter.body()
         if self.entry.focused:
             painter.focus_ring(painter.theme.tokens.accent, style.radius or 0)
 
-    def handle_input(self, event, /):
+    def handle_input(self, event: Input, /) -> bool | None:
         if event.kind == "pointer_down" and event.button == 1 and self.effective_enabled:
             self.focus()
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         if field.name in ("text", "placeholder", "read_only"):
             self._syncing = True
             origin = self.entry._origin
@@ -169,15 +176,17 @@ class SearchField(Container):
                 self._syncing = False
         super()._changed(field, old, value)
 
-    def _accept_text(self, text, origin):
+    def _accept_text(
+        self, text: object, origin: Literal["user", "program", "system"]
+    ) -> None:
         previous = self._origin
         self._origin = origin
         try:
-            self.text = text
+            self.text = expect_text(text)
         finally:
             self._origin = previous
 
-    def _clear(self, origin):
+    def _clear(self, origin: Literal["user", "program", "system"]) -> None:
         if not self.effective_enabled or self.read_only:
             return
         previous = self.entry._origin

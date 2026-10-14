@@ -75,6 +75,37 @@ class CaptionFittingTests(unittest.TestCase):
                                         for count, size in host.batches), host.batches)
                     self.assertLess(host.characters, len(source) * 80)
 
+    def test_explicit_face_skips_body_style(self):
+        class FaceHost:
+            def text(self, text, x, y, color, size, mono=False):
+                self.drawn = (text, x, y, color, size, mono)
+
+            def measure(self, text, size, mono=False):
+                return float(len(text)), float(size)
+
+        area = Rect(0, 0, 100, 30)
+        control = type("Stub", (), {"_clip": area})()
+        painter = Painter(FaceHost(), area, dark(), control)
+        calls = 0
+
+        def style(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return dark().tokens
+
+        painter.style = style
+        painter.text("Caption", 4, 6, color="#112233", size=14, font_family="ui")
+        self.assertEqual(calls, 0)
+        self.assertEqual(painter.host.drawn, ("Caption", 4, 6, "#112233", 14, False))
+        painter.measure("Caption", size=14, font_family="mono")
+        painter.elide("Hi", 100, size=14, font_family="ui")
+        self.assertEqual(calls, 0)
+        with self.assertRaises(ValueError):
+            painter.text("Caption", 0, 0, color="#112233", size=14, font_family="serif")
+        self.assertEqual(calls, 0)
+        painter.text("Caption", 0, 0, size=14, font_family="ui")
+        self.assertEqual(calls, 1)
+
     def test_nonpositive_width_skips_metrics_but_keeps_font_validation(self):
         for batched in (False, True):
             host = BatchCaptionHost()

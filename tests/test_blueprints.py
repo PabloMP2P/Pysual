@@ -3,10 +3,10 @@
 import asyncio
 from dataclasses import FrozenInstanceError
 import unittest
-from _ui_testcase import AsyncUIOwnerTestCase
+from _ui_testcase import AsyncUIOwnerTestCase, UIOwnerTestCase
 
 from pysual import App, Button, Container, Label, prop
-from pysual.controls import blueprint
+from pysual.controls import _blueprint_order, blueprint
 from pysual.errors import BindingError, LifecycleError
 from pysual.runtime import Runtime
 from test_library import RecordingHost, eventually
@@ -173,6 +173,60 @@ class BlueprintDataTests(unittest.TestCase):
             self.assertTrue(instance.inspect().control_type.endswith(".Composite"))
         finally:
             app.destroy()
+
+
+class BlueprintOrderingTests(UIOwnerTestCase):
+    def test_long_forward_parent_chain_plans_in_dependency_order(self):
+        count = 1100
+        declarations = {
+            f"level_{index}": blueprint(Container).under(f"level_{index + 1}")
+            for index in range(count - 1)
+        }
+        declarations[f"level_{count - 1}"] = blueprint(Container)
+        self.assertEqual(
+            _blueprint_order(declarations),
+            [f"level_{index}" for index in reversed(range(count))],
+        )
+
+    def test_forward_parent_chain_materializes_in_dependency_order(self):
+        count = 32
+        declarations = {
+            f"level_{index}": blueprint(Container).under(f"level_{index + 1}")
+            for index in range(count - 1)
+        }
+        declarations[f"level_{count - 1}"] = blueprint(Container)
+        form = type("DeepForm", (Container,), declarations)()
+        try:
+            self.assertEqual(len(form._bindings), count)
+            self.assertEqual(form.children[0].name, f"level_{count - 1}")
+            for index in range(count - 1):
+                self.assertIs(
+                    form._bindings[f"level_{index}"].parent,
+                    form._bindings[f"level_{index + 1}"],
+                )
+        finally:
+            # Dispose leaves first so this test isolates dependency planning.
+            for child in reversed(tuple(form._bindings.values())):
+                child.destroy()
+            form.destroy()
+
+    def test_long_parent_cycle_fails_before_any_child_allocation(self):
+        allocated = []
+
+        class Observed(Container):
+            def _initialize(self):
+                super()._initialize()
+                allocated.append(self)
+
+        count = 1100
+        declarations = {
+            f"level_{index}": blueprint(Observed).under(f"level_{(index + 1) % count}")
+            for index in range(count)
+        }
+        form_type = type("DeepCycle", (Container,), declarations)
+        with self.assertRaisesRegex(BindingError, "cycle"):
+            form_type()
+        self.assertEqual(allocated, [])
 
 
 class BlueprintRuntimeTests(AsyncUIOwnerTestCase):

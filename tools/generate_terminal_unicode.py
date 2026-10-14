@@ -136,7 +136,7 @@ def render_python():
         f"Unicode {TERMINAL_VERSION} category and width data, shared with native/pt_unicode.h.",
         'Copyright Unicode, Inc. See assets/UNICODE-LICENSE.txt."""',
         "", f'UNICODE_VERSION = "{TERMINAL_VERSION}"',
-        "CONTROL, SURROGATE, COMBINING, WIDE = 1, 2, 4, 8", "", "STARTS = (",
+        "CONTROL, SURROGATE, COMBINING, WIDE = 1, 2, 4, 8", "", "STARTS: tuple[int, ...] = (",
     ]
     for start in range(0, len(starts), 12):
         lines.append("    " + ", ".join(f"0x{code:X}" for code in starts[start:start + 12]) + ",")

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import ClassVar
 
 from ._text_display import single_line
@@ -16,10 +16,11 @@ from .commands import (
 from .controls import Control
 from .events import Event
 from .geometry import Rect
-from .painting import resolve_style
+from .painting import resolve_style, Painter
 from .popup import Popup
-from .schema import Dirty, prop
+from .schema import Dirty, Field, _records, prop
 from .widgets import ListView
+from .host import Host, Input
 
 
 class _MenuRows(ListView):
@@ -34,7 +35,7 @@ class _MenuRows(ListView):
         ("row", "separator", "track", "thumb")
     )
 
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
         self._entries: tuple[MenuItem, ...] = ()
         self._commit: Callable[[MenuItem], None] | None = None
@@ -43,14 +44,14 @@ class _MenuRows(ListView):
         self._scrolled: Callable[[], None] | None = None
         self._down = -1
 
-    def _enabled(self, index):
+    def _enabled(self, index: int) -> bool:
         return (
             0 <= index < len(self._entries)
             and self._entries[index].enabled
             and not self._entries[index].separator
         )
 
-    def handle_input(self, e, /):
+    def handle_input(self, e: Input, /) -> bool | None:
         scrollbar = self._scrollbar()
         if (
             e.kind in ("wheel", "blur", "pointer_cancel")
@@ -127,7 +128,7 @@ class _MenuRows(ListView):
             if previous != self.selected_index and self._hover_item is not None:
                 self._hover_item(self._entries[self.selected_index])
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         p.body()
         self._clamp_scroll()
         scrollbar = self._scrollbar()
@@ -146,7 +147,7 @@ class _MenuRows(ListView):
                     p.style(part),
                 )
 
-    def _paint_entries(self, p, width):
+    def _paint_entries(self, p: Painter, width: float) -> None:
         row_height = self._row_height()
         fixed_height = self.effective_row_height(0)
         for index in range(
@@ -226,19 +227,19 @@ class _MenuRows(ListView):
 class _CascadePopup(Popup):
     """Cascades are ordinary sibling rows inside the one active popup subtree."""
 
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
         self._levels: list[_MenuRows] = []
         self._command_owner: Menu | MenuBar | None = None
         self._group_switch: Callable[[int], None] | None = None
         self._group_select: Callable[[int], None] | None = None
 
-    def _trim(self, keep):
+    def _trim(self, keep: int) -> None:
         for rows in self._levels[keep:]:
             rows.destroy()
         del self._levels[keep:]
 
-    def handle_owner_input(self, event) -> bool:
+    def handle_owner_input(self, event: Input) -> bool:
         """Route active menu headers without opening the rest of the popup scope."""
         owner, runtime = self._command_owner, self._session
         if (
@@ -260,13 +261,13 @@ class _CascadePopup(Popup):
             owner._origin = origin
         return True
 
-    def dismiss(self, *, restore_focus=True):
+    def dismiss(self, *, restore_focus: bool = True) -> None:
         owner = self._command_owner
         super().dismiss(restore_focus=restore_focus)
         if owner is not None and not owner._disposed:
             owner.invalidate()
 
-    def _level(self, items):
+    def _level(self, items: tuple[MenuItem, ...]) -> _MenuRows:
         rows = self.add(
             _MenuRows(items=tuple(item.text for item in items), row_height=30)
         )
@@ -277,7 +278,7 @@ class _CascadePopup(Popup):
         self._levels.append(rows)
         level = len(self._levels) - 1
 
-        def choose(item, *, focus=True):
+        def choose(item: MenuItem, *, focus: bool = True) -> None:
             if level == 0 and self._group_select is not None:
                 self._group_select(rows._entries.index(item))
             unchanged = (
@@ -313,7 +314,7 @@ class _CascadePopup(Popup):
                 return
             self.invalidate(Dirty.MEASURE | Dirty.PAINT | Dirty.HIT_TEST)
 
-        def switch(delta):
+        def switch(delta: int) -> None:
             if (
                 delta > 0
                 and rows._enabled(rows.selected_index)
@@ -327,7 +328,7 @@ class _CascadePopup(Popup):
             elif self._group_switch is not None:
                 self._group_switch(delta)
 
-        def scrolled():
+        def scrolled() -> None:
             if len(self._levels) <= level + 1:
                 return
             runtime = self._session
@@ -354,7 +355,7 @@ class _CascadePopup(Popup):
         self.reposition()
         return True
 
-    def reposition(self):
+    def reposition(self) -> None:
         runtime = self._session
         if runtime is None or not self._levels:
             return
@@ -414,7 +415,13 @@ class _CascadePopup(Popup):
             children.append(self)
 
 
-def _show(owner, items, anchor, at=None, switch=None):
+def _show(
+    owner: Menu | MenuBar,
+    items: tuple[MenuItem, ...],
+    anchor: Control,
+    at: tuple[float, float] | None = None,
+    switch: Callable[[int], None] | None = None,
+) -> None:
     previous = getattr(owner, "_popup", None)
     if previous is not None and previous.is_open:
         previous.dismiss()
@@ -434,7 +441,7 @@ def _show(owner, items, anchor, at=None, switch=None):
         raise
 
 
-def _shortcut(owner, items, shortcut):
+def _shortcut(owner: Menu | MenuBar, items: Iterable[MenuItem], shortcut: str) -> bool:
     for item in items:
         if item.enabled and item.children and _shortcut(owner, item.children, shortcut):
             return True
@@ -458,12 +465,12 @@ class Menu(Control):
     command: ClassVar[Event[CommandEvent]] = Event(CommandEvent)
     _overlay: ClassVar[bool] = True
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
         if name == "items":
             validate_items(value)
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         if field.name == "items":
             popup = getattr(self, "_popup", None)
             if popup is not None and popup.is_open:
@@ -480,7 +487,7 @@ class Menu(Control):
     def invoke_shortcut(self, shortcut: str) -> bool:
         return _shortcut(self, self.items, shortcut)
 
-    def destroy(self):
+    def destroy(self) -> None:
         popup = getattr(self, "_popup", None)
         if popup is not None and popup.is_open:
             popup.dismiss(restore_focus=False)
@@ -494,20 +501,22 @@ class MenuBar(Control):
     command: ClassVar[Event[CommandEvent]] = Event(CommandEvent)
     style_parts: ClassVar[tuple[str, ...]] = ("body", "item")
 
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
-        self._headers = []
+        self._headers: list[Rect] = []
         self._active_group = 0
         self._overflow_start = 0
         self._overflow_rect = Rect(0, 0, 0, 0)
         self._overflow_open = False
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
         if name == "groups":
-            validate_items(item for group in value for item in group.items)
+            validate_items(
+                item for group in _records(value, MenuGroup) for item in group.items
+            )
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         if field.name == "groups":
             popup = getattr(self, "_popup", None)
             if popup is not None and popup.is_open:
@@ -515,10 +524,10 @@ class MenuBar(Control):
             self._active_group = 0
         super()._changed(field, old, value)
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         return 400, self._control_height(host)
 
-    def _open(self, index):
+    def _open(self, index: int) -> None:
         if not self.groups:
             return
         self._active_group = index % len(self.groups)
@@ -531,7 +540,7 @@ class MenuBar(Control):
         )
         self.invalidate()
 
-    def _open_overflow(self):
+    def _open_overflow(self) -> None:
         items = tuple(
             MenuItem(f"overflow_{index}", group.text, enabled=bool(group.items),
                      children=group.items)
@@ -545,7 +554,7 @@ class MenuBar(Control):
         if popup is not None and popup.is_open:
             start = self._overflow_start
 
-            def select_group(index):
+            def select_group(index: int) -> None:
                 self._active_group = start + index
                 self.invalidate()
 
@@ -564,7 +573,7 @@ class MenuBar(Control):
             return True
         return False
 
-    def handle_input(self, e, /):
+    def handle_input(self, e: Input, /) -> bool | None:
         popup = getattr(self, "_popup", None)
         opened = popup is not None and popup.is_open
         if e.kind in ("focus", "blur"):
@@ -597,7 +606,7 @@ class MenuBar(Control):
                 ) % len(self.groups)
                 self.invalidate()
 
-    def _layout_headers(self, host):
+    def _layout_headers(self, host: Host) -> None:
         self._headers = [Rect(0, 0, 0, 0) for _ in self.groups]
         popup = getattr(self, "_popup", None)
         active = self.focused or (popup is not None and popup.is_open)
@@ -623,13 +632,13 @@ class MenuBar(Control):
             self._overflow_rect = Rect(self.bounds.x + x, self.bounds.y,
                                        overflow_width, self.bounds.height)
 
-    def _popup_x(self, host):
+    def _popup_x(self, host: Host) -> float:
         self._layout_headers(host)
         if not self._overflow_open and self._active_group < self._overflow_start:
             return self._headers[self._active_group].x
         return self._overflow_rect.x if self._overflow_rect.width else self.bounds.x
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         p.body()
         self._layout_headers(p.host)
         popup = getattr(self, "_popup", None)
@@ -666,7 +675,7 @@ class MenuBar(Control):
                    (p.height - label_height) / 2, color=style.foreground,
                    size=style.font_size, font_family=style.font_family)
 
-    def destroy(self):
+    def destroy(self) -> None:
         popup = getattr(self, "_popup", None)
         if popup is not None and popup.is_open:
             popup.dismiss(restore_focus=False)

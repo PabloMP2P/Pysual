@@ -354,7 +354,8 @@ class ThemeGallery(App):
         available = max(0, width - self.padding * 2)
         self.dialog.width = min(390, max(1, available - 16))
         self.dialog.left = max(0, (available - self.dialog.width) / 2)
-        self.dialog.top = max(0, min(160, (self.height or 800) - self.padding * 2 - self.dialog.height))
+        dialog_height = self.dialog.height or 0
+        self.dialog.top = max(0, min(160, (self.height or 800) - self.padding * 2 - dialog_height))
 
     def dialog_button_on_click(self, event):
         self._show_dialog()
@@ -397,7 +398,7 @@ class ThemeGallery(App):
 
 if __name__ == "__main__":
     from argparse import ArgumentParser
-    from pysual import autoconfig
+    from pysual import autoconfig as autoconfig
 
     ArgumentParser(description=__doc__).parse_args()
     ThemeGallery().run_blocking()

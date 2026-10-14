@@ -6,12 +6,14 @@ module owns only drawing, bundled-font metrics and portable scene snapshots.
 
 import base64
 from collections import OrderedDict
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
 from html import escape
 from importlib.resources import files
 from math import ceil, floor
 from pathlib import Path
+from typing import Literal, NotRequired, TypedDict, cast
 
 from ..geometry import Rect
 from ..host import Viewport
@@ -20,8 +22,38 @@ from . import _font
 from ._gradient import gradient_colors
 
 
-def _node(tag, attrs=None, children=(), text=None):
-    result = {"tag": tag, "attrs": {k: str(v) for k, v in (attrs or {}).items()}}
+class _SvgNode(TypedDict):
+    tag: str
+    attrs: dict[str, str]
+    children: NotRequired[list["_SvgNode"]]
+    text: NotRequired[str]
+
+
+class _FramePacket(TypedDict):
+    revision: int
+    reset: bool
+    length: int
+    updates: list[list[object]]
+    definitions: list[object]
+    remove_definitions: list[str]
+    image_sources: dict[str, str]
+    remove_images: list[str]
+    width: float
+    height: float
+    title: str
+    text_input: list[float] | None
+
+
+def _node(
+    tag: str,
+    attrs: Mapping[str, object] | None = None,
+    children: Iterable[_SvgNode] = (),
+    text: object = None,
+) -> _SvgNode:
+    result: _SvgNode = {
+        "tag": tag,
+        "attrs": {str(key): str(value) for key, value in (attrs or {}).items()},
+    }
     if children:
         result["children"] = list(children)
     if text is not None:
@@ -29,7 +61,7 @@ def _node(tag, attrs=None, children=(), text=None):
     return result
 
 
-def _xml(node):
+def _xml(node: _SvgNode) -> str:
     attributes = "".join(
         f' {key}="{escape(value, quote=True)}"' for key, value in node["attrs"].items()
     )
@@ -39,7 +71,7 @@ def _xml(node):
     return f"<{node['tag']}{attributes}>{content}</{node['tag']}>"
 
 
-def _rect_attrs(rect):
+def _rect_attrs(rect: Rect) -> dict[str, float]:
     return {
         "x": rect.x,
         "y": rect.y,
@@ -48,10 +80,10 @@ def _rect_attrs(rect):
     }
 
 
-def _image_sources(node):
+def _image_sources(node: _SvgNode) -> dict[str, str]:
     """Collect one immutable paint group's embedded image dependencies."""
-    images = {}
-    pending = [node]
+    images: dict[str, str] = {}
+    pending: list[_SvgNode] = [node]
     while pending:
         current = pending.pop()
         attrs = current["attrs"]
@@ -62,10 +94,10 @@ def _image_sources(node):
 
 
 @lru_cache(maxsize=64)
-def _gradient_stops(first, last, span):
+def _gradient_stops(first: str, last: str, span: int) -> tuple[_SvgNode, ...]:
     """Reuse exact device-aligned stops; published nodes are never mutated."""
     count = min(96, span)
-    stops = []
+    stops: list[_SvgNode] = []
     for index, color in enumerate(gradient_colors(first, last, count)):
         color = "#" + "".join(f"{value:02x}" for value in color)
         for edge in (index, index + 1):
@@ -76,12 +108,20 @@ def _gradient_stops(first, last, span):
     return tuple(stops)
 
 
+def _svg_nodes() -> list[_SvgNode]:
+    return []
+
+
+def _svg_gradients() -> dict[str, _SvgNode]:
+    return {}
+
+
 @dataclass(eq=False)
 class _Surface:
     serial: int
     rect: Rect
-    nodes: list = field(default_factory=list)
-    gradients: dict = field(default_factory=dict)
+    nodes: list[_SvgNode] = field(default_factory=_svg_nodes)
+    gradients: dict[str, _SvgNode] = field(default_factory=_svg_gradients)
     released: bool = False
 
 
@@ -91,8 +131,8 @@ class _FrameSnapshot:
 
     epoch: object
     revision: int
-    nodes: tuple
-    images: dict
+    nodes: tuple[_SvgNode, ...]
+    images: dict[str, str]
 
 
 class SVGRenderer:
@@ -101,48 +141,55 @@ class SVGRenderer:
     _error_prefix = "web"
     backend = "web"
 
-    def __init__(self):
-        self.size = (960.0, 640.0)
+    def __init__(self) -> None:
+        self.size: tuple[float, float] = (960.0, 640.0)
         self._viewport = Viewport(*self.size)
-        self._nodes = []
-        self._frame_gradients = {}
-        self._frames = OrderedDict()
-        self._frame_epoch = object()
-        self._frame_image_sources = {}
-        self._node_image_sources = {}
+        self._nodes: list[_SvgNode] = []
+        self._frame_gradients: dict[str, _SvgNode] = {}
+        self._frames: OrderedDict[int, tuple[_SvgNode, ...]] = OrderedDict()
+        self._frame_epoch: object = object()
+        self._frame_image_sources: dict[int, dict[str, str]] = {}
+        self._node_image_sources: dict[int, tuple[_SvgNode, dict[str, str]]] = {}
         self._revision = 0
         self._resource_revision = 0
         self._surface_serial = 0
-        self._surfaces = set()
-        self._target = None
-        self._saved_target = None
-        self._clip = None
-        self._clip_group = None
+        self._surfaces: set[_Surface] = set()
+        self._target: _Surface | None = None
+        self._saved_target: tuple[Rect | None, int, _SvgNode | None] | None = None
+        self._clip: Rect | None = None
+        self._clip_group: _SvgNode | None = None
         self._serial = 0
-        self._paint_group = None
-        self._saved_group = None
+        self._paint_group: _SvgNode | None = None
+        self._saved_group: tuple[Rect | None, int] | None = None
         self._group_serial = 0
-        self._segments = {}
-        self._segment_ids = {}
-        self._segment_order = []
+        self._segments: dict[str, tuple[_SvgNode, dict[str, _SvgNode]]] = {}
+        self._segment_ids: dict[str, int] = {}
+        self._segment_order: list[str] = []
         self._segment_open = False
-        self._segment_id = None
+        self._segment_id: str | None = None
         self._segment_serial = 0
         self._scene_recording = False
-        self._saved_recording = None
-        self._segment_background = None
-        self._background_node = None
-        self._background_key = None
-        self._images = OrderedDict()
+        self._saved_recording: tuple[
+            list[_SvgNode],
+            dict[str, _SvgNode],
+            Rect | None,
+            int,
+            _SvgNode | None,
+            _SvgNode | None,
+        ] | None = None
+        self._segment_background: str | None = None
+        self._background_node: _SvgNode | None = None
+        self._background_key: tuple[object, float, float] | None = None
+        self._images: OrderedDict[str, tuple[str, int]] = OrderedDict()
         self._image_serial = 0
-        self._image_labels = OrderedDict()
+        self._image_labels: OrderedDict[int, tuple[str, int]] = OrderedDict()
         self._image_bytes = 0
-        self._image_errors = set()
+        self._image_errors: set[tuple[int, str]] = set()
         self._title = "Pysual"
-        self._text_rect = None
-        self._metadata_revision = 0
+        self._text_rect: list[float] | None = None
+        self._metadata_revision: int = 0
 
-    def reset_scene(self, title, width, height):
+    def reset_scene(self, title: object, width: float, height: float) -> None:
         """Start a fresh opening, invalidating resources from the previous one."""
         viewport = Viewport(width, height)
         self.close_scene()
@@ -162,7 +209,7 @@ class SVGRenderer:
         self._metadata_revision += 1
         self._resource_revision += 1
 
-    def close_scene(self):
+    def close_scene(self) -> None:
         """Release cached resources, retaining the last frame for snapshots."""
         self._target = None
         self._saved_target = None
@@ -189,45 +236,51 @@ class SVGRenderer:
         self._image_bytes = 0
 
     @property
-    def viewport(self):
+    def viewport(self) -> Viewport:
         return self._viewport
 
     @property
-    def render_scale(self):
+    def render_scale(self) -> float:
         return self._viewport.scale
 
     @property
-    def resource_revision(self):
+    def resource_revision(self) -> int:
         return self._resource_revision
 
-    def set_title(self, title):
+    def set_title(self, title: object) -> None:
         title = str(title)
         if title != self._title:
             self._title = title
             self._metadata_revision += 1
 
-    def text_input(self, rect):
+    def text_input(self, rect: Rect | None) -> None:
         value = [rect.x, rect.y, rect.width, rect.height] if rect is not None else None
         if value != self._text_rect:
             self._text_rect = value
             self._metadata_revision += 1
 
-    def _frame_snapshot(self):
+    def _frame_snapshot(self) -> _FrameSnapshot:
         return _FrameSnapshot(
             self._frame_epoch, self._revision,
             self._frames.get(self._revision, ()),
             self._frame_image_sources.get(self._revision, {}),
         )
 
-    def frame_packet(self, revision, *, _base=None):
+    def frame_packet(
+        self, revision: int, *, _base: _FrameSnapshot | None = None
+    ) -> _FramePacket:
         """Send changed paint groups and independently retained resources."""
         if _base is not None and _base.epoch is not self._frame_epoch:
             # Revision numbers restart on opening. A previous opening's base
             # cannot use a coincidentally equal revision from the current one.
             revision, _base = -1, None
 
-        def split(frame):
+        def split(
+            frame: Sequence[_SvgNode],
+        ) -> tuple[Sequence[_SvgNode], dict[str, _SvgNode]]:
             if frame and frame[0]["tag"] == "defs":
+                if "children" not in frame[0]:
+                    raise KeyError("children")
                 return frame[1:], {
                     node["attrs"]["id"]: node for node in frame[0]["children"]
                 }
@@ -239,16 +292,23 @@ class SVGRenderer:
             and _base.revision == revision
         )
         previous, old_definitions = split(
-            _base.nodes if retained else self._frames.get(revision, ())
+            _base.nodes if retained and _base is not None else self._frames.get(revision, ())
         )
         images = self._frame_image_sources.get(self._revision, {})
-        old_images = _base.images if retained else self._frame_image_sources.get(revision, {})
+        old_images = (
+            _base.images if retained and _base is not None
+            else self._frame_image_sources.get(revision, {})
+        )
 
-        def references(node):
+        def references(node: _SvgNode) -> object:
             if not images:
                 return node
             identifier = node["attrs"].get("data-pysual-image")
-            if node["tag"] == "image" and identifier in images:
+            if (
+                node["tag"] == "image"
+                and isinstance(identifier, str)
+                and identifier in images
+            ):
                 return {**node, "image": identifier, "attrs": {
                     key: value for key, value in node["attrs"].items() if key != "href"
                 }}
@@ -257,21 +317,22 @@ class SVGRenderer:
             return node
 
         reset = not retained and revision not in self._frames
-        updates = [
+        updates: list[list[object]] = [
             [index, references(node)]
             for index, node in enumerate(current)
             if reset or index >= len(previous)
             or (node is not previous[index] and node != previous[index])
+        ]
+        changed_definitions: list[object] = [
+            references(node) for identity, node in definitions.items()
+            if reset or node != old_definitions.get(identity)
         ]
         return {
             "revision": self._revision,
             "reset": reset,
             "length": len(current),
             "updates": updates,
-            "definitions": [
-                references(node) for identity, node in definitions.items()
-                if reset or node != old_definitions.get(identity)
-            ],
+            "definitions": changed_definitions,
             "remove_definitions": [
                 identity for identity in old_definitions if identity not in definitions
             ],
@@ -286,21 +347,21 @@ class SVGRenderer:
             "text_input": self._text_rect,
         }
 
-    def report_image_error(self, identifier):
+    def report_image_error(self, identifier: int) -> None:
         """Resolve a browser decode failure without exposing an arbitrary path."""
         resource = self._image_labels.get(identifier)
         if resource is not None:
             label, source_key = resource
             self._image_error(f"Browser could not decode {label}", source_key)
 
-    def _image_error(self, detail, source_key):
+    def _image_error(self, detail: object, source_key: int) -> None:
         message = f"{self._error_prefix} image unavailable: {str(detail)[:400]}"
         key = source_key, message
         if key not in self._image_errors and len(self._image_errors) < 32:
             self._image_errors.add(key)
             self._resource_error(message)
 
-    def reload_image(self, source):
+    def reload_image(self, source: object) -> None:
         source = str(source)
         previous = self._images.pop(source, None)
         if previous is not None:
@@ -315,18 +376,18 @@ class SVGRenderer:
         }
         self._resource_revision += 1
 
-    def _resource_error(self, message):
+    def _resource_error(self, message: str) -> None:
         """Execution adapters enqueue a resource_error input event here."""
         raise NotImplementedError
 
-    def begin_scene(self, background):
+    def begin_scene(self, background: str) -> None:
         """Start a retained patch. Unchanged controls keep their recorded nodes."""
         if self._target is not None or self._paint_group is not None or self._segment_open:
             raise RuntimeError("Cannot begin a retained scene inside another recording")
         self._scene_recording = True
         self._segment_background = background
 
-    def begin_segment(self, identity, bounds):
+    def begin_segment(self, identity: object, bounds: Rect) -> None:
         if not self._scene_recording or self._segment_open:
             raise RuntimeError("Invalid retained segment recording state")
         identity = str(identity)
@@ -347,11 +408,11 @@ class SVGRenderer:
         self._paint_group = None
         self._segment_bounds = bounds
 
-    def end_segment(self):
+    def end_segment(self) -> None:
         if not self._segment_open or self._saved_recording is None:
             raise RuntimeError("No retained segment is being recorded")
         group = _node("g", children=list(self._nodes))
-        self._segments[self._segment_id] = (group, dict(self._frame_gradients))
+        self._segments[cast(str, self._segment_id)] = (group, dict(self._frame_gradients))
         (
             self._nodes, self._frame_gradients, self._clip, self._serial,
             self._clip_group, self._paint_group,
@@ -360,7 +421,9 @@ class SVGRenderer:
         self._segment_open = False
         self._segment_id = None
 
-    def end_scene(self, order=None, remove=()):
+    def end_scene(
+        self, order: Iterable[object] | None = None, remove: Iterable[object] = ()
+    ) -> None:
         if not self._scene_recording or self._segment_open:
             raise RuntimeError("Invalid retained scene recording state")
         self._scene_recording = False
@@ -370,8 +433,8 @@ class SVGRenderer:
             self._segment_ids.pop(identity, None)
         if order is not None:
             self._segment_order = [str(identity) for identity in order]
-        nodes = []
-        gradients = {}
+        nodes: list[_SvgNode] = []
+        gradients: dict[str, _SvgNode] = {}
         background = self._segment_background
         background_key = (background, *self.size)
         if self._background_node is None or self._background_key != background_key:
@@ -393,14 +456,9 @@ class SVGRenderer:
         self._frame_gradients = gradients
         self._clip = None
         self._clip_group = None
-        # Subclasses deliver the published scene. The bare renderer only records it.
-        publisher = getattr(self, "present", None)
-        if publisher is None:
-            self.publish_scene()
-        else:
-            publisher()
+        self.present()
 
-    def begin(self, background):
+    def begin(self, background: str) -> None:
         if self._target is not None:
             raise RuntimeError("Cannot begin a frame inside a render surface")
         if self._paint_group is not None:
@@ -413,7 +471,7 @@ class SVGRenderer:
         self._group_serial = 0
         self.rect(Rect(0, 0, *self.size), background)
 
-    def _paint_group_begin(self):
+    def _paint_group_begin(self) -> None:
         """Keep a body's direct, cached and focus drawing in one scene slot."""
         if self._target is not None or self._paint_group is not None:
             raise RuntimeError("Nested paint groups are unsupported")
@@ -421,11 +479,12 @@ class SVGRenderer:
         self._group_serial += 1
         self._serial = 0
         self._clip_group = None
-        self._paint_group = _node("g")
-        self._paint_group["children"] = []
-        self._nodes.append(self._paint_group)
+        group = _node("g")
+        group["children"] = []
+        self._paint_group = group
+        self._nodes.append(group)
 
-    def _paint_group_end(self):
+    def _paint_group_end(self) -> None:
         if self._target is not None or self._saved_group is None:
             raise RuntimeError("No finished paint group is active")
         self._clip, self._serial = self._saved_group
@@ -434,7 +493,7 @@ class SVGRenderer:
         # A following primitive must not extend a group earlier in paint order.
         self._clip_group = None
 
-    def clip(self, rect):
+    def clip(self, rect: Rect | None) -> None:
         if self._target is not None:
             bounds = self._target.rect
             rect = bounds if rect is None else bounds.intersect(rect)
@@ -442,23 +501,26 @@ class SVGRenderer:
             self._clip_group = None
         self._clip = rect
 
-    def _id(self):
+    def _id(self) -> str:
         self._serial += 1
         # A segment keeps its namespace across recordings. Local operation
         # numbers can then compare equal when its drawing has not changed.
         # Surfaces have independent recordings, even inside a segment.
         prefix = (
             f"p{self._target.serial}" if self._target is not None
-            else f"s{self._segment_ids[self._segment_id]}" if self._segment_open
+            else f"s{self._segment_ids[cast(str, self._segment_id)]}" if self._segment_open
             else f"g{self._group_serial}" if self._paint_group is not None
             else "p0"
         )
         return f"{prefix}_{self._serial}"
 
-    def _append(self, node):
+    def _append(self, node: _SvgNode) -> None:
         if self._clip is not None:
             if self._clip_group is not None:
-                self._clip_group["children"].append(node)
+                children = self._clip_group.get("children")
+                if children is None:
+                    raise KeyError("children")
+                children.append(node)
                 return
             identity = self._id()
             self._clip_group = _node("g", {"clip-path": f"url(#{identity})"}, [node])
@@ -478,14 +540,24 @@ class SVGRenderer:
                     self._clip_group,
                 ],
             )
-        nodes = (
-            self._target.nodes if self._target is not None
-            else self._paint_group["children"] if self._paint_group is not None
-            else self._nodes
-        )
+        if self._target is not None:
+            nodes = self._target.nodes
+        elif self._paint_group is not None:
+            nodes = self._paint_group.get("children")
+            if nodes is None:
+                raise KeyError("children")
+        else:
+            nodes = self._nodes
         nodes.append(node)
 
-    def rect(self, rect, fill, radius: float = 0, border="", border_width: float = 1):
+    def rect(
+        self,
+        rect: Rect,
+        fill: str,
+        radius: float = 0,
+        border: str = "",
+        border_width: float = 1,
+    ) -> None:
         if rect.width <= 0 or rect.height <= 0:
             return
         # Host borders occupy the inside of the rectangle, as on desktop.
@@ -500,7 +572,7 @@ class SVGRenderer:
             max(0, rect.height - stroke),
         )
         radius = max(0, min(radius, rect.width / 2, rect.height / 2))
-        nodes = []
+        nodes: list[_SvgNode] = []
         if fill or not stroke:
             nodes.append(_node("rect", {
                 **_rect_attrs(rect), "fill": fill or "none", "rx": radius,
@@ -514,7 +586,15 @@ class SVGRenderer:
         # preserves one frame primitive and applies the same clip to both nodes.
         self._append(nodes[0] if len(nodes) == 1 else _node("g", children=nodes))
 
-    def gradient_rect(self, rect, first, last, axis, radius, border_width=0):
+    def gradient_rect(
+        self,
+        rect: Rect,
+        first: str,
+        last: str,
+        axis: Literal["vertical", "horizontal"],
+        radius: float,
+        border_width: float = 0,
+    ) -> bool:
         if rect.width <= 0 or rect.height <= 0:
             return True
         identity = self._id()
@@ -537,7 +617,7 @@ class SVGRenderer:
             definitions[shared] = _node(
                 "linearGradient", {"id": shared}, _gradient_stops(first, last, span)
             )
-        attrs = {
+        attrs: dict[str, object] = {
             "id": identity,
             "href": f"#{shared}",
             "gradientUnits": "userSpaceOnUse",
@@ -554,7 +634,7 @@ class SVGRenderer:
             rect.width - stroke,
             rect.height - stroke,
         )
-        paint = (
+        paint: dict[str, object] = (
             {"fill": "none", "stroke": f"url(#{identity})", "stroke-width": stroke}
             if stroke
             else {"fill": f"url(#{identity})"}
@@ -577,7 +657,9 @@ class SVGRenderer:
         )
         return True
 
-    def text(self, text, x, y, color, size, mono=False):
+    def text(
+        self, text: str, x: float, y: float, color: str, size: float, mono: bool = False
+    ) -> None:
         advance = _font.measure("", size, mono)[1] if "\n" in text else 0
         for index, line in enumerate(text.split("\n")):
             if not line:
@@ -598,10 +680,14 @@ class SVGRenderer:
                 )
             )
 
-    def measure(self, text, size, mono=False):
+    def measure(
+        self, text: str, size: float, mono: bool = False
+    ) -> tuple[float, float]:
         return _font.measure(text, size, mono)
 
-    def line(self, x1, y1, x2, y2, color, width: float = 1):
+    def line(
+        self, x1: float, y1: float, x2: float, y2: float, color: str, width: float = 1
+    ) -> None:
         self._append(
             _node(
                 "line",
@@ -616,7 +702,7 @@ class SVGRenderer:
             )
         )
 
-    def _image_source(self, source):
+    def _image_source(self, source: str) -> tuple[str, int]:
         source = str(source)
         if source in self._images:
             self._images.move_to_end(source)
@@ -642,7 +728,7 @@ class SVGRenderer:
         self._image_bytes += len(value)
         return value, identifier
 
-    def _resolve_image_source(self, source):
+    def _resolve_image_source(self, source: str) -> str:
         """Embed local assets; browser adapters may additionally resolve URLs."""
         if source.startswith("data:image/"):
             header, encoded = source.split(",", 1)
@@ -700,7 +786,13 @@ class SVGRenderer:
             raise ValueError("Image exceeds 32 MiB")
         return value
 
-    def image(self, source, rect, *, fit="stretch"):
+    def image(
+        self,
+        source: str,
+        rect: Rect,
+        *,
+        fit: Literal["stretch", "contain", "cover"] = "stretch",
+    ) -> None:
         aspects = {"stretch": "none", "contain": "xMidYMid meet", "cover": "xMidYMid slice"}
         if fit not in aspects:
             raise ValueError("Image fit must be stretch, contain or cover")
@@ -721,7 +813,7 @@ class SVGRenderer:
             )
         )
 
-    def surface_create(self, rect):
+    def surface_create(self, rect: Rect) -> _Surface:
         if len(self._surfaces) >= 8192:
             raise MemoryError("Too many web render surfaces")
         self._surface_serial += 1
@@ -729,11 +821,13 @@ class SVGRenderer:
         self._surfaces.add(surface)
         return surface
 
-    def _check_surface(self, surface):
+    def _check_surface(self, surface: _Surface) -> None:
         if surface not in self._surfaces or surface.released:
             raise ValueError("Unknown or released web render surface")
 
-    def surface_begin(self, surface):
+    def surface_begin(self, surface: object) -> None:
+        if not isinstance(surface, _Surface):
+            raise ValueError("Unknown or released web render surface")
         self._check_surface(surface)
         if self._target is not None:
             raise RuntimeError("Nested render surfaces are unsupported")
@@ -745,14 +839,16 @@ class SVGRenderer:
         self._clip_group = None
         self._serial = 0
 
-    def surface_end(self):
+    def surface_end(self) -> None:
         if self._target is None or self._saved_target is None:
             raise RuntimeError("No web surface is active")
         self._target = None
         self._clip, self._serial, self._clip_group = self._saved_target
         self._saved_target = None
 
-    def surface_blit(self, surface):
+    def surface_blit(self, surface: object) -> None:
+        if not isinstance(surface, _Surface):
+            raise ValueError("Unknown or released web render surface")
         self._check_surface(surface)
         definitions = (
             self._target.gradients if self._target else self._frame_gradients
@@ -762,7 +858,9 @@ class SVGRenderer:
         # Nested SVG viewports snap fractional bounds differently in Firefox.
         self._append(_node("g", children=surface.nodes))
 
-    def surface_release(self, surface):
+    def surface_release(self, surface: object) -> None:
+        if not isinstance(surface, _Surface):
+            raise ValueError("Unknown or released web render surface")
         self._check_surface(surface)
         if self._target is surface:
             raise RuntimeError("Cannot release an active render surface")
@@ -771,12 +869,16 @@ class SVGRenderer:
         surface.nodes = []
         surface.gradients = {}
 
-    def _scene_nodes(self):
+    def _scene_nodes(self) -> tuple[_SvgNode, ...]:
         if self._frame_gradients:
             return (_node("defs", children=self._frame_gradients.values()), *self._nodes)
         return tuple(self._nodes)
 
-    def publish_scene(self):
+    def present(self) -> None:
+        """Record the scene; delivery adapters also send it to their browser."""
+        self.publish_scene()
+
+    def publish_scene(self) -> bool:
         """Publish an immutable scene and return whether its contents changed."""
         if self._target is not None:
             raise RuntimeError("Finish the render surface before presenting")
@@ -791,7 +893,8 @@ class SVGRenderer:
         self._frames[self._revision] = frame
         # Keep image data out of geometry-only transport deltas. The original
         # nodes retain their hrefs for self-contained SVG and HTML snapshots.
-        images, resources = {}, {}
+        images: dict[str, str] = {}
+        resources: dict[int, tuple[_SvgNode, dict[str, str]]] = {}
         for node in self._nodes:
             identity = id(node)
             cached = self._node_image_sources.get(identity)
@@ -811,13 +914,13 @@ class SVGRenderer:
             self._frame_image_sources.pop(expired)
         return True
 
-    def _font_css(self):
+    def _font_css(self) -> str:
         return "".join(
             f"@font-face{{font-family:'Pysual {'Mono' if mono else 'Sans'}';src:url(data:font/ttf;base64,{base64.b64encode(_font.font_bytes(mono)).decode('ascii')}) format('truetype');}}"
             for mono in (False, True)
         )
 
-    def export_svg(self, path=None):
+    def export_svg(self, path: str | Path | None = None) -> str:
         """Return/write a portable SVG of the last presented frame, with fonts."""
         nodes = self._frames.get(self._revision)
         if nodes is None:
@@ -838,7 +941,7 @@ class SVGRenderer:
             Path(path).write_text(content, encoding="utf-8")
         return content
 
-    def export_html(self, path=None):
+    def export_html(self, path: str | Path | None = None) -> str:
         """Return/write a self-contained snapshot; interaction needs a running application."""
         svg = self.export_svg()
         title = self._title

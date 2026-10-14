@@ -41,6 +41,20 @@ class SegmentBatchTests(unittest.TestCase):
         painter.segments((), "#123456", 2)
         self.assertEqual(len(native._commands), 1)
 
+    def test_noncallable_batch_hook_uses_line_fallback(self):
+        class Host:
+            def __init__(self):
+                self.line = Mock()
+                self.lines = object()
+
+        host = Host()
+        painter = Painter(host, Rect(0, 0, 10, 10), Theme())
+        painter.lines(((0, 0), (1, 1)), "#fff", 1)
+        self.assertEqual(
+            [call.args for call in host.line.call_args_list],
+            [(0, 0, 1, 1, "#fff", 1)],
+        )
+
 
 class RetainedSegmentBatchTests(UIOwnerTestCase):
     def test_donut_strokes_reach_native_retained_commands(self):

@@ -14,13 +14,17 @@ _EP_STARTS = tuple(row[0] for row in PICTOGRAPHIC)
 _CONTROL = frozenset(("Control", "CR", "LF"))
 
 
-def _lookup(code, table, starts):
+def _lookup(
+    code: int,
+    table: tuple[tuple[int, int, str], ...],
+    starts: tuple[int, ...],
+) -> str:
     i = bisect_right(starts, code) - 1
     return table[i][2] if i >= 0 and code <= table[i][1] else "Other"
 
 
 @lru_cache(maxsize=4096)
-def _properties(char):
+def _properties(char: str) -> tuple[str, str, bool]:
     code = ord(char)
     return (
         _lookup(code, GCB, _GCB_STARTS),
@@ -29,7 +33,7 @@ def _properties(char):
     )
 
 
-def _simple_break(left, right):
+def _simple_break(left: str, right: str) -> bool | None:
     if left == "CR" and right == "LF":
         return False
     if left in _CONTROL or right in _CONTROL:

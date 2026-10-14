@@ -170,6 +170,43 @@ class ControlUpdateTests(UIOwnerTestCase):
             all(snapshot == ("Changed", "#123456", 10, 20) for snapshot in observed)
         )
 
+    def test_container_batch_keeps_preflighted_values_when_callback_mutates_input(self):
+        later_values = {"min_width": 10, "max_width": 20}
+
+        class MutatingButton(Button):
+            def _changed(self, field, old, value):
+                later_values["min_width"] = 100
+                super()._changed(field, old, value)
+
+        root = self.keep(Container())
+        first = MutatingButton(parent=root)
+        later = Button(parent=root)
+        root.update_children({first: {"text": "Changed"}, later: later_values})
+        self.assertEqual(later_values["min_width"], 100)
+        self.assertEqual((later.min_width, later.max_width), (10, 20))
+
+    def test_container_batch_snapshots_inputs_before_preparation_hooks(self):
+        later_values = {"text": "Requested"}
+        retained = []
+
+        class PreparingButton(Button):
+            def _prepare_update(self, values):
+                later_values["text"] = "Mutated during preparation"
+                retained.append(values)
+                return values
+
+            def _changed(self, field, old, value):
+                retained[0]["text"] = "Mutated after preparation"
+                super()._changed(field, old, value)
+
+        root = self.keep(Container())
+        first = PreparingButton(parent=root)
+        later = Button(parent=root)
+        first_values = {"text": "First requested"}
+        root.update_children({first: first_values, later: later_values})
+        self.assertEqual(first_values, {"text": "First requested"})
+        self.assertEqual((first.text, later.text), ("First requested", "Requested"))
+
     def test_update_subclass_hook_observes_complete_candidate_without_live_writes(self):
         observations = []
         live = None

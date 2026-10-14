@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import ast
+from collections.abc import Iterable
 import hashlib
 import html
 import io
@@ -13,6 +14,7 @@ import os
 from pathlib import Path
 import tarfile
 import tempfile
+from typing import cast
 from urllib.request import urlopen
 import zipfile
 
@@ -30,9 +32,23 @@ def _validate_runtime(runtime: Path) -> Path:
         if not (runtime / name).is_file():
             raise ValueError(f"Incomplete Pyodide runtime: missing {runtime / name}")
     metadata = json.loads((runtime / "package.json").read_text(encoding="utf-8"))
-    if not isinstance(metadata, dict) or metadata.get("version") != PYODIDE_VERSION:
+    if (
+        not isinstance(metadata, dict)
+        or cast(dict[str, object], metadata).get("version") != PYODIDE_VERSION
+    ):
         raise ValueError(f"Web builds require the Pyodide {PYODIDE_VERSION} npm runtime")
     return runtime
+
+
+def _distribution_bytes(path: object) -> bytes:
+    """Read a distribution path whose stub omits ``read_bytes``."""
+    read_bytes = getattr(path, "read_bytes", None)
+    if not callable(read_bytes):
+        raise TypeError("Installed license path cannot be read")
+    data = read_bytes()
+    if not isinstance(data, bytes):
+        raise TypeError("Installed license path cannot be read")
+    return data
 
 
 def runtime_cache() -> Path:
@@ -71,7 +87,7 @@ def fetch_runtime(destination: Path | None = None) -> Path:
     return _validate_runtime(destination)
 
 
-def _atomic_write(path: Path, data: bytes):
+def _atomic_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
     try:
@@ -84,7 +100,7 @@ def _atomic_write(path: Path, data: bytes):
             temporary.unlink(missing_ok=True)
 
 
-def _zip_file(archive, name: str, data: bytes):
+def _zip_file(archive: zipfile.ZipFile, name: str, data: bytes) -> None:
     info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
     info.compress_type = zipfile.ZIP_DEFLATED
     info.create_system = 3
@@ -106,7 +122,13 @@ def _runtime_notices(package: Path) -> str:
     return "\n\n".join(texts)
 
 
-def build_web(script: Path, output: Path, runtime: Path | None = None, *, includes=()) -> Path:
+def build_web(
+    script: Path,
+    output: Path,
+    runtime: Path | None = None,
+    *,
+    includes: Iterable[str | Path] = (),
+) -> Path:
     """Embed the entry script and optional relative files into a self-contained HTML.
 
     A supplied runtime directory avoids all build-time network access. Without
@@ -147,7 +169,9 @@ def build_web(script: Path, output: Path, runtime: Path | None = None, *, includ
             installed = distribution("pysual")
             for path in installed.files or ():
                 if str(path).endswith(".dist-info/licenses/LICENSE"):
-                    entries["PYSUAL-LICENSE.txt"] = installed.locate_file(path).read_bytes()
+                    entries["PYSUAL-LICENSE.txt"] = _distribution_bytes(
+                        installed.locate_file(path)
+                    )
                     break
         except PackageNotFoundError:
             pass

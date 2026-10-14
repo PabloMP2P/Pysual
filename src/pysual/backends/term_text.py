@@ -6,11 +6,11 @@ updates changed runs only and never requests or emits a graphics protocol.
 """
 
 import asyncio
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, cast
 
 from ..geometry import Rect
 from ..graphemes import boundaries
@@ -18,7 +18,11 @@ from ..host import CapabilityError, Input, TextFile
 from . import _files
 from ._term_cells import RGB, Cell, CellRenderer, safe_text
 from ._term_images import AsyncImageCache
+from ._term_io import TerminalTransport
 from ._term_session import TerminalSession
+
+if TYPE_CHECKING:
+    from ..theme import ResolvedStyle
 
 _ANSI16 = (
     (0, 0, 0),
@@ -154,7 +158,7 @@ class _FilePrompt:
     confirmed: bool = False
     busy: bool = False
     cancelled: bool = False
-    operation: asyncio.Task[Any] | None = None
+    operation: asyncio.Task[bool] | asyncio.Task[TextFile] | None = None
 
 
 class TermTextHost(TerminalSession):
@@ -178,7 +182,14 @@ class TermTextHost(TerminalSession):
     text_row_height = CELL_HEIGHT
     MAX_WRITE = 64 * 1024
 
-    def __init__(self, *, io=None, probe_timeout=0.15, environ=None, color="auto"):
+    def __init__(
+        self,
+        *,
+        io: TerminalTransport | None = None,
+        probe_timeout: float = 0.15,
+        environ: Mapping[str, str] | None = None,
+        color: str = "auto",
+    ) -> None:
         super().__init__(
             io=io, protocol="text", probe_timeout=probe_timeout, environ=environ
         )
@@ -189,14 +200,21 @@ class TermTextHost(TerminalSession):
         self._file_lock = asyncio.Lock()
         self._generation = 0
 
-    def open(self, title, width, height, resizable, scale):
+    def open(
+        self,
+        title: str,
+        width: float,
+        height: float,
+        resizable: bool,
+        scale: float | None,
+    ) -> None:
         if scale is not None and scale != 1:
             raise CapabilityError(
                 "TermTextHost uses terminal-owned cells; scale must be 1 or None"
             )
         super().open(title, width, height, resizable, scale)
 
-    def _reset_open_state(self):
+    def _reset_open_state(self) -> None:
         super()._reset_open_state()
         self._renderer._images.close()
         self._renderer._images = AsyncImageCache()
@@ -228,33 +246,60 @@ class TermTextHost(TerminalSession):
             self._last_cells = None
         return changed
 
-    def begin(self, background):
+    def begin(self, background: str) -> None:
         self._renderer.begin(background)
 
-    def clip(self, rect):
+    def clip(self, rect: Rect | None) -> None:
         self._renderer.clip(rect)
 
-    def rect(self, rect, fill, radius: float = 0, border="", border_width: float = 1):
+    def rect(
+        self,
+        rect: Rect,
+        fill: str,
+        radius: float = 0,
+        border: str = "",
+        border_width: float = 1,
+    ) -> None:
         self._renderer.rect(rect, fill, radius, border, border_width)
 
-    def text(self, text, x, y, color, size, mono=False):
+    def text(
+        self, text: str, x: float, y: float, color: str, size: float, mono: bool = False
+    ) -> None:
         self._renderer.text(text, x, y, color, size, mono)
 
-    def measure(self, text, size, mono=False):
+    def measure(
+        self, text: str, size: float, mono: bool = False
+    ) -> tuple[float, float]:
         return self._renderer.measure(text, size, mono)
 
-    def line(self, x1, y1, x2, y2, color, width: float = 1):
+    def line(
+        self,
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+        color: str,
+        width: float = 1,
+    ) -> None:
         self._renderer.line(x1, y1, x2, y2, color, width)
 
-    def caret(self, x, y, height, color) -> bool:
+    def caret(self, x: float, y: float, height: float, color: str) -> bool:
         self._renderer.caret(x, y, height, color)
         return True
 
-    def focus_ring(self, rect, color, radius: float = 0) -> bool:
+    def focus_ring(self, rect: Rect, color: str, radius: float = 0) -> bool:
         self._renderer.focus_ring(rect, color, radius, monochrome=self.color == "none")
         return True
 
-    def image(self, source, rect, *, tint="#ffffff", fit="stretch", _edges=None):
+    def image(
+        self,
+        source: str,
+        rect: Rect,
+        *,
+        tint: str = "#ffffff",
+        fit: str = "stretch",
+        _edges: tuple[int, int, int, int] | None = None,
+    ) -> None:
         try:
             self._renderer.image(source, rect, tint=tint, fit=fit, _edges=_edges)
         except (OSError, ValueError) as exc:
@@ -269,10 +314,17 @@ class TermTextHost(TerminalSession):
                     Input("resource_error", text=f"terminal image unavailable: {message}")
                 )
 
-    def image_nine(self, source, rect, edges, *, tint="#ffffff"):
+    def image_nine(
+        self,
+        source: str,
+        rect: Rect,
+        edges: tuple[int, int, int, int],
+        *,
+        tint: str = "#ffffff",
+    ) -> None:
         self.image(source, rect, tint=tint, _edges=edges)
 
-    def reload_image(self, source):
+    def reload_image(self, source: str) -> None:
         self._renderer._images.invalidate(source)
         source_key = hash(source)
         for key in tuple(self._image_errors):
@@ -282,43 +334,58 @@ class TermTextHost(TerminalSession):
         self._renderer.resource_revision += 1
         self._repaint()
 
-    def gradient_rect(self, rect, first, last, axis, radius, border_width=0):
+    def gradient_rect(
+        self,
+        rect: Rect,
+        first: str,
+        last: str,
+        axis: str,
+        radius: float,
+        border_width: float = 0,
+    ) -> bool:
         return self._renderer.gradient_rect(
             rect, first, last, axis, radius, border_width
         )
 
-    def styled_rect(self, rect, style) -> bool:
+    def styled_rect(self, rect: Rect, style: "ResolvedStyle") -> bool:
         return self._renderer.styled_rect(rect, style)
 
-    def marker(self, rect, style, *, shape="square", checked=False) -> bool:
+    def marker(
+        self,
+        rect: Rect,
+        style: "ResolvedStyle",
+        *,
+        shape: str = "square",
+        checked: bool = False,
+    ) -> bool:
         return self._renderer.marker(rect, style, shape=shape, checked=checked)
 
-    def icon(self, name, x, y, size, color) -> bool:
+    def icon(self, name: str, x: float, y: float, size: float, color: str) -> bool:
         glyph = _ICON_GLYPHS.get(name)
         if glyph is None:
             return False
         self._renderer.icon(glyph, x, y, size, color)
         return True
 
-    def surface_create(self, rect):
+    def surface_create(self, rect: Rect) -> object:
         return self._renderer.surface_create(rect)
 
-    def surface_byte_size(self, rect):
+    def surface_byte_size(self, rect: Rect) -> int:
         return self._renderer.surface_byte_size(rect)
 
-    def surface_matches(self, surface):
+    def surface_matches(self, surface: object) -> bool:
         return self._renderer.surface_matches(surface)
 
-    def surface_begin(self, surface):
+    def surface_begin(self, surface: object) -> None:
         self._renderer.surface_begin(surface)
 
-    def surface_end(self):
+    def surface_end(self) -> None:
         self._renderer.surface_end()
 
-    def surface_blit(self, surface):
+    def surface_blit(self, surface: object) -> None:
         self._renderer.surface_blit(surface)
 
-    def surface_release(self, surface):
+    def surface_release(self, surface: object) -> None:
         self._renderer.surface_release(surface)
 
     def _changes(self, cells: tuple[Cell, ...]) -> Iterator[bytes]:
@@ -368,10 +435,12 @@ class TermTextHost(TerminalSession):
                         yield cell.text.encode("utf-8")
                     x += 1
 
-    def present(self):
+    def present(self) -> None:
         if not self._active:
             return
-        self._renderer._images.finish_frame()
+        images = self._renderer._images
+        if isinstance(images, AsyncImageCache):
+            images.finish_frame()
         cells = (
             self._paint_prompt()
             if self._prompt is not None
@@ -406,15 +475,16 @@ class TermTextHost(TerminalSession):
                 raise
         self._last_cells = cells
 
-    def text_input(self, rect):
+    def text_input(self, rect: Rect | None) -> None:
         # Shared controls paint their own caret into character cells.
         pass
 
-    def _repaint(self):
+    def _repaint(self) -> None:
         self._resource_events.append(Input("repaint"))
 
-    def poll(self):
-        if self._active and self._renderer._images.poll():
+    def poll(self) -> list[Input]:
+        images = self._renderer._images
+        if self._active and isinstance(images, AsyncImageCache) and images.poll():
             # Cached controls and cached cell surfaces have independent keys.
             # Both must stop reusing a placeholder when its pixels arrive.
             self.resource_revision += 1
@@ -423,7 +493,7 @@ class TermTextHost(TerminalSession):
         result = super().poll()
         if self._prompt is None:
             return result
-        retained = []
+        retained: list[Input] = []
         for event in result:
             if event.kind == "close":
                 self._cancel_prompt()
@@ -434,7 +504,7 @@ class TermTextHost(TerminalSession):
                 self._prompt_input(event)
         return retained
 
-    def _cancel_prompt(self):
+    def _cancel_prompt(self) -> None:
         prompt = self._prompt
         if prompt is None:
             return
@@ -446,7 +516,7 @@ class TermTextHost(TerminalSession):
         self._prompt = None
         self._repaint()
 
-    def _prompt_input(self, event: Input):
+    def _prompt_input(self, event: Input) -> None:
         prompt = self._prompt
         if prompt is None or prompt.cancelled:
             return
@@ -588,7 +658,9 @@ class TermTextHost(TerminalSession):
             target[offset:end] = pane.cells[y * width : (y + 1) * width]
         return tuple(target)
 
-    async def _text_file(self, *, save: bool, text="", suggested_name=""):
+    async def _text_file(
+        self, *, save: bool, text: str = "", suggested_name: str = ""
+    ) -> TextFile | None:
         generation = self._generation
         async with self._file_lock:
             if not self._active or generation != self._generation:
@@ -596,7 +668,11 @@ class TermTextHost(TerminalSession):
             loop = asyncio.get_running_loop()
             value = safe_text(suggested_name).replace("\n", "").replace("\t", "")[:4096]
             prompt = _FilePrompt(
-                save, value, len(value), loop.create_future(), selected=bool(value)
+                save,
+                value,
+                len(value),
+                cast("asyncio.Future[str | None]", loop.create_future()),
+                selected=bool(value),
             )
             self._prompt = prompt
             self._repaint()
@@ -610,23 +686,25 @@ class TermTextHost(TerminalSession):
                     try:
                         path = Path(chosen).expanduser()
                         if save and not prompt.confirmed:
-                            prompt.operation = asyncio.create_task(
-                                asyncio.to_thread(path.exists)
-                            )
-                            exists = await prompt.operation
+                            exists_task = asyncio.create_task(asyncio.to_thread(path.exists))
+                            prompt.operation = exists_task
+                            exists = await exists_task
                             if prompt.cancelled:
                                 return None
                             if exists:
                                 prompt.confirm, prompt.busy = True, False
-                                prompt.answer = loop.create_future()
+                                prompt.answer = cast(
+                                    "asyncio.Future[str | None]", loop.create_future()
+                                )
                                 self._repaint()
                                 continue
-                        prompt.operation = asyncio.create_task(
+                        file_task = asyncio.create_task(
                             _files.write_text(path, text)
                             if save
                             else _files.read_text(path)
                         )
-                        return await prompt.operation
+                        prompt.operation = file_task
+                        return await file_task
                     except asyncio.CancelledError:
                         if prompt.cancelled:
                             return None
@@ -634,7 +712,9 @@ class TermTextHost(TerminalSession):
                     except (OSError, UnicodeError, ValueError) as exc:
                         prompt.error = safe_text(str(exc)).replace("\n", " ")[:512]
                         prompt.confirm = prompt.confirmed = prompt.busy = False
-                        prompt.answer = loop.create_future()
+                        prompt.answer = cast(
+                            "asyncio.Future[str | None]", loop.create_future()
+                        )
                         self._repaint()
                     finally:
                         prompt.operation = None
@@ -646,14 +726,16 @@ class TermTextHost(TerminalSession):
     async def open_text_file(self) -> TextFile | None:
         return await self._text_file(save=False)
 
-    async def save_text_file(self, text, suggested_name, location) -> TextFile | None:
+    async def save_text_file(
+        self, text: str, suggested_name: str, location: str | None
+    ) -> TextFile | None:
         if location is not None:
             return await _files.write_text(location, text)
         return await self._text_file(
             save=True, text=text, suggested_name=suggested_name
         )
 
-    def _close_target(self):
+    def _close_target(self) -> None:
         self._generation += 1
         self._cancel_prompt()
         self._prompt = None

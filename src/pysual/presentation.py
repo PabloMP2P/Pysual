@@ -35,7 +35,7 @@ class Outcome:
 class Presentation:
     """The identity and immutable completion of one native or in-app opening."""
 
-    def __init__(self, generation: int, *, modal: bool = False, owner=None):
+    def __init__(self, generation: int, *, modal: bool = False, owner: object = None):
         self.generation = generation
         self.modal = modal
         self.owner = owner
@@ -45,7 +45,7 @@ class Presentation:
     def done(self) -> bool:
         return self._future.done()
 
-    def complete(self, result=None, *, reason: str = "closed") -> None:
+    def complete(self, result: object = None, *, reason: str = "closed") -> None:
         try:
             self._future.set_result(Outcome(result, reason))
         except InvalidStateError:
