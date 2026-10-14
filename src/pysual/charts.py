@@ -1,5 +1,6 @@
 """Bounded charts; data preparation belongs to the controls, not the host."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Context, Decimal, localcontext
 from math import ceil, cos, fsum, isfinite, pi, sin
@@ -8,12 +9,14 @@ from typing import ClassVar, Literal
 from ._text_display import single_line
 from .controls import Control
 from .geometry import Rect
-from .schema import Dirty, _persist_record, prop
+from .schema import Dirty, Field, _persist_record, _records, prop
+from .host import Host
+from .painting import Painter
 
 _PALETTE = ("#38bdf8", "#34d399", "#fbbf24", "#f472b6", "#a78bfa", "#fb923c", "#94a3b8")
 
 
-def _chart_identity(key, title, color):
+def _chart_identity(key: object, title: object, color: object) -> None:
     if not isinstance(key, str) or not key or not isinstance(title, str):
         raise ValueError("Chart data needs a nonempty key and title string")
     if not isinstance(color, str) or (
@@ -35,7 +38,7 @@ class ChartSeries:
     points: tuple[tuple[float, float], ...]
     color: str = ""
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         _chart_identity(self.key, self.title, self.color)
         if not isinstance(self.points, tuple) or any(
             not isinstance(p, tuple)
@@ -52,7 +55,9 @@ class ChartSeries:
             raise ValueError("Chart points must be ordered by increasing x")
 
 
-def _reduce(points, buckets):
+def _reduce(
+    points: tuple[tuple[float, float], ...], buckets: int,
+) -> tuple[tuple[float, float], ...]:
     """Retain each bucket's endpoints and y extrema in their original order."""
     if len(points) <= buckets * 4:
         return points
@@ -72,18 +77,24 @@ def _reduce(points, buckets):
     return tuple(result)
 
 
-def _axis_labels(values, available, measure):
+def _axis_labels(
+    values: tuple[float, ...], available: float, measure: Callable[[str], float],
+) -> tuple[tuple[str, ...], str]:
     """Format a small tick set together, retaining its visible differences."""
     # Axis formatting must not inherit the application's Decimal precision or
     # traps, nor leave rounding flags in the caller's context.
     with localcontext(Context(prec=28)):
         numbers = tuple(Decimal(str(value)) for value in values)
 
-        def labels_for(ticks):
+        def labels_for(ticks: tuple[Decimal, ...]) -> tuple[str, ...]:
             gaps = [abs(b - a) for a, b in zip(ticks, ticks[1:]) if a != b]
             largest = max(map(abs, ticks))
             precision = max(4, largest.adjusted() - min(gaps).adjusted() + 2) if gaps else 4
-            for digits in range(min(17, precision), 18):
+            start = min(17, precision)
+            labels = tuple(format(float(value), f".{start}g") for value in ticks)
+            if len(set(labels)) == len(set(ticks)):
+                return labels
+            for digits in range(start + 1, 18):
                 labels = tuple(format(float(value), f".{digits}g") for value in ticks)
                 if len(set(labels)) == len(set(ticks)):
                     return labels
@@ -115,31 +126,32 @@ class LineChart(Control):
     show_legend: bool = prop(default=True, affects=Dirty.MEASURE)
     style_parts: ClassVar[tuple[str, ...]] = ("body", "axis", "legend", "line")
 
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
         self._rebuild()
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
         if name == "series":
-            if len(value) > 8 or sum(len(s.points) for s in value) > 20_000:
+            series = _records(value, ChartSeries)
+            if len(series) > 8 or sum(len(item.points) for item in series) > 20_000:
                 raise ValueError(
                     "LineChart supports at most eight series and 20,000 total points"
                 )
-            if len({s.key for s in value}) != len(value):
+            if len({item.key for item in series}) != len(series):
                 raise ValueError("Chart series keys must be unique")
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         if field.name == "series":
             self._rebuild()
         super()._changed(field, old, value)
 
-    def _rebuild(self):
+    def _rebuild(self) -> None:
         # At most 2048 vertices across the chart; recompute only on data changes.
         buckets = max(1, 512 // max(1, len(self.series)))
         self._points = tuple(_reduce(s.points, buckets) for s in self.series)
         values = [p for s in self.series for p in s.points]
-        self._extent = (
+        self._extent: tuple[float, float, float, float] = (
             (
                 min(p[0] for p in values),
                 max(p[0] for p in values),
@@ -150,10 +162,10 @@ class LineChart(Control):
             else (0, 1, 0, 1)
         )
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         return 560, 300
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         p.body()
         if self.title:
             p.text(p.elide(single_line(self.title), max(0, p.width - 24)), 12, 10)
@@ -172,7 +184,10 @@ class LineChart(Control):
                 )
         axis = p.style("axis")
         xmin, xmax, ymin, ymax = self._extent
-        measure = lambda text: p.measure(text, size=11, font_family=axis.font_family)[0]
+
+        def measure(text: str) -> float:
+            return p.measure(text, size=11, font_family=axis.font_family)[0]
+
         yvalues = tuple(ymin * (1 - i / 4) + ymax * (i / 4) for i in range(5))
         ylabels, ynote = _axis_labels(yvalues, max(56, min(120, p.width / 5)), measure)
         left = max(66, max(map(measure, ylabels)) + 14)
@@ -188,7 +203,7 @@ class LineChart(Control):
             return
 
         # Halving before subtraction avoids overflow for finite extreme ranges.
-        def fraction(value, low, high):
+        def fraction(value: float, low: float, high: float) -> float:
             if low == high:
                 return 0.5
             span = high - low
@@ -266,7 +281,7 @@ class ChartSlice:
     value: float
     color: str = ""
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         _chart_identity(self.key, self.title, self.color)
         if (
             type(self.value) not in (int, float)
@@ -287,24 +302,25 @@ class DonutChart(Control):
     center_text: str | None = prop(default=None)
     style_parts: ClassVar[tuple[str, ...]] = ("body", "legend")
 
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
         self._rebuild()
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
         if name == "slices":
-            if len(value) > 8:
+            slices = _records(value, ChartSlice)
+            if len(slices) > 8:
                 raise ValueError("DonutChart supports at most eight slices")
-            if len({s.key for s in value}) != len(value):
+            if len({item.key for item in slices}) != len(slices):
                 raise ValueError("Chart slice keys must be unique")
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         if field.name == "slices":
             self._rebuild()
         super()._changed(field, old, value)
 
-    def _rebuild(self):
+    def _rebuild(self) -> None:
         # Normalize before adding to avoid overflow from finite extreme values.
         maximum = max((s.value for s in self.slices), default=0)
         scaled = tuple(s.value / maximum if maximum else 0 for s in self.slices)
@@ -316,7 +332,7 @@ class DonutChart(Control):
             self._total_text = format(
                 sum((Decimal(str(s.value)) for s in self.slices), Decimal(0)), ".4g"
             )
-        self._arcs = []
+        self._arcs: list[tuple[tuple[float, float], ...]] = []
         start = -pi / 2
         for fraction in self._fractions:
             count = ceil(fraction * 512)
@@ -334,10 +350,10 @@ class DonutChart(Control):
             )
             start = end
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         return 360, 340
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         p.body()
         if self.title:
             p.text(p.elide(single_line(self.title), max(0, p.width - 24)), 12, 10)

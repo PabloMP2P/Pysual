@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, fields, replace
 from functools import cached_property
 from math import isfinite
 from pathlib import Path
-from typing import Any, ClassVar, Literal, Protocol
+from typing import Any, ClassVar, Literal, Protocol, cast
 
 StyleState = Literal["normal", "selected", "checked", "hover", "pressed", "disabled"]
 
@@ -19,14 +19,14 @@ class StyleTarget(Protocol):
     style_parts: ClassVar[tuple[str, ...]]
 
 
-def _color(value):
+def _color(value: object) -> None:
     if not isinstance(value, str) or not re.fullmatch(
         r"#[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?", value
     ):
         raise ValueError(f"Expected #RRGGBB or #RRGGBBAA color, got {value!r}")
 
 
-def _luminance(value):
+def _luminance(value: str) -> float:
     channels = [int(value[i : i + 2], 16) / 255 for i in (1, 3, 5)]
     linear = [
         c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
@@ -35,23 +35,26 @@ def _luminance(value):
     return sum(c * w for c, w in zip(linear, (0.2126, 0.7152, 0.0722)))
 
 
-def _tint(first, second, amount):
+def _tint(first: str, second: str, amount: float) -> str:
     return "#" + "".join(
         f"{round(int(first[i:i + 2], 16) * (1 - amount) + int(second[i:i + 2], 16) * amount):02x}"
         for i in (1, 3, 5)
     )
 
 
-def _readable_ink(preferred, background, fallback):
+def _readable_ink(preferred: str, background: str, fallback: str) -> str:
     light, dark = sorted((_luminance(preferred), _luminance(background)), reverse=True)
     return preferred if (light + .05) / (dark + .05) >= 4.5 else fallback
 
 
-def _hover_fill(color, foreground):
+def _hover_fill(color: str | None, foreground: str | None) -> str:
     """Tint an action face away from its text, preserving the original alpha."""
 
     # A small tint makes a solid accent button respond without reducing text
     # contrast. It is resolved once with the immutable theme, never each frame.
+    # Partial styles omit a channel to mean "inherit"; a hover face needs both.
+    if color is None or foreground is None:
+        raise TypeError("hover fill requires a color and a foreground")
     target = 0 if _luminance(color) < _luminance(foreground) else 255
     return (
         "#"
@@ -75,13 +78,13 @@ class Tokens:
     border: str = "#344057"
     selection: str = "#344c83"
     danger: str = "#ee7383"
-    font_family: str = "ui"
+    font_family: Literal["ui", "mono"] = "ui"
     font_size: float = 15
     spacing: float = 12
     radius: float = 10
     control_height: float = 38
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         for f in fields(self):
             value = getattr(self, f.name)
             if f.name == "font_family":
@@ -105,7 +108,7 @@ class Style:
     border: str | None = None
     radius: float | None = None
     border_width: float | None = None
-    font_family: str | None = None
+    font_family: Literal["ui", "mono"] | None = None
     font_size: float | None = None
     padding: float | None = None
     # Surface effects are data, rendered by the shared Painter on every host.
@@ -128,7 +131,7 @@ class Style:
     shadow_x: float | None = None
     shadow_y: float | None = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         for f in fields(self):
             value = getattr(self, f.name)
             if value is None:
@@ -177,6 +180,73 @@ class Style:
                 raise ValueError(f"{f.name} must be within 24 logical pixels")
 
 
+class ResolvedStyle(Protocol):
+    """Face produced by theme resolution.
+
+    Partial ``Style`` rules omit fields to mean "inherit". Resolution fills the
+    base face, so painting and measurement can rely on these values.
+    """
+
+    fill: str
+    foreground: str
+    border: str
+    radius: float
+    border_width: float
+    font_family: Literal["ui", "mono"]
+    font_size: float
+    padding: float
+    fill_end: str | None
+    border_end: str | None
+    gradient_axis: Literal["vertical", "horizontal"] | None
+    bevel: Literal["none", "raised", "sunken"] | None
+    bevel_width: float | None
+    bevel_light: str | None
+    bevel_dark: str | None
+    highlight: str | None
+    inner_border: str | None
+    glow: str | None
+    glow_width: float | None
+    pattern: Literal["none", "scanlines", "grid"] | None
+    pattern_color: str | None
+    pattern_spacing: float | None
+    shadow: str | None
+    shadow_blur: float | None
+    shadow_x: float | None
+    shadow_y: float | None
+
+
+# Fields Theme.resolve fills before a face is safe to paint or measure.
+_RESOLVED_FIELDS = (
+    "fill",
+    "foreground",
+    "border",
+    "radius",
+    "border_width",
+    "font_family",
+    "font_size",
+    "padding",
+)
+
+
+def as_resolved(style: Style) -> ResolvedStyle:
+    """Treat a style as resolved. Only call this after the base face is filled."""
+    missing = [name for name in _RESOLVED_FIELDS if getattr(style, name) is None]
+    if missing:
+        raise TypeError("Resolved style is missing " + ", ".join(missing))
+    return cast(ResolvedStyle, style)
+
+
+def style_instance(style: ResolvedStyle) -> Style:
+    """Return a Style so fields can be replaced.
+
+    Theme resolution stores a Style. Another ResolvedStyle is copied field by field.
+    """
+    if isinstance(style, Style):
+        return style
+    copied = {item.name: getattr(style, item.name) for item in fields(Style)}
+    return Style(**copied)
+
+
 @dataclass(frozen=True)
 class Rule:
     control: str
@@ -184,7 +254,7 @@ class Rule:
     state: StyleState = "normal"
     style: Style = Style()
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.state not in (
             "normal",
             "selected",
@@ -217,7 +287,7 @@ class Theme:
     tokens: Tokens = Tokens()
     rules: tuple[Rule, ...] = ()
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if (
             not isinstance(self.tokens, Tokens)
             or not isinstance(self.rules, tuple)
@@ -228,7 +298,7 @@ class Theme:
         if len(keys) != len(set(keys)):
             raise ValueError("Duplicate theme rule")
 
-    def derive(self, **tokens):
+    def derive(self, **tokens: Any) -> "Theme":
         return replace(self, tokens=replace(self.tokens, **tokens))
 
     def styled(
@@ -255,7 +325,7 @@ class Theme:
         )
 
     @cached_property
-    def _rule_index(self):
+    def _rule_index(self) -> dict[tuple[str, str, str], dict[str, Any]]:
         # Compile only the immutable data lookup, never drawing code. This avoids
         # scanning and converting the entire catalog on every control part.
         return {
@@ -266,13 +336,13 @@ class Theme:
         }
 
     @cached_property
-    def _resolved_styles(self):
+    def _resolved_styles(self) -> dict[tuple[Any, ...], ResolvedStyle]:
         # Per immutable theme, rather than an lru_cache keyed by a deep hash of
         # every rule. Derived/loaded themes get their own bounded lookup.
         return {}
 
     @cached_property
-    def _has_shadows(self):
+    def _has_shadows(self) -> bool:
         return any(
             r.style.shadow
             and not (len(r.style.shadow) == 9 and r.style.shadow.endswith("00"))
@@ -280,7 +350,7 @@ class Theme:
         )
 
     @cached_property
-    def _has_glows(self):
+    def _has_glows(self) -> bool:
         return any(
             r.style.glow
             and not (len(r.style.glow) == 9 and r.style.glow.endswith("00"))
@@ -288,8 +358,13 @@ class Theme:
         )
 
     def resolve(
-        self, control, part="body", state="normal", checked=False, selected=False
-    ):
+        self,
+        control: str | tuple[str, ...],
+        part: str = "body",
+        state: StyleState = "normal",
+        checked: bool = False,
+        selected: bool = False,
+    ) -> ResolvedStyle:
         kinds = (control,) if isinstance(control, str) else tuple(control)
         key = (kinds, part, state, checked, selected)
         cache = self._resolved_styles
@@ -301,9 +376,18 @@ class Theme:
         cache[key] = style
         return style
 
-    def _resolve(self, kinds, part, state, checked, selected):
+    def _resolve(
+        self,
+        kinds: tuple[str, ...],
+        part: str,
+        state: str,
+        checked: bool,
+        selected: bool,
+    ) -> ResolvedStyle:
         t = self.tokens
         primary = "Button" in kinds and "CheckBox" not in kinds
+        # Style kwargs. Catalog rules merge in as plain dicts of whichever
+        # fields they set, so this scratch pad is not one fixed record.
         result: dict[str, Any] = {
             "fill": t.accent if primary else t.surface,
             "foreground": t.accent_text if primary else t.foreground,
@@ -489,43 +573,52 @@ class Theme:
         for selected_state in states:
             for kind in kinds:
                 result.update(self._rule_index.get((kind, part, selected_state), {}))
-        return Style(**result)
+        return as_resolved(Style(**result))
 
-    def to_json(self):
+    def to_json(self) -> str:
         return json.dumps({"schema": "pysual-theme/1", **asdict(self)}, indent=2)
 
     @classmethod
-    def from_json(cls, text):
-        doc = json.loads(text)
-        if (
-            not isinstance(doc, dict)
-            or set(doc) != {"schema", "tokens", "rules"}
-            or doc["schema"] != "pysual-theme/1"
-        ):
+    def from_json(cls, text: str) -> "Theme":
+        loaded: object = json.loads(text)
+        if not isinstance(loaded, dict):
             raise ValueError("Unsupported theme document")
+        doc = cast(dict[str, object], loaded)
+        if set(doc) != {"schema", "tokens", "rules"} or doc["schema"] != "pysual-theme/1":
+            raise ValueError("Unsupported theme document")
+        tokens = doc["tokens"]
+        rules_value = doc["rules"]
         if (
-            not isinstance(doc["tokens"], dict)
-            or set(doc["tokens"]) != {f.name for f in fields(Tokens)}
-            or not isinstance(doc["rules"], list)
+            not isinstance(tokens, dict)
+            or set(cast(dict[str, object], tokens)) != {f.name for f in fields(Tokens)}
+            or not isinstance(rules_value, list)
         ):
             raise ValueError("Theme requires all declared tokens and a rules list")
+        token_map = cast(dict[str, object], tokens)
+        rules = cast(list[object], rules_value)
         if any(
-            not isinstance(r, dict) or set(r) != {"control", "part", "state", "style"}
-            for r in doc["rules"]
+            not isinstance(item, dict)
+            or set(cast(dict[str, object], item)) != {"control", "part", "state", "style"}
+            for item in rules
         ):
             raise ValueError("Theme rules require control, part, state, style")
-        return cls(
-            Tokens(**doc["tokens"]),
-            tuple(
-                Rule(r["control"], r["part"], r["state"], Style(**r["style"]))
-                for r in doc["rules"]
-            ),
-        )
+        parsed: list[Rule] = []
+        for item in rules:
+            record = cast(dict[str, object], item)
+            parsed.append(
+                Rule(
+                    cast(str, record["control"]),
+                    cast(str, record["part"]),
+                    cast(StyleState, record["state"]),
+                    Style(**cast(Any, record["style"])),
+                )
+            )
+        return cls(Tokens(**cast(Any, token_map)), tuple(parsed))
 
 
-def _polished_theme(tokens, *, night):
+def _polished_theme(tokens: Tokens, *, night: bool) -> Theme:
     """Neutral elevation stays coherent when callers derive their own palette."""
-    rules = []
+    rules: list[Rule] = []
     for kind in ("Button", "Dropdown"):
         rules.extend(
             (
@@ -608,7 +701,7 @@ def _polished_theme(tokens, *, night):
     return Theme(tokens, tuple(rules))
 
 
-def dark():
+def dark() -> Theme:
     theme = _polished_theme(Tokens(), night=True)
     return replace(theme, rules=theme.rules + (
         Rule("Hyperlink", style=Style(foreground="#8b9cff")),
@@ -619,7 +712,7 @@ def dark():
     ))
 
 
-def light():
+def light() -> Theme:
     return _polished_theme(
         Tokens(
             background="#f1f4fa",
@@ -636,11 +729,11 @@ def light():
     )
 
 
-def load_theme(path):
+def load_theme(path: str | Path) -> Theme:
     return Theme.from_json(Path(path).read_text(encoding="utf-8"))
 
 
-def save_theme(theme, path):
+def save_theme(theme: Theme, path: str | Path) -> None:
     Path(path).write_text(theme.to_json() + "\n", encoding="utf-8")
 
 
@@ -691,19 +784,28 @@ def get_theme(name: str) -> Theme:
     raise ValueError(f"Unknown theme {name!r}; choose from {', '.join(theme_names())}")
 
 
-def _check_box(style):
+def _check_box(style: Style) -> Style:
     """Keep a CheckBox box a rounded square whatever radius its source style has."""
     radius = style.radius if style.radius is not None else CHECK_BOX_RADIUS
     return replace(style, radius=min(radius, CHECK_BOX_RADIUS))
 
 
-def _surface_rules(tokens, face, field, panel, accent, selection, titlebar, thumb=None,
-                   secondary=None):
+def _surface_rules(
+    tokens: Tokens,
+    face: Style,
+    field: Style,
+    panel: Style,
+    accent: Style,
+    selection: Style,
+    titlebar: Style,
+    thumb: Style | None = None,
+    secondary: Style | None = None,
+) -> tuple[Rule, ...]:
     """Apply a visual language through ordinary control/part/state declarations.
 
     ``thumb`` styles slider and toggle thumbs; it defaults to the button face.
     """
-    rules = []
+    rules: list[Rule] = []
     thumb = face if thumb is None else thumb
     secondary = secondary or replace(
         panel, fill=tokens.raised, fill_end=tokens.raised,
@@ -713,7 +815,7 @@ def _surface_rules(tokens, face, field, panel, accent, selection, titlebar, thum
 
     def rule(
         kinds: str, style: Style, part: str = "body", state: StyleState = "normal"
-    ):
+    ) -> None:
         rules.extend(Rule(kind, part, state, style) for kind in kinds.split())
 
     rule("Button", face)
@@ -821,9 +923,9 @@ def _surface_rules(tokens, face, field, panel, accent, selection, titlebar, thum
     return tuple(rules)
 
 
-def _scrollbar_rules(t, field):
+def _scrollbar_rules(t: Tokens, field: Style) -> list[Rule]:
     """Scroll affordances are neutral grips, leaving accent for actual values."""
-    rules = []
+    rules: list[Rule] = []
     for kind in ("ScrollArea", "ListView", "TreeView", "DataGrid", "TextBox"):
         channel = field.fill or t.surface
         rules.append(Rule(kind, "track", style=Style(
@@ -840,11 +942,11 @@ def _scrollbar_rules(t, field):
     return rules
 
 
-def _content_rules(t, panel, field):
+def _content_rules(t: Tokens, panel: Style, field: Style) -> list[Rule]:
     """Cards and feedback reuse each material while keeping their semantic roles."""
-    rules = []
+    rules: list[Rule] = []
 
-    def rule(kind, part, style, state="normal"):
+    def rule(kind: str, part: str, style: Style, state: StyleState = "normal") -> None:
         rules.append(Rule(kind, part, state, style))
 
     # Explicitly clear Button fallback effects on every interactive state.
@@ -928,11 +1030,11 @@ def _content_rules(t, panel, field):
     return rules
 
 
-def _navigation_rules(t, face, field, accent):
+def _navigation_rules(t: Tokens, face: Style, field: Style, accent: Style) -> list[Rule]:
     """Navigation shares the theme's surfaces without inheriting button bodies."""
-    rules = []
+    rules: list[Rule] = []
 
-    def rule(kind, part, style, state="normal"):
+    def rule(kind: str, part: str, style: Style, state: StyleState = "normal") -> None:
         rules.append(Rule(kind, part, state, style))
 
     empty = Style(fill="#00000000", fill_end="#00000000", border_width=0,
@@ -972,7 +1074,7 @@ def _navigation_rules(t, face, field, accent):
     return rules
 
 
-def _reference_theme(name):
+def _reference_theme(name: str) -> Theme:
     """Era-specific materials, shared by every control and every renderer.
 
     Light and dark are designed companions, not inverted screenshots. Geometry,
@@ -1206,7 +1308,9 @@ def _reference_theme(name):
                                 thumb=thumb, secondary=secondary)
     }
 
-    def rule(kinds, style, part="body", state="normal"):
+    def rule(
+        kinds: str, style: Style, part: str = "body", state: StyleState = "normal"
+    ) -> None:
         for kind in kinds.split():
             rules[kind, part, state] = Rule(kind, part, state, style)
 
@@ -1309,7 +1413,7 @@ def _reference_theme(name):
     return Theme(t, tuple(rules.values()))
 
 
-def _platform_theme(name):
+def _platform_theme(name: str) -> Theme:
     """Desktop-inspired roles; ordinary data, never a native widget dependency."""
     mac = name.startswith("macos")
     night = name.endswith("_dark")
@@ -1410,7 +1514,7 @@ def _platform_theme(name):
 
     def rule(
         kinds: str, style: Style, part: str = "body", state: StyleState = "normal"
-    ):
+    ) -> None:
         for kind in kinds.split():
             rules[kind, part, state] = Rule(kind, part, state, style)
 

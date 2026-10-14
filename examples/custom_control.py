@@ -1,22 +1,24 @@
 """A custom control with observable sizing and portable painting."""
 
-from pysual import App, Control, Dirty, Label, Rect, Slider, prop
+from pysual import App, Control, Dirty, Label, Painter, Rect, Slider, prop
+from pysual.host import Host
+from pysual.schema import expect_number
 
 
 class Meter(Control):
     value: float = prop(default=0.5, minimum=0)
     caption: str = prop(default="Level", affects=Dirty.MEASURE | Dirty.PAINT)
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
-        if name == "value" and value > 1:
+        if name == "value" and expect_number(value) > 1:
             raise ValueError("Meter value must be between 0 and 1")
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         width, height = host.measure(self.caption, 16)
         return width + 24, max(32, height + 16)
 
-    def paint(self, painter):
+    def paint(self, painter: Painter, /) -> None:
         area = Rect(0, 0, self.bounds.width, self.bounds.height)
         painter.rect(area, "#23334a", radius=10)
         filled = Rect(area.x, area.y, area.width * self.value, area.height)
@@ -40,7 +42,7 @@ class Demo(App):
 
 
 if __name__ == "__main__":
-    from pysual import autoconfig
+    from pysual import autoconfig as autoconfig
     from argparse import ArgumentParser
 
     ArgumentParser(description=__doc__).parse_args()

@@ -1,7 +1,7 @@
 """Small typed value editors; transient editing uses the shared popup path."""
 
 from math import isfinite
-from typing import ClassVar
+from typing import Any, ClassVar, TypeVar
 
 from .behaviors import PressBehavior
 from ._ranges import NumericRange
@@ -9,9 +9,11 @@ from .controls import Container, Control, Label
 from .editing import EditorContent, EditorPopup
 from .events import ChangeEvent, Event, KeyEvent
 from .geometry import Rect
-from .schema import Dirty, prop
+from .schema import Dirty, Field, _dynamic_properties, prop
 from .theme import _color
 from .widgets import Slider, TextBox
+from .host import Host, Input
+from .painting import Painter
 
 
 class NumericInput(Control):
@@ -24,7 +26,7 @@ class NumericInput(Control):
     focusable: bool = prop(default=True, affects=Dirty.HIT_TEST)
     changed: ClassVar[Event[ChangeEvent[float]]] = Event(ChangeEvent)
 
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
         self._press = PressBehavior(keys=())
 
@@ -32,18 +34,22 @@ class NumericInput(Control):
         self._press.reset(self)
         super().destroy()
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
-        data = {**self._values, name: value}
-        bounds = NumericRange(data["minimum"], data["maximum"])
-        if not bounds.contains(data["value"]):
+        if name not in ("minimum", "maximum", "value", "decimals"):
+            return
+        pending = self._pending(name, value)
+        bounds = NumericRange(
+            pending.optional_number("minimum"), pending.optional_number("maximum"),
+        )
+        if not bounds.contains(pending.number("value")):
             raise ValueError("NumericInput requires minimum <= value <= maximum")
         if not bounds.is_ordered():
             raise ValueError("minimum must not exceed maximum")
-        if data["decimals"] > 8:
+        if pending.number("decimals") > 8:
             raise ValueError("decimals must be between 0 and 8")
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         return 180, self._control_height(host)
 
     def set_range(
@@ -72,7 +78,7 @@ class NumericInput(Control):
             raise ValueError("NumericInput requires minimum <= value <= maximum")
         self.update(minimum=minimum, maximum=maximum, value=candidate)
 
-    def increment(self, steps=1):
+    def increment(self, steps: float = 1) -> None:
         self._check_live()
         if not self.effective_enabled:
             return
@@ -82,7 +88,7 @@ class NumericInput(Control):
         if isfinite(value):
             self.value = value
 
-    def edit(self):
+    def edit(self) -> None:
         """Open the numeric editor and return without waiting for a value.
         Requires a running App; disabled controls do nothing. Apply or Enter
         commits a valid value as a user change; dismissal commits no edit.
@@ -92,10 +98,10 @@ class NumericInput(Control):
         if self.effective_enabled:
             _ValuePopup(self).show(self)
 
-    def _create_editor_content(self):
+    def _create_editor_content(self) -> "NumericEditor":
         return NumericEditor(self.value, decimals=self.decimals)
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         style = p.body()
         p.icon("minus", 8, (p.height - 20) / 2, color=style.foreground)
         p.icon(
@@ -115,14 +121,14 @@ class NumericInput(Control):
             size=style.font_size,
         )
 
-    def _pointer_part(self, event):
+    def _pointer_part(self, event: Input) -> int:
         x = event.x - self.bounds.x
         return -1 if x < 36 else 1 if x >= self.bounds.width - 36 else 0
 
-    def _popup_press_passthrough(self, event):
+    def _popup_press_passthrough(self, event: Input) -> bool:
         return self._pointer_part(event) != 0
 
-    def handle_input(self, event, /):
+    def handle_input(self, event: Input, /) -> bool | None:
         part = self._pointer_part(event)
         if self._press.handle_input(self, event, part=part):
             self.increment(part) if part else self.edit()
@@ -146,7 +152,7 @@ class ColorPicker(Control):
     focusable: bool = prop(default=True, affects=Dirty.HIT_TEST)
     changed: ClassVar[Event[ChangeEvent[str]]] = Event(ChangeEvent)
 
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
         self._press = PressBehavior(keys=())
 
@@ -154,15 +160,15 @@ class ColorPicker(Control):
         self._press.reset(self)
         super().destroy()
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
         if name == "value":
             _color(value)
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         return 180, self._control_height(host)
 
-    def edit(self):
+    def edit(self) -> None:
         """Open the color editor and return without waiting for a value.
         Requires a running App; disabled controls do nothing. Apply or Enter
         commits a valid color as a user change; dismissal commits no edit.
@@ -172,10 +178,10 @@ class ColorPicker(Control):
         if self.effective_enabled:
             _ValuePopup(self).show(self)
 
-    def _create_editor_content(self):
+    def _create_editor_content(self) -> "ColorEditor":
         return ColorEditor(self.value)
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         style = p.body()
         for row in range(2):
             for column in range(4):
@@ -192,7 +198,7 @@ class ColorPicker(Control):
             size=style.font_size,
         )
 
-    def handle_input(self, event, /):
+    def handle_input(self, event: Input, /) -> bool | None:
         if self._press.handle_input(self, event):
             self.edit()
         elif event.kind == "key_down" and event.key in ("Enter", "Space"):
@@ -200,7 +206,7 @@ class ColorPicker(Control):
 
 
 class _ColorEntry(TextBox):
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         super()._changed(field, old, value)
         editor = getattr(self, "_editor_content", None)
         if field.name == "text" and editor is not None:
@@ -209,7 +215,7 @@ class _ColorEntry(TextBox):
 
 
 class _ColorChannel(Slider):
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         super()._changed(field, old, value)
         if field.name == "value" and self._origin == "user":
             editor = getattr(self, "_editor_content", None)
@@ -220,18 +226,24 @@ class _ColorChannel(Slider):
                 editor._sync_entry()
 
 
-class _TextEditorContent(EditorContent):
+_V = TypeVar("_V")
+
+
+class _TextEditorContent(EditorContent[_V]):
+    entry: TextBox
+    _initial_text: str
+
     def is_untouched(self) -> bool:
         # Display precision is not storage precision. An untouched draft must
         # also preserve external value changes made while the editor was open.
         return self.entry.text == self._initial_text and not self.entry.can_undo
 
-    def entry_on_key_down(self, event: KeyEvent):
+    def entry_on_key_down(self, event: KeyEvent) -> None:
         if event.key == "Enter":
             self.submit()
 
 
-class NumericEditor(_TextEditorContent):
+class NumericEditor(_TextEditorContent[float]):
     """Reusable numeric draft content, independent of its inline/popup host."""
 
     hint: ClassVar[str] = "Enter a number; Escape cancels"
@@ -242,9 +254,9 @@ class NumericEditor(_TextEditorContent):
         if decimals > 8:
             raise ValueError("decimals must be between 0 and 8")
         self._decimals = decimals
-        super().__init__(value, **properties)
+        super().__init__(value, **_dynamic_properties(properties))
 
-    def build(self, value):
+    def build(self, value: float) -> None:
         self.entry = TextBox(text=f"{value:.{self._decimals}f}", height=38)
         self._initial_text = self.entry.text
         self.entry.select_all()
@@ -254,7 +266,7 @@ class NumericEditor(_TextEditorContent):
         NumericInput._schema["value"].validate(value)
         return value
 
-    def error_message(self, error, owner) -> str:
+    def error_message(self, error: Exception, owner: Control) -> str:
         try:
             value = float(self.entry.text)
         except ValueError:
@@ -271,18 +283,18 @@ class NumericEditor(_TextEditorContent):
         return str(error)
 
 
-class ColorEditor(_TextEditorContent):
+class ColorEditor(_TextEditorContent[str]):
     """RGBA draft content with synchronous text/channel synchronization."""
 
     hint: ClassVar[str] = "RGBA hex or channel sliders"
     popup_size: ClassVar[tuple[float, float]] = (300, 320)
 
     def __init__(self, value: str, **properties: object):
-        super().__init__(value, **properties)
+        super().__init__(value, **_dynamic_properties(properties))
 
-    def build(self, value):
+    def build(self, value: str) -> None:
         _color(value)
-        self._channels_rgba = []
+        self._channels_rgba: list[_ColorChannel] = []
         self.entry = _ColorEntry(text=value, height=38)
         self._initial_text = self.entry.text
         self.entry.select_all()
@@ -305,20 +317,20 @@ class ColorEditor(_TextEditorContent):
         _color(value)
         return value
 
-    def equivalent(self, value, current) -> bool:
+    def equivalent(self, value: str, current: str) -> bool:
         value, current = value.upper(), current.upper()
         return (value + ("FF" if len(value) == 7 else "")) == (
             current + ("FF" if len(current) == 7 else "")
         )
 
-    def error_message(self, error, owner) -> str:
+    def error_message(self, error: Exception, owner: Control) -> str:
         try:
             _color(self.entry.text.strip())
         except ValueError:
             return "Use #RRGGBB or #RRGGBBAA."
         return str(error)
 
-    def _sync_channels(self, text):
+    def _sync_channels(self, text: str) -> None:
         text = text.strip()
         try:
             _color(text)
@@ -333,22 +345,28 @@ class ColorEditor(_TextEditorContent):
             finally:
                 slider._origin = previous
 
-    def _sync_entry(self):
+    def _sync_entry(self) -> None:
         self.entry.text = (
             "#" + "".join(f"{round(s.value):02X}" for s in self._channels_rgba)
         )
 
 
-class _ValuePopup(EditorPopup):
+class _ValuePopup(EditorPopup[Any]):
     """Compatibility wrapper; each owner supplies its editor content explicitly."""
 
-    def __init__(self, owner):
+    def __init__(self, owner: NumericInput | ColorPicker) -> None:
         super().__init__(owner, owner._create_editor_content())
 
     @property
-    def entry(self):
-        return self.content.entry
+    def entry(self) -> TextBox:
+        content = self.content
+        if not isinstance(content, _TextEditorContent):
+            raise TypeError("Value popup content must be text editor content")
+        return content.entry
 
     @property
-    def _channels_rgba(self):
-        return getattr(self.content, "_channels_rgba", ())
+    def _channels_rgba(self) -> list[_ColorChannel] | tuple[()]:
+        content = self.content
+        if isinstance(content, ColorEditor):
+            return content._channels_rgba
+        return ()

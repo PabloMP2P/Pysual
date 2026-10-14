@@ -4,14 +4,17 @@ from __future__ import annotations
 
 from time import monotonic
 from math import ceil
-from typing import ClassVar
+from typing import ClassVar, cast
 from .._text_display import single_line
 from ..controls import Control
 from ..events import ChangeEvent, Event
 from ..geometry import Rect
-from ..schema import Dirty, prop
+from ..schema import Dirty, Field, _sequence, expect_number, prop
+from ..host import Host, Input
+from ..painting import Painter
+from ..theme import ResolvedStyle
 from .._scrolling import (
-    can_scroll, clamp_scroll, typeahead_prefix,
+    Scrollbar, can_scroll, clamp_scroll, typeahead_prefix,
     scrollbar, handle_scrollbars, paint_scrollbars,
 )
 
@@ -27,41 +30,46 @@ class ListView(Control):
     style_parts: ClassVar[tuple[str, ...]] = ("body", "row", "track", "thumb")
     _contained_style_parts: ClassVar[frozenset[str]] = frozenset(("row", "track", "thumb"))
 
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
         self._scroll = 0
         self._wheel = 0.0
-        self._scroll_drag = None
-        self._prefix, self._typed_at = "", 0.0
+        self._scroll_drag: tuple[int, int, float] | None = None
+        self._prefix = ""
+        self._typed_at = 0.0
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         return 220, 220
 
-    def _row_height(self):
+    def _row_height(self) -> float:
         return self.effective_row_height(self.row_height)
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
-        if name == "selected_index" and value >= len(self.items):
+        if name == "selected_index" and expect_number(value) >= len(self.items):
             raise ValueError("Selected index is outside items")
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         if field.name == "items":
             self._clamp_scroll()
             self._wheel = 0.0
             self._scroll_drag = None
             self._prefix = ""
-            if self.selected_index >= len(value):
+            if self.selected_index >= len(_sequence(value)):
                 self.selected_index = -1
         super()._changed(field, old, value)
 
-    def _clamp_scroll(self):
-        self._scroll = clamp_scroll(self._scroll, len(self.items), self._visible_rows())
+    def _clamp_scroll(self) -> None:
+        # Row offsets stay whole. clamp_scroll is annotated float, but these
+        # inputs are ints and max/min preserve that integer.
+        self._scroll = cast(
+            int, clamp_scroll(self._scroll, len(self.items), self._visible_rows())
+        )
 
-    def _visible_rows(self):
+    def _visible_rows(self) -> int:
         return max(1, int(self._rect.height / self._row_height()))
 
-    def _scrollbar(self):
+    def _scrollbar(self) -> tuple[Rect, Rect] | None:
         visible = self._visible_rows()
         if (
             len(self.items) <= visible
@@ -78,14 +86,14 @@ class ListView(Control):
         bar = scrollbar(track, len(self.items), visible, self._scroll)
         return (bar.track, bar.thumb) if bar is not None else None
 
-    def _scrollbars(self):
+    def _scrollbars(self) -> list[Scrollbar]:
         boxes = self._scrollbar()
         if boxes is None:
             return []
         bar = scrollbar(boxes[0], len(self.items), self._visible_rows(), self._scroll)
         return [bar] if bar is not None else []
 
-    def _row_at(self, x, y):
+    def _row_at(self, x: float, y: float) -> int:
         if not self._rect.contains(x, y) or not self._clip.contains(x, y):
             return -1
         scrollbar = self._scrollbar()
@@ -131,7 +139,7 @@ class ListView(Control):
         if self.selected_index >= 0:
             self.reveal(self.selected_index)
 
-    def _typeahead(self, key):
+    def _typeahead(self, key: str) -> None:
         now = monotonic()
         self._prefix, prefix = typeahead_prefix(self._prefix, self._typed_at, key, now)
         self._typed_at = now
@@ -143,7 +151,7 @@ class ListView(Control):
                 self.reveal_selection()
                 break
 
-    def scroll_input(self, e, /) -> bool:
+    def scroll_input(self, e: Input, /) -> bool:
         self._clamp_scroll()
         if e.shift or not can_scroll(
             self._scroll, max(0, len(self.items) - self._visible_rows()), e.delta
@@ -153,7 +161,7 @@ class ListView(Control):
         self.handle_input(e)
         return True
 
-    def handle_input(self, e, /):
+    def handle_input(self, e: Input, /) -> bool | None:
         self._clamp_scroll()
         previous_scroll = self._scroll
         if e.kind == "focus" and self._should_reveal_focus():
@@ -211,12 +219,12 @@ class ListView(Control):
         if self._scroll != previous_scroll:
             self.invalidate()
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         s = p.body()
         with p._clipped(Rect(0, 0, p.width, p.height)):
             self._paint_items(p, s)
 
-    def _paint_items(self, p, s):
+    def _paint_items(self, p: Painter, s: ResolvedStyle) -> None:
         row_height = self._row_height()
         self._clamp_scroll()
         scrollbar = self._scrollbar()

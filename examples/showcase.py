@@ -63,6 +63,7 @@ from pysual import (
     registered_controls,
     theme_names,
 )
+from pysual.host import Viewport
 
 
 class Orbit(Control):
@@ -182,7 +183,7 @@ class Showcase(App):
         Label(parent=self.sidebar, text="THEME", height=20, font_size=12)
         self.theme_choice = Dropdown(
             parent=self.sidebar,
-            items=tuple(name for name, theme in self._themes),
+            items=tuple(name for name, _theme in self._themes),
             selected_index=next(
                 (i for i, (_, theme) in enumerate(self._themes) if theme == self.theme), -1
             ),
@@ -286,7 +287,7 @@ class Showcase(App):
         self.create_task(self.animate_frames())
         self.create_task(self.measure_fps())
 
-    def Showcase_on_viewport_changed(self, event: ChangeEvent):
+    def Showcase_on_viewport_changed(self, event: ChangeEvent[Viewport]):
         self.meter.visible = event.new_value.width >= 800
 
     async def animate_frames(self):
@@ -1148,7 +1149,7 @@ class Showcase(App):
 
 def main():
     # Activate CLI/environment settings only when launching this script.
-    from pysual import autoconfig  # noqa: F401
+    from pysual import autoconfig as autoconfig
 
     parser = argparse.ArgumentParser(
         description=__doc__,

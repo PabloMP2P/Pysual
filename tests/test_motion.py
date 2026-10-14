@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from pysual import App, Button, Container, Dirty, Style, Theme, Toggle, get_theme
 from pysual.host import Input
+from pysual.motion import interaction_state
 from pysual.painting import Painter, RetainedPaintTree, resolve_style
 from pysual.runtime import Runtime
 from test_library import RecordingHost
@@ -37,6 +38,24 @@ class MotionTests(UIOwnerTestCase):
     def style(self, control=None):
         control = control or self.button
         return Painter(self.host, control.bounds, control.effective_theme, control).style()
+
+    def test_forwarded_checked_state_is_read_once_and_normalized(self):
+        class DelegatedCheck(Button):
+            def __getattr__(self, name):
+                if name == "checked":
+                    self._checked_reads += 1
+                    return self._checked_value
+                raise AttributeError(name)
+
+        control = DelegatedCheck()
+        self.addCleanup(control.destroy)
+        control._checked_reads = 0
+        for value in (1, 0):
+            control._checked_value = value
+            before = control._checked_reads
+            self.assertEqual(interaction_state(control), ("normal", bool(value)))
+            self.assertEqual(control._checked_reads, before + 1)
+        self.assertEqual(interaction_state(self.button), ("normal", False))
 
     def test_hover_blends_then_releases_all_work_and_keeps_layout_stable(self):
         normal, bounds = self.style(), self.button.bounds

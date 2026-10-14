@@ -564,6 +564,46 @@ class LiveSVGHostTests(unittest.TestCase):
         self.assertEqual(len(result), 2560)
         self.assertTrue(all(event.kind == "key_down" for event in result))
 
+    def test_unrepresentable_numbers_return_bad_requests_atomically(self):
+        huge = 10 ** 400
+        events = [
+            {"kind": "pointer_move", field: huge}
+            for field in ("x", "y", "delta")
+        ]
+        events.extend(
+            {"kind": "viewport", "viewport": {"width": 320, "height": 240, field: huge}}
+            for field in ("width", "height", "scale", "keyboard_occlusion")
+        )
+        events.append({
+            "kind": "viewport",
+            "viewport": {"width": 320, "height": 240, "safe_area": [0, huge, 0, 0]},
+        })
+        for event in events:
+            with self.subTest(event=event):
+                payload = {"events": [{"kind": "text", "text": "discard"}, event]}
+                self.assertEqual(
+                    self.request("POST", "/events", json.dumps(payload))[0], 400
+                )
+                self.assertEqual(self.host.poll(), [])
+        self.assertEqual(
+            self.request("POST", "/events", '{"events":[{"kind":"repaint"}]}')[0], 200
+        )
+        self.assertEqual(self.host.poll(), [Input("repaint")])
+
+    def test_pointer_coalescing_preserves_each_pointer_and_pointer_kind(self):
+        self.host._receive({"events": [
+            {"kind": "pointer_move", "pointer_id": 1, "pointer_kind": "touch", "x": 10},
+            {"kind": "pointer_move", "pointer_id": 1, "pointer_kind": "touch", "x": 20},
+            {"kind": "pointer_move", "pointer_id": 2, "pointer_kind": "touch", "x": 30},
+            {"kind": "pointer_move", "pointer_id": 2, "pointer_kind": "touch", "x": 40},
+            {"kind": "pointer_move", "pointer_id": 2, "pointer_kind": "pen", "x": 50},
+        ]})
+        self.assertEqual(self.host.poll(), [
+            Input("pointer_move", pointer_id=1, pointer_kind="touch", x=20),
+            Input("pointer_move", pointer_id=2, pointer_kind="touch", x=40),
+            Input("pointer_move", pointer_id=2, pointer_kind="pen", x=50),
+        ])
+
     def test_motion_overflow_preserves_close_and_lifecycle_events(self):
         protected = [
             Input("close"),

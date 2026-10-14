@@ -6,8 +6,9 @@ from typing import ClassVar
 from ..controls import Button
 from ..events import ChangeEvent, Event
 from ..geometry import Rect
-from ..painting import resolve_style
-from ..schema import prop
+from ..painting import resolve_style, Painter
+from ..schema import Field, prop
+from ..host import Host, Input
 
 
 class CheckBox(Button):
@@ -17,9 +18,9 @@ class CheckBox(Button):
     _style_kind: ClassVar[str] = "CheckBox"
     style_parts: ClassVar[tuple[str, ...]] = ("body", "check")
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         style = resolve_style(self)
-        width, height = host.measure(
+        width, _height = host.measure(
             self.text, style.font_size, style.font_family == "mono"
         )
         return max(90, width + 30), self._control_height(host, self.text)
@@ -30,7 +31,7 @@ class CheckBox(Button):
             self.checked = not self.checked
             super().activate()
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         check = p.style("check")
         s = p.style()
         y = (p.height - 20) / 2
@@ -51,16 +52,16 @@ class CheckBox(Button):
 class Toggle(CheckBox):
     style_parts: ClassVar[tuple[str, ...]] = ("body", "track", "thumb")
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         style = resolve_style(self)
-        width, height = host.measure(
+        width, _height = host.measure(
             self.text,
             style.font_size,
             style.font_family == "mono",
         )
         return width + 64, self._control_height(host, self.text)
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         s, track, thumb = p.style(), p.style("track"), p.style("thumb")
         y = (p.height - 24) / 2
         p.surface(Rect(0, y, 44, 24), track)
@@ -104,7 +105,7 @@ class RadioButton(CheckBox):
     def on_attached(self):
         self._exclusive()
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         if field.name in ("checked", "group"):
             self._exclusive()
         super()._changed(field, old, value)
@@ -115,7 +116,7 @@ class RadioButton(CheckBox):
             self.checked = True
             Button.activate(self)
 
-    def handle_input(self, event, /):
+    def handle_input(self, event: Input, /) -> bool | None:
         if event.kind == "key_down" and event.key in (
             "ArrowLeft", "ArrowUp", "ArrowRight", "ArrowDown"
         ):
@@ -140,7 +141,7 @@ class RadioButton(CheckBox):
             return
         super().handle_input(event)
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         s, check = p.style(), p.style("check")
         y = (p.height - 20) / 2
         p.marker(Rect(0, y, 20, 20), check, shape="circle", checked=self.checked)

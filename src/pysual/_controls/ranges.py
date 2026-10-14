@@ -9,8 +9,9 @@ from ..behaviors import PressBehavior
 from ..controls import Control
 from ..events import ChangeEvent, Event
 from ..geometry import Rect
-from ..painting import resolve_style
-from ..schema import Dirty, prop
+from ..painting import resolve_style, Painter
+from ..schema import Dirty, Field, prop
+from ..host import Host, Input
 
 
 class Slider(Control):
@@ -36,12 +37,14 @@ class Slider(Control):
         self._drag_pointer: int | None = None
         self._drag_update = False
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
-        data = {**self._values, name: value}
-        bounds = NumericRange(data["minimum"], data["maximum"])
-        if (not bounds.contains(data["value"]) or not bounds.is_ordered(strict=True)
-                or not isfinite(data["maximum"] - data["minimum"])):
+        if name not in ("minimum", "maximum", "value"):
+            return
+        pending = self._pending(name, value)
+        bounds = NumericRange(pending.number("minimum"), pending.number("maximum"))
+        if (not bounds.contains(pending.number("value")) or not bounds.is_ordered(strict=True)
+                or not isfinite(pending.number("maximum") - pending.number("minimum"))):
             raise ValueError(
                 "Slider requires minimum <= value <= maximum and a finite positive range"
             )
@@ -50,13 +53,13 @@ class Slider(Control):
         self._drag_pointer = None
         self._press.reset(self)
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         if (field.name in ("minimum", "maximum", "step", "enabled", "visible")
                 or field.name == "value" and not self._drag_update):
             self._clear_interaction()
         super()._changed(field, old, value)
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         return 180, self._control_height(host)
 
     def set_range(self, minimum: float, maximum: float, *, value: float | None = None) -> None:
@@ -77,7 +80,7 @@ class Slider(Control):
         inset = min(9, self._rect.width / 2, self._rect.height / 2)
         return inset, max(0, self._rect.width - 2 * inset)
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         y = p.height / 2
         left, width = self._track()
         fraction = (self.value - self.minimum) / (self.maximum - self.minimum)
@@ -93,7 +96,7 @@ class Slider(Control):
             shape="circle" if thumb.radius >= left else "square",
         )
 
-    def _move_pointer(self, event):
+    def _move_pointer(self, event: Input) -> None:
         left, width = self._track()
         if width <= 0:
             return
@@ -112,7 +115,7 @@ class Slider(Control):
         finally:
             self._drag_update = False
 
-    def handle_input(self, event, /):
+    def handle_input(self, event: Input, /) -> bool | None:
         self._check_live()
         if event.kind == "blur":
             self._clear_interaction()
@@ -167,10 +170,12 @@ class ProgressBar(Control):
     changed: ClassVar[Event[ChangeEvent[float]]] = Event(ChangeEvent)
     style_parts: ClassVar[tuple[str, ...]] = ("body", "track", "fill")
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
-        values = {**self._values, name: value}
-        if not NumericRange(0, values["maximum"]).contains(values["value"]):
+        if name not in ("maximum", "value"):
+            return
+        pending = self._pending(name, value)
+        if not NumericRange(0, pending.number("maximum")).contains(pending.number("value")):
             raise ValueError("ProgressBar requires 0 <= value <= maximum")
 
     def set_range(self, maximum: float, *, value: float | None = None) -> None:
@@ -184,10 +189,10 @@ class ProgressBar(Control):
             raise ValueError("ProgressBar requires 0 <= value <= maximum")
         self.update(maximum=maximum, value=candidate)
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         return 200, self._control_height(host)
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         s = p.style()
         ratio = self.value / self.maximum
         track, fill = p.style("track"), p.style("fill")
@@ -234,13 +239,15 @@ class Rating(Control):
         self._preview: int | None = None
         self._preview_pointer: int | None = None
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
-        values = {**self._values, name: value}
-        if values["value"] > values["maximum"]:
+        if name not in ("value", "maximum"):
+            return
+        pending = self._pending(name, value)
+        if pending.number("value") > pending.number("maximum"):
             raise ValueError("Rating requires 0 <= value <= maximum")
 
-    def _set_preview(self, value):
+    def _set_preview(self, value: int | None) -> None:
         if self._preview != value:
             self._preview = value
             if not self._disposed:
@@ -251,7 +258,7 @@ class Rating(Control):
         self._preview_pointer = None
         self._set_preview(None)
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         if field.name in ("value", "maximum", "read_only", "enabled", "visible"):
             self._clear_interaction()
         super()._changed(field, old, value)
@@ -259,18 +266,18 @@ class Rating(Control):
     def _star_pitch(self):
         return max(24, resolve_style(self, "star").font_size * 1.5)
 
-    def _hit_star(self, event):
+    def _hit_star(self, event: Input) -> int | None:
         if not self._rect.contains(event.x, event.y):
             return None
         star = int((event.x - self._rect.x) // self._star_pitch()) + 1
         return star if star <= self.maximum else None
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         style = resolve_style(self, "star")
         height = host.measure("★", style.font_size, style.font_family == "mono")[1]
         return self._star_pitch() * self.maximum, max(self._control_height(host), height + 8)
 
-    def handle_input(self, event, /):
+    def handle_input(self, event: Input, /) -> bool | None:
         self._check_live()
         if event.kind == "blur":
             self._clear_interaction()
@@ -316,7 +323,7 @@ class Rating(Control):
                 )))
             )
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         super().paint(p)
         visible = self._clip.intersect(self._rect)
         if visible.width <= 0 or visible.height <= 0:

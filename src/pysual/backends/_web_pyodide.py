@@ -5,11 +5,14 @@ import base64
 import json
 import mimetypes
 import re
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from pathlib import Path
+from typing import NotRequired, Protocol, TypedDict, cast
 from urllib.parse import unquote
 
-from ._web_svg import SVGRenderer
+from ._web_svg import SVGRenderer, _FramePacket
 
+from ..geometry import Rect
 from ..host import (
     MAX_TEXT_BYTES,
     CapabilityError,
@@ -19,6 +22,93 @@ from ..host import (
     validate_session_key,
     validate_session_text,
 )
+
+
+class _PyodideBridge(Protocol):
+    """Browser object installed by the Pyodide host script."""
+
+    width: float
+    height: float
+    viewport: object
+    renderScale: float
+    resourceRevision: int
+
+    def open(self, title: str, width: float, height: float, scale: float) -> None: ...
+    def setSessionNamespace(self, namespace: str) -> None: ...
+    def title(self, text: str) -> None: ...
+    def poll(self) -> str: ...
+    def present(self, packet: str) -> None: ...
+    def close(self) -> None: ...
+    def textInput(self, x: float, y: float, width: float, height: float) -> None: ...
+    def readClipboard(self, operation: int) -> Awaitable[object]: ...
+    def writeClipboard(self, text: str, operation: int) -> Awaitable[object]: ...
+    def cancelOperation(self, operation: int) -> None: ...
+    def cancelSession(self, operation: int) -> None: ...
+    def readSessionJSON(self, key: str, operation: int) -> Awaitable[object]: ...
+    def writeSessionJSON(self, key: str, text: str, operation: int) -> Awaitable[object]: ...
+    def openUrl(self, url: str, operation: int) -> Awaitable[object]: ...
+    def openTextFile(self, limit: int, operation: int) -> Awaitable[object]: ...
+    def saveTextFile(self, text: str, name: str, operation: int) -> Awaitable[object]: ...
+
+
+class _ViewportData(TypedDict):
+    width: float
+    height: float
+    scale: NotRequired[float]
+    safe_area: NotRequired[tuple[float, float, float, float]]
+    keyboard_occlusion: NotRequired[float]
+
+
+class _InputData(TypedDict):
+    kind: str
+    x: NotRequired[float]
+    y: NotRequired[float]
+    key: NotRequired[str]
+    text: NotRequired[str]
+    delta: NotRequired[float]
+    shift: NotRequired[bool]
+    ctrl: NotRequired[bool]
+    button: NotRequired[int]
+    pointer_id: NotRequired[int]
+    pointer_kind: NotRequired[str]
+    viewport: NotRequired[Viewport | None]
+    paste: NotRequired[bool]
+
+
+class _TextFileData(TypedDict):
+    name: str
+    text: str
+    location: NotRequired[str | None]
+
+
+def _as_tuple(value: object) -> tuple[object, ...]:
+    return tuple(item for item in cast(Iterable[object], value))
+
+
+def _get(mapping: object, key: str, default: object) -> object:
+    getter: Callable[[str, object], object] = getattr(mapping, "get")
+    return getter(key, default)
+
+
+def _set(mapping: object, key: str, value: object) -> None:
+    setter: Callable[[str, object], None] = getattr(mapping, "__setitem__")
+    setter(key, value)
+
+
+def _viewport_from_json(data: object) -> Viewport:
+    _set(data, "safe_area", _as_tuple(_get(data, "safe_area", (0, 0, 0, 0))))
+    return Viewport(**cast(_ViewportData, data))
+
+
+def _json_object(text: str) -> object:
+    loaded: object = json.loads(text)
+    return loaded
+
+
+def _loads(value: object) -> object:
+    if isinstance(value, (str, bytes, bytearray)):
+        return json.loads(value)
+    return json.loads(cast(str, value))
 
 
 class BundledSVGHost(SVGRenderer):
@@ -38,18 +128,25 @@ class BundledSVGHost(SVGRenderer):
         }
     )
 
-    def __init__(self):
+    def __init__(self) -> None:
         from js import pysualHost  # type: ignore[import-not-found]
 
         super().__init__()
-        self.bridge = pysualHost
+        self.bridge: _PyodideBridge = pysualHost
         self._session_serial = 0
         self._sent_revision = -1
-        self._resource_events = []
+        self._resource_events: list[Input] = []
         self._opened = False
         self._session_namespace = "default"
 
-    def open(self, title, width, height, resizable, scale):
+    def open(
+        self,
+        title: str,
+        width: float,
+        height: float,
+        resizable: bool,
+        scale: float | None,
+    ) -> None:
         if self._opened:
             raise RuntimeError("The browser host is already open")
         if scale not in (None, 1):
@@ -63,55 +160,58 @@ class BundledSVGHost(SVGRenderer):
         self._sent_revision = -1
         self._resource_events.clear()
 
-    def set_size(self, width, height):
+    def set_size(self, width: float, height: float) -> None:
         raise CapabilityError("The browser owns the app viewport size")
 
-    def set_title(self, title):
+    def set_title(self, title: object) -> None:
         title = str(title)
         if title == self._title:
             return
         super().set_title(title)
         self.bridge.title(title)
 
-    def set_session_namespace(self, namespace):
+    def set_session_namespace(self, namespace: str) -> None:
         self._session_namespace = namespace
         if self._opened:
             self.bridge.setSessionNamespace(namespace)
 
     @property
-    def viewport(self):
+    def viewport(self) -> Viewport:
         if hasattr(self.bridge, "viewport"):
-            data = json.loads(str(self.bridge.viewport))
-            data["safe_area"] = tuple(data.get("safe_area", (0, 0, 0, 0)))
-            return Viewport(**data)
+            loaded = _json_object(str(self.bridge.viewport))
+            return _viewport_from_json(loaded)
         return Viewport(*self.size, self.render_scale)
 
-    def poll(self):
-        events = json.loads(self.bridge.poll())
-        result = []
-        for event in events:
-            if event.get("kind") == "image_error":
+    def poll(self) -> list[Input]:
+        loaded = _json_object(self.bridge.poll())
+        result: list[Input] = []
+        for event in cast(Iterable[object], loaded):
+            record = cast(dict[str, object], event)
+            if record.get("kind") == "image_error":
                 try:
-                    identifier = int(event.get("text", ""))
+                    identifier = int(cast(str, record.get("text", "")))
                 except (TypeError, ValueError):
                     continue
                 self.report_image_error(identifier)
                 continue
-            if event.get("viewport") is not None:
-                data = event["viewport"]
-                data["safe_area"] = tuple(data.get("safe_area", (0, 0, 0, 0)))
-                event["viewport"] = Viewport(**data)
-            result.append(Input(**event))
+            if record.get("viewport") is not None:
+                record["viewport"] = _viewport_from_json(record["viewport"])
+            result.append(Input(**cast(_InputData, record)))
         result.extend(self._resource_events)
         self._resource_events.clear()
         self.size = (float(self.bridge.width), float(self.bridge.height))
         return result
 
-    def lines(self, points, color, width: float = 1):
-        for first, last in zip(points, points[1:]):
-            self.line(first[0], first[1], last[0], last[1], color, width)
+    def lines(
+        self, points: Sequence[tuple[float, float]], color: str, width: float = 1
+    ) -> None:
+        previous: tuple[float, float] | None = None
+        for point in points:
+            if previous is not None:
+                self.line(previous[0], previous[1], point[0], point[1], color, width)
+            previous = point
 
-    def _resolve_image_source(self, source):
+    def _resolve_image_source(self, source: str) -> str:
         # Included/package assets exist in Pyodide's virtual filesystem. Other
         # relative paths and absolute URLs retain ordinary browser resolution.
         if source.startswith(("http://", "https://", "blob:")):
@@ -134,7 +234,7 @@ class BundledSVGHost(SVGRenderer):
         if not (path.is_absolute() and path.is_file()):
             if re.match(r"^[a-z][a-z\d+.-]*:|^[\\/]", source, re.IGNORECASE):
                 return source
-            parts = []
+            parts: list[str] = []
             try:
                 for raw in re.split(r"[?#]", source, maxsplit=1)[0].split("/"):
                     if re.search(r"%(?![0-9a-f]{2})", raw, re.IGNORECASE):
@@ -169,23 +269,25 @@ class BundledSVGHost(SVGRenderer):
         return super()._resolve_image_source(str(path))
 
     @property
-    def render_scale(self):
-        return float(getattr(self.bridge, "renderScale", 1))
+    def render_scale(self) -> float:
+        scale: object = getattr(self.bridge, "renderScale", 1)
+        return float(cast(float, scale))
 
     @property
-    def resource_revision(self):
-        return self._resource_revision + int(getattr(self.bridge, "resourceRevision", 0))
+    def resource_revision(self) -> int:
+        revision: object = getattr(self.bridge, "resourceRevision", 0)
+        return self._resource_revision + int(cast(int, revision))
 
-    def _resource_error(self, message):
+    def _resource_error(self, message: str) -> None:
         self._resource_events.append(Input("resource_error", text=message))
 
-    def present(self):
+    def present(self) -> None:
         self.publish_scene()
-        packet = self.frame_packet(self._sent_revision)
+        packet: _FramePacket = self.frame_packet(self._sent_revision)
         self.bridge.present(json.dumps(packet, separators=(",", ":")))
         self._sent_revision = packet["revision"]
 
-    def close(self):
+    def close(self) -> None:
         try:
             if self._opened:
                 self.bridge.close()
@@ -195,24 +297,26 @@ class BundledSVGHost(SVGRenderer):
             self._sent_revision = -1
             self._opened = False
 
-    async def clipboard_read(self):
+    async def clipboard_read(self) -> str:
         try:
-            return str(await self._service_call("readClipboard"))
+            return str(await self._service_call(self.bridge.readClipboard))
         except Exception as exc:
             raise CapabilityError(
                 "Browser clipboard read was denied or is unsupported"
             ) from exc
 
-    async def clipboard_write(self, text):
+    async def clipboard_write(self, text: str) -> None:
         try:
-            if not await self._service_call("writeClipboard", text):
+            if not await self._service_call(
+                lambda operation: self.bridge.writeClipboard(text, operation)
+            ):
                 raise CapabilityError("Browser clipboard write was cancelled")
         except Exception as exc:
             raise CapabilityError(
                 "Browser clipboard write was denied or is unsupported"
             ) from exc
 
-    def text_input(self, rect):
+    def text_input(self, rect: Rect | None) -> None:
         super().text_input(rect)
         self.bridge.textInput(
             rect.x if rect else -1,
@@ -221,56 +325,86 @@ class BundledSVGHost(SVGRenderer):
             rect.height if rect else 0,
         )
 
-    async def open_text_file(self):
+    async def open_text_file(self) -> TextFile | None:
         try:
-            value = json.loads(await self._service_call("openTextFile", MAX_TEXT_BYTES))
-            return TextFile(**value) if value is not None else None
+            loaded = _loads(await self._service_call(
+                lambda operation: self.bridge.openTextFile(MAX_TEXT_BYTES, operation)
+            ))
+            if loaded is None:
+                return None
+            return TextFile(**cast(_TextFileData, loaded))
         except Exception as exc:
             raise CapabilityError(f"Browser file import failed: {exc}") from exc
 
-    async def save_text_file(self, text, suggested_name, location):
+    async def save_text_file(
+        self, text: str, suggested_name: str, location: str | None
+    ) -> TextFile | None:
         try:
-            saved = await self._service_call("saveTextFile", text, suggested_name)
+            saved = await self._service_call(
+                lambda operation: self.bridge.saveTextFile(text, suggested_name, operation)
+            )
             return TextFile(str(saved), text) if saved else None
         except Exception as exc:
             raise CapabilityError(f"Browser file export failed: {exc}") from exc
 
-    async def _service_call(self, method, *args, cancel="cancelOperation"):
+    async def _service_call(
+        self,
+        invoke: Callable[[int], Awaitable[object]],
+        *,
+        cancel: Callable[[int], None] | None = None,
+    ) -> object:
+        """Keep operation identity and cancellation together for typed bridge calls."""
         self._session_serial += 1
         operation = self._session_serial
         try:
-            return await getattr(self.bridge, method)(*args, operation)
-        except asyncio.CancelledError:
-            getattr(self.bridge, cancel)(operation)
+            return await invoke(operation)
+        except asyncio.CancelledError as cancelled:
+            try:
+                (self.bridge.cancelOperation if cancel is None else cancel)(operation)
+            except Exception as cleanup_error:
+                # Browser teardown must not turn task cancellation into a service
+                # failure. Keep cleanup diagnostics attached to the cancellation.
+                raise cancelled from cleanup_error
             raise
 
-    async def read_session(self, key):
+    async def read_session(self, key: str) -> str | None:
         validate_session_key(key)
         try:
             # JSON carries null explicitly across Pyodide, where JS null and
             # Python None are distinct and Python None can become undefined.
-            text = await self._service_call("readSessionJSON", key, cancel="cancelSession")
-            value = json.loads(str(text))
-            validate_session_text(value)
-            return value
+            text = await self._service_call(
+                lambda operation: self.bridge.readSessionJSON(key, operation),
+                cancel=self.bridge.cancelSession,
+            )
+            value = _json_object(str(text))
+            if isinstance(value, str) or value is None:
+                validate_session_text(value)
+                return value
+            validate_session_text(cast(str | None, value))
+            return cast(str | None, value)
         except Exception as exc:
             raise CapabilityError(
                 f"Browser session storage read failed: {exc}"
             ) from exc
 
-    async def write_session(self, key, text):
+    async def write_session(self, key: str, text: str | None) -> None:
         validate_session_key(key)
         validate_session_text(text)
         try:
-            await self._service_call("writeSessionJSON", key, json.dumps(text), cancel="cancelSession")
+            await self._service_call(
+                lambda operation: self.bridge.writeSessionJSON(key, json.dumps(text), operation),
+                cancel=self.bridge.cancelSession,
+            )
         except Exception as exc:
             raise CapabilityError(
                 f"Browser session storage write failed: {exc}"
             ) from exc
 
-    async def open_url(self, url):
+    async def open_url(self, url: str) -> None:
         try:
-            if not await self._service_call("openUrl", url):
+            if not await self._service_call(
+                lambda operation: self.bridge.openUrl(url, operation)
+            ):
                 raise CapabilityError("Opening the URL was cancelled")
         except Exception as exc:
             raise CapabilityError(f"Browser URL opening failed: {exc}") from exc

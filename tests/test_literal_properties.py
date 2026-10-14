@@ -1,14 +1,20 @@
 """Literal declarations retain the existing validation and persistence contract."""
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import inspect
 import json
+import sys
 from typing import Literal
 
 import pytest
 
 from pysual import Container, Label, prop
 from pysual.errors import SchemaError
+
+
+@dataclass(frozen=True)
+class Caption:
+    text: str
 
 
 class StatusLabel(Label):
@@ -82,5 +88,101 @@ def test_existing_explicit_choice_metadata_keeps_its_previous_behavior():
         assert label.status == "busy"
         with pytest.raises(ValueError, match="expected one of"):
             label.status = "missing"
+    finally:
+        label.destroy()
+
+
+def test_nested_literals_validate_mutations_and_roundtrip_json():
+    class Choices(Label):
+        status: Literal["idle", "busy"] | None = prop(default=None)
+        flags: tuple[Literal[True], ...] = prop(default=())
+        pair: tuple[Literal[1, 2], Literal["left", "right"]] = prop(
+            default=(1, "left")
+        )
+
+    label = Choices(status="busy", flags=(True,), pair=(2, "right"))
+    try:
+        for name in ("status", "flags", "pair"):
+            field = label.properties()[name]
+            value = getattr(label, name)
+            assert field.serializable
+            assert field.decode(json.loads(json.dumps(field.encode(value)))) == value
+        for name, value in (("status", "missing"), ("flags", (1,)), ("pair", (True, "left"))):
+            with pytest.raises(TypeError, match="expected"):
+                setattr(label, name, value)
+            with pytest.raises(TypeError, match="expected"):
+                label.properties()[name].decode(value)
+        with pytest.raises(TypeError, match="expected"):
+            label.update(status="idle", pair=(1, "missing"))
+        assert (label.status, label.pair) == ("busy", (2, "right"))
+        label.update(status=None, flags=(), pair=(1, "left"))
+        assert (label.status, label.flags, label.pair) == (None, (), (1, "left"))
+    finally:
+        label.destroy()
+
+
+def test_invalid_nested_literal_is_rejected_even_with_an_empty_default():
+    with pytest.raises(SchemaError, match="do not mix bool and int"):
+        class AmbiguousItems(Label):
+            items: tuple[Literal[True, 1], ...] = prop(default=())
+
+    with pytest.raises(SchemaError, match="Literal properties require"):
+        class InvalidItems(Label):
+            items: tuple[Literal[b"bytes"], ...] = prop(default=())
+
+
+def test_schema_resolves_only_property_annotations_and_keeps_inherited_fields():
+    class ForwardState(Label):
+        _peer: "NotDefinedYet"
+        caption: "Caption" = prop(default=Caption("Ready"))
+
+    class Specialized(ForwardState):
+        _other: "AlsoNotDefinedYet"
+        caption: "Caption" = prop(default=Caption("Specialized"))
+        count: "int" = prop(default=0)
+
+    class Inherited(Specialized):
+        pass
+
+    label = Inherited(text="Inherited", count=2)
+    try:
+        assert (label.caption, label.text, label.count) == (
+            Caption("Specialized"), "Inherited", 2
+        )
+        assert Inherited.properties()["caption"].annotation is Caption
+        with pytest.raises(TypeError, match="expected"):
+            label.caption = "Wrong"
+    finally:
+        label.destroy()
+
+
+def test_property_forward_references_use_the_declaring_class_namespace():
+    class Aliased(Label):
+        Status = Literal["idle", "busy"]
+        status: "Status" = prop(default="idle")
+
+    label = Aliased(status="busy")
+    try:
+        assert label.status == "busy"
+        with pytest.raises(ValueError, match="expected one of"):
+            label.status = "missing"
+    finally:
+        label.destroy()
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Native deferred annotations require Python 3.14")
+def test_native_deferred_state_annotations_do_not_need_runtime_imports():
+    class Deferred(Label):
+        _peer: RuntimeUnavailable
+        count: int = prop(default=1)
+
+    class Inherited(Deferred):
+        _other: AlsoUnavailable
+
+    label = Inherited(count=2)
+    try:
+        assert label.count == 2
+        with pytest.raises(TypeError, match="expected"):
+            label.count = "Wrong"
     finally:
         label.destroy()

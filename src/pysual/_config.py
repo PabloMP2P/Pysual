@@ -67,7 +67,7 @@ _frozen: Settings | None = None
 _lock = RLock()
 
 
-def _validate(name, value):
+def _validate(name: str, value: object) -> object:
     if name == "backend":
         if value is not None and (
             not isinstance(value, str) or value not in BACKEND_NAMES
@@ -82,10 +82,12 @@ def _validate(name, value):
         if value is not None and value not in theme_names():
             raise ValueError("theme must be a built-in theme name")
     elif name == "ui_scale":
-        if value is not None and (
-            type(value) not in (int, float) or not math.isfinite(value) or value < 0.25
-        ):
-            raise ValueError("ui_scale must be a finite number of at least 0.25")
+        if value is not None:
+            if type(value) is int or type(value) is float:
+                if not math.isfinite(value) or value < 0.25:
+                    raise ValueError("ui_scale must be a finite number of at least 0.25")
+            else:
+                raise ValueError("ui_scale must be a finite number of at least 0.25")
     else:
         raise TypeError(f"Unknown startup setting {name!r}")
     return value
@@ -145,12 +147,13 @@ def window_defaults() -> dict[str, object]:
     return defaults
 
 
-def _convert(option, value):
+def _convert(option: Option, value: str) -> object:
     if option.field == "ui_scale":
         try:
-            value = float(value)
+            parsed = float(value)
         except (ValueError, TypeError):
             raise ValueError(f"{option.flag} requires a number") from None
+        return _validate(option.field, parsed)
     return _validate(option.field, value)
 
 

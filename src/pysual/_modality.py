@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, cast
 
 from ._engine import _origin, capture_origin, critical_phase, ensure_presentable
 from .errors import LifecycleError
@@ -15,7 +17,17 @@ if TYPE_CHECKING:
     from .widgets import SubWindow
 
 
-def contains(parent, control):
+class _Completable(Protocol):
+    def done(self) -> bool: ...
+
+
+def _pending(value: object) -> _Completable | None:
+    if isinstance(value, asyncio.Future):
+        return cast(_Completable, value)
+    return None
+
+
+def contains(parent: Control, control: Control | None) -> bool:
     """Identity-based physical ancestry without consulting public bindings."""
     while control is not None:
         if control is parent:
@@ -38,7 +50,7 @@ class ModalManager:
         self._openings: list[_Opening] = []
 
     @property
-    def active(self):
+    def active(self) -> SubWindow | None:
         return next(
             (
                 entry.control
@@ -48,21 +60,21 @@ class ModalManager:
             None,
         )
 
-    def _entry(self, control):
+    def _entry(self, control: Control | None) -> _Opening | None:
         return next(
             (entry for entry in self._openings if entry.control is control), None
         )
 
-    def _guard(self):
+    def _guard(self) -> None:
         ensure_presentable()
-        if getattr(self.runtime, "_phase", None) is not None:
+        if self.runtime._phase is not None:
             raise LifecycleError(
                 "Change presentations from a scheduled event handler, not a "
                 "build, layout, paint, validation or input traversal hook"
             )
 
-    def allowed(self, control):
-        if getattr(self.runtime, "_native_blockers", ()):
+    def allowed(self, control: Control) -> bool:
+        if self.runtime._native_blockers:
             return False
         active = self.active
         if active is None:
@@ -76,8 +88,8 @@ class ModalManager:
             and contains(active, popup._owner)
         )
 
-    def _owned_by(self, entry, owner):
-        seen = set()
+    def _owned_by(self, entry: _Opening, owner: Control) -> bool:
+        seen: set[int] = set()
         current: Control | None = entry.control
         while current is not None and id(current) not in seen:
             if contains(owner, current):
@@ -89,7 +101,7 @@ class ModalManager:
             )
         return False
 
-    def validate_visibility(self, control, value):
+    def validate_visibility(self, control: Control, value: bool) -> None:
         if value:
             return
         for entry in self._openings:
@@ -99,20 +111,20 @@ class ModalManager:
                 )
 
     def show(
-        self, control: SubWindow, *, modal=False, owner: Control | None = None
+        self, control: SubWindow, *, modal: bool = False, owner: Control | None = None
     ) -> Presentation:
         self._guard()
         with critical_phase("presentation transition"):
             return self._show(control, modal=modal, owner=owner)
 
     def _show(
-        self, control: SubWindow, *, modal=False, owner: Control | None = None
+        self, control: SubWindow, *, modal: bool = False, owner: Control | None = None
     ) -> Presentation:
         control._check_live()
         runtime = self.runtime
         if control._root() is not runtime.app or not runtime.app.is_open:
             raise LifecycleError("In-app windows require a running owner Window")
-        if getattr(control, "_presentation_error", None) is not None:
+        if control._presentation_error is not None:
             raise LifecycleError("This window's previous presentation did not clean up")
         existing = self._entry(control)
         if existing is not None:
@@ -152,15 +164,15 @@ class ModalManager:
             raise LifecycleError("The owner must be visible and enabled")
         if modal and not self.allowed(owner):
             active_entry = self._entry(self.active)
-            pending_close = getattr(owner, "_close_pending", None)
+            pending_close = _pending(getattr(owner, "_close_pending", None))
             if owner is runtime.app:
-                pending_close = getattr(runtime, "_close_task", None)
+                pending_close = runtime._close_task
             confirming_owner_close = (
                 pending_close is not None
                 and not pending_close.done()
                 and active_entry is not None
                 and self._owned_by(active_entry, owner)
-                and not getattr(runtime, "_native_blockers", ())
+                and not runtime._native_blockers
             )
             if not confirming_owner_close:
                 raise LifecycleError("The owner must be inside the active modal dialog")
@@ -169,16 +181,18 @@ class ModalManager:
             raise LifecycleError(
                 "The dialog's containing tree must be visible and enabled"
             )
-        if modal and runtime.popup is not None and contains(runtime.popup, control):
+        popup = runtime.popup
+        if modal and popup is not None and contains(popup, control):
             raise LifecycleError("Mount modal dialogs outside the transient popup tree")
 
-        previous = runtime.router.focus
+        router = runtime.router
+        previous = router.focus
         if modal:
-            if runtime.popup is not None:
-                runtime.popup.dismiss(restore_focus=False)
-            runtime.router.cancel_capture(clear_focus=True)
-            runtime.router.set_focus(None)
-            runtime.router._set_hover(None)
+            if popup is not None:
+                popup.dismiss(restore_focus=False)
+            router.cancel_capture(clear_focus=True)
+            router.set_focus(None)
+            router._set_hover(None)
         control._generation += 1
         presentation = Presentation(control._generation, modal=modal, owner=owner)
         entry = _Opening(control, presentation, owner, previous)
@@ -195,7 +209,7 @@ class ModalManager:
         try:
             control.visible = True
             if modal:
-                runtime.router._tab()
+                router._tab()
             runtime.invalidate()
             runtime._paint_frame()
         except BaseException as error:
@@ -205,29 +219,41 @@ class ModalManager:
             _origin.reset(origin_token)
         return presentation
 
-    def finish(self, control, result=None, *, reason="closed"):
+    def finish(
+        self, control: Control, result: object = None, *, reason: str = "closed"
+    ) -> None:
         self._guard()
         with critical_phase("presentation transition"):
             return self._finish(control, result, reason=reason)
 
-    def _finish(self, control, result=None, *, reason="closed"):
+    def _finish(
+        self, control: Control, result: object = None, *, reason: str = "closed"
+    ) -> None:
         entries = [entry for entry in self._openings if self._owned_by(entry, control)]
         self._finish_entries(entries, result, reason, target=control)
         if not entries and not control._disposed:
             control.visible = False
 
-    def destroying(self, control):
+    def destroying(self, control: Control) -> None:
         entries = [entry for entry in self._openings if self._owned_by(entry, control)]
         if entries:
             self._guard()
             with critical_phase("presentation transition"):
                 self._finish_entries(entries, None, "destroyed", target=control)
 
-    def shutdown(self, error=None):
+    def shutdown(self, error: BaseException | None = None) -> None:
         with critical_phase("presentation transition"):
             self._finish_entries(list(self._openings), None, "owner_closed", error)
 
-    def _finish_entries(self, entries, result, reason, error=None, *, target=None):
+    def _finish_entries(
+        self,
+        entries: list[_Opening],
+        result: object,
+        reason: str,
+        error: BaseException | None = None,
+        *,
+        target: Control | None = None,
+    ) -> None:
         if not entries:
             return
         runtime = self.runtime
@@ -237,13 +263,15 @@ class ModalManager:
         self._openings[:] = [entry for entry in self._openings if entry not in entries]
         cleanup_failure = None
         try:
-            if runtime.popup is not None and any(
-                contains(entry.control, runtime.popup._owner) for entry in entries
+            popup = runtime.popup
+            router = runtime.router
+            if popup is not None and any(
+                contains(entry.control, popup._owner) for entry in entries
             ):
-                runtime.popup.dismiss(restore_focus=False)
-            runtime.router.cancel_capture(clear_focus=True)
-            runtime.router.set_focus(None)
-            runtime.router._set_hover(None)
+                popup.dismiss(restore_focus=False)
+            router.cancel_capture(clear_focus=True)
+            router.set_focus(None)
+            router._set_hover(None)
             for entry in reversed(entries):
                 if not entry.control._disposed:
                     entry.control.visible = False
@@ -259,12 +287,12 @@ class ModalManager:
                 runtime.app.is_open
                 and previous is not None
                 and not previous._disposed
-                and runtime.router._visible(previous)
+                and router._visible(previous)
                 and self.allowed(previous)
             ):
-                runtime.router.set_focus(previous)
+                router.set_focus(previous)
             elif runtime.app.is_open:
-                runtime.router._tab()
+                router._tab()
             runtime.invalidate()
         except BaseException as cleanup_error:
             error = cleanup_error
@@ -283,11 +311,11 @@ class ModalManager:
         if cleanup_failure is not None and reason != "failed":
             raise cleanup_failure
 
-    def paint_order(self, children):
+    def paint_order(self, children: Sequence[Control]) -> list[Control]:
         modals = [entry.control for entry in self._openings if entry.presentation.modal]
         popup = self.runtime.popup
 
-        def priority(child):
+        def priority(child: Control) -> tuple[int, bool]:
             rank = max(
                 (i + 1 for i, modal in enumerate(modals) if contains(child, modal)),
                 default=0,

@@ -7,16 +7,18 @@ re-export these helpers without a circular initialization dependency.
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 import inspect
 import keyword
 import re
 from threading import RLock
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
 from ._engine import ui_method
 from .errors import BindingError, SchemaError
+from .schema import _dynamic_properties
 
 if TYPE_CHECKING:
     from .controls import Container, Control
@@ -46,7 +48,7 @@ class _Factory(Generic[C]):
             return self
 
         def factory(**properties: object) -> C:
-            return owner.create(self.control_type, **properties)
+            return owner.create(self.control_type, **_dynamic_properties(properties))
 
         factory.__name__ = self.control_type.__name__
         factory.__doc__ = self.control_type.__doc__
@@ -58,14 +60,26 @@ class _Factory(Generic[C]):
 class _Registration:
     control_type: type[Control]
     authorable: bool
-    factory: _Factory | None
+    factory: _Factory[Any] | None
 
 
 _registrations: dict[str, _Registration] = {}
 _registry_lock = RLock()
 
 
-def _container_classes(cls: type[Container]):
+def _stored_factory(registration: _Registration | None) -> _Factory[Any] | None:
+    """Return the alias stored on the registration.
+
+    Type checkers apply ``_Factory.__get__`` to this annotation. That descriptor
+    runs only when the alias is a container class attribute, so the saved
+    instance is read from the registration's dictionary.
+    """
+    if registration is None:
+        return None
+    return cast(_Factory[Any] | None, vars(registration)["factory"])
+
+
+def _container_classes(cls: type[Container]) -> Iterator[type[Container]]:
     yield cls
     for child in cls.__subclasses__():
         yield from _container_classes(child)
@@ -112,7 +126,7 @@ def register_control(
                 f"Control {name!r} is already registered; pass name='another_name'"
             )
         installed = inspect.getattr_static(Container, name, None)
-        alias = previous.factory if previous is not None else None
+        alias = _stored_factory(previous)
         if factory:
             if installed is not alias or alias is None:
                 if any(
@@ -137,7 +151,7 @@ def register_control(
 
 def registered_controls(
     *, authorable_only: bool = False, factories_only: bool = False,
-):
+) -> Mapping[str, type[Control]]:
     """Return an immutable catalog snapshot, optionally filtered for tooling.
 
     ``factories_only`` selects actual named Container aliases, for example when
@@ -153,7 +167,7 @@ def registered_controls(
             if (not authorable_only or registration.authorable)
             and (
                 not factories_only
-                or registration.factory is not None
-                and inspect.getattr_static(Container, name, None) is registration.factory
+                or (stored := _stored_factory(registration)) is not None
+                and inspect.getattr_static(Container, name, None) is stored
             )
         })

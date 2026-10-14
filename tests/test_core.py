@@ -1,13 +1,17 @@
+import ast
 import asyncio
 import inspect
 import json
 import threading
 import unittest
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal, get_args, get_origin
 
 from pysual import (
     App,
     Button,
+    ScrollArea,
     ClickEvent,
     ClosingEvent,
     Container,
@@ -24,6 +28,7 @@ from pysual import (
 from _support import exercise
 from _ui_testcase import AsyncUIOwnerTestCase
 from pysual.errors import BindingError, EventOverloadError, LifecycleError, SchemaError
+from pysual._value_bag import _ValueBag
 from pysual.host import Input
 from pysual.runtime import Runtime
 from test_library import RecordingHost, eventually
@@ -100,6 +105,36 @@ class PropertyTests(unittest.TestCase):
             button.wdith = 1
         button.width = 20
         self.assertTrue(button.dirty & Dirty.MEASURE)
+
+    def test_value_bag_keys_match_declared_properties(self):
+        self.assertNotIn("__getitem__", _ValueBag.__dict__)
+        self.assertIs(_ValueBag.__getitem__, dict.__getitem__)
+        stub = Path(__file__).resolve().parents[1] / "src" / "pysual" / "_value_bag.pyi"
+        module = ast.parse(stub.read_text(encoding="utf-8"))
+        owners = (Control, Container, ScrollArea)
+        found: set[str] = set()
+        for node in module.body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for item in node.body:
+                if not isinstance(item, ast.FunctionDef) or item.name != "__getitem__":
+                    continue
+                key = item.args.args[1].annotation
+                if not isinstance(key, ast.Subscript) or ast.unparse(key) == "str":
+                    continue
+                returned = eval(ast.unparse(item.returns), {"Literal": Literal})
+                elements = key.slice.elts if isinstance(key.slice, ast.Tuple) else [key.slice]
+                for element in elements:
+                    name = element.value
+                    self.assertNotIn(name, found)
+                    found.add(name)
+                    field = next(owner._schema[name] for owner in owners if name in owner._schema)
+                    if get_origin(returned) is Literal:
+                        self.assertEqual(set(get_args(returned)), set(field.definition.choices))
+                    else:
+                        self.assertEqual(field.annotation, returned)
+        self.assertIn("margin", found)
+        self.assertIn("scroll_x", found)
 
     def test_custom_schema_inherits_and_is_immutable(self):
         class Badge(Control):
@@ -551,6 +586,50 @@ class RuntimeInputTests(AsyncUIOwnerTestCase):
 
 
 class OwnershipTests(unittest.TestCase):
+    def test_binding_collision_does_not_probe_unrelated_class_members(self):
+        class ReservedState:
+            @property
+            def control_type(self):
+                raise AssertionError("Application state is not a blueprint")
+
+        class Form(Container):
+            reserved = ReservedState()
+
+        form, child = Form(), Button()
+        try:
+            with self.assertRaisesRegex(BindingError, "framework member"):
+                form.reserved = child
+            self.assertIsNone(child.parent)
+            self.assertEqual(form.children, ())
+        finally:
+            child.destroy()
+            form.destroy()
+
+    def test_handler_diagnostics_do_not_probe_unrelated_application_state(self):
+        class ApplicationState:
+            def __getattr__(self, name):
+                raise AssertionError(f"Unexpected application state access: {name}")
+
+        class Form(Container):
+            @staticmethod
+            def missing_on_click(event):
+                pass
+
+            @classmethod
+            def other_on_click(cls, event):
+                pass
+
+        form = Form()
+        try:
+            form.state = ApplicationState()
+            self.assertEqual(form.check_handlers(), ())
+            diagnostics = form.check_handlers(include_unbound=True)
+            self.assertEqual(len(diagnostics), 2)
+            self.assertIn("Form.missing_on_click", diagnostics[0])
+            self.assertIn("Form.other_on_click", diagnostics[1])
+        finally:
+            form.destroy()
+
     def test_independent_windows_across_classes(self):
         class First(App):
             pass

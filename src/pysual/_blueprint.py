@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import keyword
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Generic, Mapping, TypeVar, overload
+from typing import TYPE_CHECKING, Any, Generic, Mapping, TypeVar, overload
 
 from .errors import BindingError, LifecycleError
 
@@ -88,9 +88,9 @@ class Blueprint(Generic[C]):
         vars(instance)[self._name] = value
 
 
-def declarations(owner_type: type) -> dict[str, Blueprint]:
+def declarations(owner_type: type) -> dict[str, Blueprint[Any]]:
     """Resolve inherited declarations without evaluating descriptors or user code."""
-    result: dict[str, Blueprint] = {}
+    result: dict[str, Blueprint[Any]] = {}
     for base in reversed(owner_type.__mro__):
         for name, value in vars(base).items():
             if isinstance(value, Blueprint):

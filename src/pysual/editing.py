@@ -5,18 +5,22 @@ The popup commits through the owner's property, preserving its validation and
 change events; content never needs to know which control presents it.
 """
 
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, Generic, TypeVar
 
 from .controls import Button, Container, Control, Label
 from .events import ClickEvent, Event, UiEvent
+from .painting import Painter
 from .popup import Popup
+from .schema import _dynamic_properties
 from .widgets import ScrollArea
 
 if TYPE_CHECKING:
     from .schema import _init_argument
 
+_V = TypeVar("_V")
 
-class EditorContent(Container):
+
+class EditorContent(Container, Generic[_V]):
     """A draft editor that can be placed inline or supplied to EditorPopup.
 
     Implement build(value) and read(). Override is_untouched() when formatting
@@ -27,25 +31,27 @@ class EditorContent(Container):
     if TYPE_CHECKING:
         # Preserve the inherited required draft argument when type checkers
         # synthesize constructors for subclasses that only override hooks.
-        _editor_value_input: object = _init_argument(alias="value", kw_only=False)
+        _editor_value_input: _V = _init_argument(alias="value", kw_only=False)
 
     submitted: ClassVar[Event[UiEvent]] = Event(UiEvent)
     hint: ClassVar[str] = ""
     popup_size: ClassVar[tuple[float, float]] = (300, 158)
 
-    def __init__(self, value: object, **properties: object):
-        super().__init__(**{"layout": "stack", "spacing": 8, **properties})
+    def __init__(self, value: _V, **properties: object):
+        super().__init__(**_dynamic_properties(
+            {"layout": "stack", "spacing": 8, **properties}
+        ))
         try:
             self.build(value)
         except BaseException:
             self.destroy()
             raise
 
-    def build(self, value: object) -> None:
+    def build(self, value: _V) -> None:
         """Create the draft's child controls from its initial value."""
         raise NotImplementedError
 
-    def read(self) -> object:
+    def read(self) -> _V:
         """Read and parse the draft, raising ValueError/TypeError if invalid."""
         raise NotImplementedError
 
@@ -53,7 +59,7 @@ class EditorContent(Container):
         """Whether accepting should preserve the owner's current value."""
         return False
 
-    def equivalent(self, value: object, current: object) -> bool:
+    def equivalent(self, value: _V, current: _V) -> bool:
         """Opt into a semantic no-op; ordinary equality belongs to the property.
 
         By default even explicit reentry reaches the owner's validation hook.
@@ -70,7 +76,7 @@ class EditorContent(Container):
 
 
 class _EditorMessage(Label):
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         style = p.body()
         p.text(
             p.elide(self.text, p.width, size=style.font_size, font_family=style.font_family),
@@ -82,13 +88,14 @@ class _EditorMessage(Label):
         )
 
 
-class EditorPopup(Popup):
+class EditorPopup(Popup, Generic[_V]):
     """Present supplied draft content and commit one validated owner property.
 
     Fresh content is owned and disposed by this popup, including when show()
     fails. Rejected drafts remain open; Escape and dismissal do not commit.
     The value owner must also be the popup anchor, so ordinary popup lifetime
     reconciliation closes the editor when its property target is disposed.
+    ``read()`` has the same value type as ``content``.
     """
 
     dismiss_on_tab: ClassVar[bool] = False
@@ -96,7 +103,7 @@ class EditorPopup(Popup):
     def __init__(
         self,
         owner: Control,
-        content: EditorContent,
+        content: EditorContent[_V],
         *,
         value_property: str = "value",
         **properties: object,
@@ -109,16 +116,16 @@ class EditorPopup(Popup):
         content._check_live()
         if content.parent is not None:
             raise ValueError("EditorPopup requires fresh, unmounted editor content")
-        super().__init__(**{
+        super().__init__(**_dynamic_properties({
             "width": content.popup_size[0], "height": content.popup_size[1],
             "layout": "stack", "padding": 12, "spacing": 8, **properties,
-        })
+        }))
         self._value_owner = owner
         self._value_property = value_property
         try:
             self.body = ScrollArea(layout="stack", spacing=8, flex=1)
             self.body.add(content)
-            self.content = content
+            self.content: EditorContent[_V] = content
             self.message = _EditorMessage(
                 parent=self.body, text=content.hint, height=26, font_size=12,
             )

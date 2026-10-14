@@ -12,7 +12,7 @@ from pathlib import Path
 from ..host import MAX_TEXT_BYTES, CapabilityError, TextFile
 
 
-def dialog_available():
+def dialog_available() -> bool:
     return bool(
         shutil.which("osascript")
         if sys.platform == "darwin"
@@ -22,7 +22,7 @@ def dialog_available():
     )
 
 
-async def choose_path(save=False, suggested_name="document.txt"):
+async def choose_path(save: bool = False, suggested_name: str = "document.txt") -> Path | None:
     env = dict(os.environ, PYSUAL_FILENAME=suggested_name)
     if sys.platform == "darwin":
         expression = (
@@ -88,7 +88,7 @@ async def choose_path(save=False, suggested_name="document.txt"):
     return Path(value) if value else None
 
 
-def _read_text(path, strip_bom=True):
+def _read_text(path: str | Path, strip_bom: bool = True) -> TextFile:
     path = Path(path)
     with path.open("rb") as stream:
         data = stream.read(MAX_TEXT_BYTES + 1)
@@ -101,12 +101,12 @@ def _read_text(path, strip_bom=True):
     )
 
 
-async def read_text(path, *, strip_bom=True):
+async def read_text(path: str | Path, *, strip_bom: bool = True) -> TextFile:
     """Read and decode without blocking the UI; cancellation has no side effects."""
     return await asyncio.to_thread(_read_text, path, strip_bom)
 
 
-def _discard_temporary(path):
+def _discard_temporary(path: str | Path) -> None:
     """Remove only our temporary, without hiding a preparation/commit error."""
     primary = sys.exception()
     path = Path(path)
@@ -125,7 +125,7 @@ def _discard_temporary(path):
         primary.add_note(f"Temporary-file cleanup also failed: {error}")
 
 
-def _prepare_write(path, text, cancelled):
+def _prepare_write(path: Path, text: str, cancelled: threading.Event) -> Path | None:
     """The worker owns only a temporary file, never the destination."""
     data = text.encode("utf-8")
     if len(data) > MAX_TEXT_BYTES:
@@ -153,7 +153,7 @@ def _prepare_write(path, text, cancelled):
             _discard_temporary(temporary)
 
 
-async def write_text(path, text):
+async def write_text(path: str | Path, text: str) -> TextFile:
     """Prepare off-thread, then atomically commit without an intervening await.
 
     Cancellation waits for worker cleanup and cannot leave a late replacement.

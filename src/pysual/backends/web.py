@@ -1,11 +1,18 @@
 """The SVG web backend for native Python and self-contained browser apps."""
 
 import sys
+from typing import TypedDict, Unpack
 
 from ..host import Host
 
 
-def WebHost(**options) -> Host:
+class _WebOptions(TypedDict, total=False):
+    open_browser: bool
+    host: str
+    port: int
+
+
+def WebHost(**options: Unpack[_WebOptions]) -> Host:
     """Create an SVG host for the current Python runtime.
 
     Native Python serves a loopback browser tab. In Pyodide the same SVG scene

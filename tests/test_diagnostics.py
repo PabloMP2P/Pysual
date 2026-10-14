@@ -6,6 +6,7 @@ import time
 import pytest
 
 from pysual import App, RenderDiagnostics, terminal
+from pysual.host import image_fit_host, native_frame_count, optional_host, read_native_stats
 from pysual._engine import is_ui_thread
 from pysual.backends._native_client import native_executable
 from pysual.backends.native import NativeHost
@@ -27,6 +28,52 @@ class CountingHost(RecordingHost):
         assert is_ui_thread(), "Native diagnostics must run on the UI owner"
         self.stats_calls += 1
         return {"frames": self.presentations}
+
+
+def test_retained_host_without_stats_is_rejected():
+    class Retained(RecordingHost):
+        native_retained = True
+
+    with pytest.raises(TypeError, match="native_stats"):
+        read_native_stats(Retained())
+
+    class Placeholder(RecordingHost):
+        native_retained = True
+        native_stats = object()
+
+    with pytest.raises(TypeError, match="native_stats"):
+        read_native_stats(Placeholder())
+
+
+def test_optional_host_follows_the_method_name():
+    from pysual.host import _OPTIONAL_HOST_METHODS
+
+    class Batch(RecordingHost):
+        def lines(self, points, color, width=1):
+            return None
+
+    host = Batch()
+    assert optional_host(host, "lines") is host
+    assert optional_host(RecordingHost(), "segments") is None
+    for method in _OPTIONAL_HOST_METHODS:
+        assert optional_host(RecordingHost(), method) is None
+    with pytest.raises(ValueError, match="optional host method"):
+        optional_host(host, "redraw")
+
+    class Fitted(RecordingHost):
+        capabilities = frozenset({"image_fit"})
+
+    assert image_fit_host(Fitted()) is not None
+    assert image_fit_host(RecordingHost()) is None
+
+
+def test_native_frame_count_accepts_only_whole_numbers():
+    assert native_frame_count({"frames": 40}) == 40
+    assert native_frame_count({"frames": 40.0}) == 40
+    assert native_frame_count({"vsync": True}) is None
+    for value in (True, False, "40", float("nan"), 1.5, None):
+        with pytest.raises(TypeError, match="frames"):
+            native_frame_count({"frames": value})
 
 
 def test_snapshot_is_immutable_explicit_and_does_not_render_or_poll():

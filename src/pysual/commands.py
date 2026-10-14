@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import cast
+
 from .events import UiEvent
 from .icons import icon_names
 
@@ -47,7 +50,7 @@ class MenuItem:
     children: tuple[MenuItem, ...] = ()
     icon: str = ""
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if (
             not isinstance(self.key, str)
             or not self.key
@@ -80,7 +83,7 @@ class MenuGroup:
     text: str
     items: tuple[MenuItem, ...]
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if (
             not isinstance(self.text, str)
             or not isinstance(self.items, tuple)
@@ -96,13 +99,14 @@ class CommandEvent(UiEvent):
     key: str
 
 
-def validate_items(items):
-    keys, shortcuts = set(), set()
+def validate_items(items: object) -> None:
+    keys: set[str] = set()
+    shortcuts: set[str] = set()
 
-    def visit(entries, depth=0):
+    def visit(entries: object, depth: int = 0) -> None:
         if depth >= 8:
             raise ValueError("Menus support at most eight nested levels")
-        for item in entries:
+        for item in cast(Iterable[object], entries):
             if not isinstance(item, MenuItem):
                 raise TypeError("Menus contain MenuItem records")
             chord = normalize_shortcut(item.shortcut)

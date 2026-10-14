@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Mapping
+from collections.abc import Coroutine, Mapping
 import keyword
 from difflib import get_close_matches
 from functools import wraps
-from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
     ClassVar,
     Literal,
@@ -29,7 +29,9 @@ from .errors import BindingError, LifecycleError, SchemaError
 from .events import (
     Channel,
     ChangeEvent,
-    ClickEvent,
+    # Button is published as pysual.controls.Button, so this name must stay
+    # bound for get_type_hints when its click annotation is resolved.
+    ClickEvent as ClickEvent,
     Dispatcher,
     DragEvent,
     DragPayload,
@@ -42,15 +44,19 @@ from .events import (
     validate_callback,
 )
 from .geometry import Rect
-from .painting import resolve_style
+from .host import Host, Input
+from .painting import Painter, resolve_style
 from .theme import Theme, dark
 from .schema import (
     Dirty,
+    Field,
     SchemaObject,
     _LAYOUT_MASK,
     _VISUAL_MASK,
+    _dynamic_properties,
     _init_argument,
     _mask,
+    _sequence,
     check_ui_thread,
     prop,
     unknown_name,
@@ -67,18 +73,39 @@ from ._engine import (
 
 if TYPE_CHECKING:
     from .inspection import ControlSnapshot
+    from .motion import _Transition
 
 
 # Detached controls share immutable defaults and their bounded style cache.
 _DETACHED_THEME = dark()
 
 
-def _control_mutator(function):
+def _unwrapped(value: object) -> object:
+    if isinstance(value, (staticmethod, classmethod)):
+        method = cast(
+            "staticmethod[..., object] | classmethod[object, ..., object]", value
+        )
+        return method.__func__
+    return value
+
+
+def _stored_extent(value: float | None, fallback: float) -> float:
+    """Preferred size from stored schema data.
+
+    ``None`` and zero use ``fallback``, as the previous ``value or fallback``
+    expression did. The schema has already rejected a bool.
+    """
+    if value is None or value == 0:
+        return fallback
+    return value
+
+
+def _control_mutator(function: Callable[..., object]) -> Callable[..., object]:
     """Run custom public mutation preflight and commit as one owner operation."""
     owner_operation = ui_method(function)
 
     @wraps(function)
-    def mutation(self, name, *args, **kwargs):
+    def mutation(self: object, name: str, *args: object, **kwargs: object) -> object:
         # Private implementation state keeps its existing direct behavior,
         # including assignments before a custom constructor calls super().
         if name.startswith("_"):
@@ -88,13 +115,52 @@ def _control_mutator(function):
     return ui_operation(mutation)
 
 
+def _construct_control(
+    cls: type[Any], args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> Any:
+    """Runtime constructor body. Hidden from the checker so property signatures stay."""
+    if not is_ui_thread():
+        return call(lambda: cls(*args, **kwargs))
+    get_engine()  # Freeze config for a direct-owner Pyodide constructor too.
+    check_ui_thread()
+    parent = kwargs.pop("parent", None)
+    if parent is not None:
+        if not isinstance(parent, Container):
+            raise TypeError("parent must be a Container or None")
+        parent._check_live()
+        if getattr(cls, "_is_app", False):
+            raise LifecycleError("Window cannot have a parent; use a Container")
+    with critical_phase("construction"):
+        control = type.__call__(cls, *args, **kwargs)
+        if not hasattr(control, "_values"):
+            raise LifecycleError("Custom __init__ must call super().__init__()")
+        control._check_live()
+        try:
+            if isinstance(control, Container):
+                control._materialize_blueprints()
+            elif control._blueprints:
+                raise BindingError("Declare blueprints on an App or Container")
+            if parent is not None:
+                parent.add(control)
+        except BaseException:
+            control.destroy()
+            raise
+    return control
+
+
 class _ControlMeta(type):
     """Explicit parenting happens only after the complete Python constructor."""
 
-    def __new__(metaclass, name, bases, namespace, **kwargs):
+    def __new__(
+        cls,
+        name: str,
+        bases: tuple[type, ...],
+        namespace: dict[str, Any],
+        **kwargs: Any,
+    ) -> type:
         # Wrapping happens at class creation, preserving concrete identity,
         # annotations and override dispatch without user-facing decorators.
-        cls = super().__new__(metaclass, name, bases, dict(namespace), **kwargs)
+        created = super().__new__(cls, name, bases, dict(namespace), **kwargs)
         for member_name in ("__setattr__", "__delattr__"):
             if member_name in namespace:
                 # Framework gateways perform their own dispatch. An override
@@ -105,9 +171,9 @@ class _ControlMeta(type):
                     and name in ("Control", "Container")
                 )
                 wrapper = ui_operation if framework_gateway else _control_mutator
-                setattr(cls, member_name, wrapper(namespace[member_name]))
-        resolved = {}
-        for base in cls.__mro__:
+                setattr(created, member_name, wrapper(namespace[member_name]))
+        resolved: dict[str, Any] = {}
+        for base in created.__mro__:
             for member_name, member in vars(base).items():
                 if not member_name.startswith("_"):
                     resolved.setdefault(member_name, member)
@@ -115,55 +181,31 @@ class _ControlMeta(type):
             if inspect.isfunction(member):
                 caller_gateway = any(
                     getattr(vars(base).get(member_name), "__pysual_caller_side__", False)
-                    for base in cls.__mro__
+                    for base in created.__mro__
                 )
                 if caller_gateway:
-                    if member_name in vars(cls):
+                    if member_name in vars(created):
                         setattr(member, "__pysual_caller_side__", True)
                     continue
                 if not getattr(member, "__pysual_ui_method__", False):
-                    setattr(cls, member_name, ui_method(member))
+                    setattr(created, member_name, ui_method(member))
             elif isinstance(member, property):
                 accessors = (member.fget, member.fset, member.fdel)
                 if all(function is None or getattr(function, "__pysual_ui_method__", False)
                        for function in accessors):
                     continue
-                setattr(cls, member_name, property(
+                setattr(created, member_name, property(
                     ui_method(member.fget) if member.fget else None,
                     ui_method(member.fset) if member.fset else None,
                     ui_method(member.fdel) if member.fdel else None,
                     member.__doc__,
                 ))
-        return cls
+        return created
 
-    def __call__(cls, *args: object, **kwargs: object):
-        if not is_ui_thread():
-            return call(lambda: cls(*args, **kwargs))
-        get_engine()  # Freeze config for a direct-owner Pyodide constructor too.
-        check_ui_thread()
-        parent = kwargs.pop("parent", None)
-        if parent is not None:
-            if not isinstance(parent, Container):
-                raise TypeError("parent must be a Container or None")
-            parent._check_live()
-            if getattr(cls, "_is_app", False):
-                raise LifecycleError("Window cannot have a parent; use a Container")
-        with critical_phase("construction"):
-            control = super().__call__(*args, **kwargs)
-            if not hasattr(control, "_values"):
-                raise LifecycleError("Custom __init__ must call super().__init__()")
-            control._check_live()
-            try:
-                if isinstance(control, Container):
-                    control._materialize_blueprints()
-                elif control._blueprints:
-                    raise BindingError("Declare blueprints on an App or Container")
-                if parent is not None:
-                    parent.add(control)
-            except BaseException:
-                control.destroy()
-                raise
-        return control
+    if not TYPE_CHECKING:
+        # A visible metaclass __call__ replaces the property constructor.
+        def __call__(cls, *args, **kwargs):  # noqa: N805
+            return _construct_control(cls, args, kwargs)
 
 
 class Control(SchemaObject, metaclass=_ControlMeta):
@@ -242,9 +284,9 @@ class Control(SchemaObject, metaclass=_ControlMeta):
     # Inherited exclusions may be replaced by subclasses, including with ().
     style_excludes: ClassVar[tuple[str, ...]] = ()
     _overlay: ClassVar[bool] = False
-    _blueprints: ClassVar[tuple[tuple[str, Blueprint], ...]] = ()
+    _blueprints: ClassVar[tuple[tuple[str, Blueprint[Any]], ...]] = ()
 
-    def __init_subclass__(cls, **kwargs):
+    def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
         if any(isinstance(value, Control) for value in vars(cls).values()):
             raise SchemaError(
@@ -260,43 +302,50 @@ class Control(SchemaObject, metaclass=_ControlMeta):
         ):
             raise SchemaError("style_parts must be a non-empty tuple of part names")
         for name in ("style_fallbacks", "style_excludes"):
-            kinds = getattr(cls, name)
-            if not isinstance(kinds, tuple) or any(
-                not isinstance(kind, str) or not kind.isidentifier() for kind in kinds
-            ):
+            kinds: object = getattr(cls, name)
+            if not isinstance(kinds, tuple):
                 raise SchemaError(f"{name} must be a tuple of style selector names")
+            for kind in cast(tuple[object, ...], kinds):
+                if not isinstance(kind, str) or not kind.isidentifier():
+                    raise SchemaError(f"{name} must be a tuple of style selector names")
 
     def _initialize(self) -> None:
         self._parent: Container | None = None
         self._name: str | None = None
         self._binding_owner: Container | None = None
-        self._channels: dict[str, Channel] = {}
+        self._channels: dict[str, Channel[Any]] = {}
         self._dispatcher: Dispatcher | None = None
         self._rect = Rect()
         self._clip = Rect()
         self._paint_clip = Rect()
         self._fixed_row_height = 0.0
-        self._measurement_row_height = None
-        self._layout_row_height = None
+        self._measurement_row_height: float | None = None
+        self._layout_row_height: float | None = None
         self._pressed = self._hover = False
-        self._motion = None
-        self._anchor_base = None
+        self._motion: _Transition | None = None
+        self._anchor_base: tuple[
+            float, float, float, float, float, float, float | None, float | None
+        ] | None = None
         self._paint_revision = 0
         self._paint_local_revision = 0
         self._measure_revision = 0
         self._measure_local_revision = 0
-        self._measure_cache = []
-        self._measure_cache_host = None
+        self._measure_cache: list[tuple[tuple[object, ...], tuple[float, float]]] = []
+        self._measure_cache_host: Host | None = None
         self._measure_cache_enabled = self._values["cache_measure"]
+        self._layout_valid = False
+        self._layout_theme: Theme | None = None
+        self._layout_measure_host: Host | None = None
+        self._layout_measure_environment: tuple[object, ...] | None = None
         self._measure_uncached = int(not self._measure_cache_enabled)
         self._measure_coalescing = False
-        self._batch_dirty: Dirty | None = None
+        self._batch_dirty: int | None = None
         self._batch_requested = False
-        self._release_paint = None
+        self._release_paint: Callable[[], None] | None = None
         self._origin: Literal["user", "program", "system"] = "program"
         self._wake: Callable[[], None] | None = None
 
-    def _validate_live_update(self, name, value):
+    def _validate_live_update(self, name: str, value: object) -> None:
         super()._validate_live_update(name, value)
         if name == "visible" and not value:
             runtime = getattr(self._root(), "_runtime", None)
@@ -304,20 +353,14 @@ class Control(SchemaObject, metaclass=_ControlMeta):
             if modality is not None:
                 modality.validate_visibility(self, value)
 
-    def _validate_update(self, name, value):
-        if name in (
-            "width", "height", "min_width", "min_height", "max_width", "max_height",
-        ):
-            values = self._values
-
-            def current(key):
-                return value if key == name else values[key]
-
+    def _validate_update(self, name: str, value: object) -> None:
+        if name in ("min_width", "min_height", "max_width", "max_height"):
+            pending = self._pending(name, value)
             for axis in ("width", "height"):
-                maximum = current("max_" + axis)
-                if maximum is not None and maximum < current("min_" + axis):
+                maximum = pending.optional_number("max_" + axis)
+                if maximum is not None and maximum < pending.number("min_" + axis):
                     raise ValueError(f"max_{axis} must be >= min_{axis}")
-        elif name == "anchor" and not {part.strip() for part in value.split(",")} <= {
+        elif name == "anchor" and not {part.strip() for part in cast(str, value).split(",")} <= {
             "left",
             "top",
             "right",
@@ -329,9 +372,9 @@ class Control(SchemaObject, metaclass=_ControlMeta):
         elif name in ("foreground", "background") and value is not None:
             from .theme import _color
 
-            _color(value)
+            _color(cast(str, value))
 
-    def _control_height(self, host, text="M"):
+    def _control_height(self, host: Host, text: str = "M") -> float:
         style = resolve_style(self)
         line = host.measure(text, style.font_size, style.font_family == "mono")[1]
         return max(self.effective_theme.tokens.control_height, line + style.padding * 2)
@@ -365,27 +408,28 @@ class Control(SchemaObject, metaclass=_ControlMeta):
             if requested:
                 self._flush_invalidation(affects)
 
-    def _flush_invalidation(self, affects):
+    def _flush_invalidation(self, affects: Dirty | int) -> None:
         # Public overrides may make new local changes while handling the flush.
+        recorded = cast(Dirty, affects)
         if type(self).invalidate is not Control.invalidate:
-            self.invalidate(affects)
+            self.invalidate(recorded)
             return
         # A batch already recorded each originating change. Its final wake is
         # propagated dirt, not a new local change to the batching container.
         previous = self._measure_coalescing
         self._measure_coalescing = True
         try:
-            self.invalidate(affects)
+            self.invalidate(recorded)
         finally:
             self._measure_coalescing = previous
 
-    def _adjust_uncached_measurements(self, delta):
-        node = self
+    def _adjust_uncached_measurements(self, delta: int) -> None:
+        node: Control | None = self
         while node is not None:
             node._measure_uncached += delta
             node = node._parent
 
-    def _invalidate_measure(self, affects, *, local=True):
+    def _invalidate_measure(self, affects: Dirty | int, *, local: bool = True) -> None:
         if not _mask(affects) & _LAYOUT_MASK:
             return
         enabled = self._values["cache_measure"]
@@ -400,7 +444,7 @@ class Control(SchemaObject, metaclass=_ControlMeta):
             node._measure_cache.clear()
             node = node._parent
 
-    def _record_dirty(self, affects):
+    def _record_dirty(self, affects: Dirty) -> None:
         super()._record_dirty(affects)
         # Preserve committed sizing changes even when a custom _changed hook
         # consumes the notification instead of calling super().
@@ -411,7 +455,7 @@ class Control(SchemaObject, metaclass=_ControlMeta):
         self._check_live()
         self._invalidate_model(affects)
 
-    def _invalidate_model(self, affects):
+    def _invalidate_model(self, affects: Dirty | int) -> None:
         """Record dirt on this control and its ancestors, then wake the runtime.
 
         Runs on the UI owner: every public write already arrives there.
@@ -447,7 +491,7 @@ class Control(SchemaObject, metaclass=_ControlMeta):
                 node._wake()
             node = node._parent
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         affects = self._change_affects(field, old, value)
         self.invalidate(affects)
         if field.definition.changed and self._dispatcher is not None:
@@ -461,7 +505,7 @@ class Control(SchemaObject, metaclass=_ControlMeta):
                 )
             )
 
-    def _change_affects(self, field, old, value):
+    def _change_affects(self, field: Field, old: object, value: object) -> Dirty:
         if field.name in ("left", "top", "anchor"):
             self._anchor_base = None
         affects = field.definition.affects
@@ -475,17 +519,17 @@ class Control(SchemaObject, metaclass=_ControlMeta):
         return affects
 
     @property
-    def bounds(self):
+    def bounds(self) -> Rect:
         self._check_live()
         return self._rect
 
-    def _committed_enabled(self):
+    def _committed_enabled(self) -> bool:
         """Enabled state for layout and paint, including a custom policy."""
         if type(self).effective_enabled is not Control.effective_enabled:
             return self.effective_enabled
         return self._fast_enabled()
 
-    def _fast_enabled(self):
+    def _fast_enabled(self) -> bool:
         """Default enabled chain. Custom policies enter through `_committed_enabled`."""
         node = self
         while node._values["enabled"]:
@@ -513,7 +557,7 @@ class Control(SchemaObject, metaclass=_ControlMeta):
         return _DETACHED_THEME
 
     @property
-    def effective_enabled(self):
+    def effective_enabled(self) -> bool:
         self._check_live()
         return self._fast_enabled()
 
@@ -524,7 +568,7 @@ class Control(SchemaObject, metaclass=_ControlMeta):
         # this public boundary, rather than checking every ancestor descriptor.
         return self._fast_theme()
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         """Return the preferred (width, height) in logical pixels.
 
         Layout applies constraints separately. Override this synchronous hook
@@ -536,8 +580,8 @@ class Control(SchemaObject, metaclass=_ControlMeta):
         """
         values = self._values
         return (
-            values["width"] or 100,
-            values["height"] or self._fast_theme().tokens.control_height,
+            _stored_extent(values["width"], 100),
+            _stored_extent(values["height"], self._fast_theme().tokens.control_height),
         )
 
     def effective_row_height(self, fallback: float) -> float:
@@ -560,24 +604,24 @@ class Control(SchemaObject, metaclass=_ControlMeta):
         )
 
     def measure_available(
-        self, host, *, width: float | None = None, height: float | None = None
-    ):
+        self, host: Host, *, width: float | None = None, height: float | None = None
+    ) -> tuple[float, float]:
         """Measure with parent space hints; ordinary custom measure hooks still work."""
         from .layout import _measurement_rows
 
         with _measurement_rows(self, host):
             return self.measure(host)
 
-    def _layout_size(self, width, height):
+    def _layout_size(self, width: float, height: float) -> tuple[float, float]:
         """Constrain arranged size without changing the requested dimensions."""
         return width, height
 
-    def _measure_layout(self, host):
+    def _measure_layout(self, host: Host) -> tuple[float, float]:
         from .layout import _size
 
         return _size(self, host)
 
-    def paint(self, painter, /):
+    def paint(self, painter: Painter, /) -> None:
         """Draw this control with the supplied Painter in local logical pixels.
 
         The runtime calls this synchronous hook during painting. Override it
@@ -587,7 +631,7 @@ class Control(SchemaObject, metaclass=_ControlMeta):
         if self.background:
             painter.rect(Rect(0, 0, painter.width, painter.height), self.background)
 
-    def paint_focus(self, painter, /):
+    def paint_focus(self, painter: Painter, /) -> None:
         """Draw keyboard focus after the cached body.
 
         Composite entries may override this when their owner draws a shared
@@ -604,7 +648,7 @@ class Control(SchemaObject, metaclass=_ControlMeta):
         """
         return self._rect
 
-    def handle_input(self, event, /):
+    def handle_input(self, event: Input, /) -> bool | None:
         """Handle routed pointer, keyboard or focus input synchronously.
 
         Override this hook for custom interaction. Returning True for a wheel
@@ -613,7 +657,7 @@ class Control(SchemaObject, metaclass=_ControlMeta):
         """
         pass
 
-    def scroll_input(self, event, /) -> bool:
+    def scroll_input(self, event: Input, /) -> bool:
         """Handle a wheel event; return True to consume it, False to try a parent.
 
         A custom handle_input continues receiving wheel events and can return
@@ -663,7 +707,7 @@ class Control(SchemaObject, metaclass=_ControlMeta):
         """Return True after dispatching a matching command through its usual event."""
         return False
 
-    def create_task(self, coroutine):
+    def create_task(self, coroutine: Coroutine[Any, Any, object]) -> TaskHandle:
         """Start owned work and return an awaitable task handle with `cancel()`.
         Requires a running App. Destroying this control cancels its work;
         native-window shutdown also cancels and joins owned work. See
@@ -705,7 +749,7 @@ class Control(SchemaObject, metaclass=_ControlMeta):
         return runtime is not None and runtime.router.focus is self
 
     @classmethod
-    def events(cls) -> dict[str, Event]:
+    def events(cls) -> dict[str, Event[Any]]:
         """Declared events, including inherited declarations."""
         return {
             name: value
@@ -751,17 +795,17 @@ class Control(SchemaObject, metaclass=_ControlMeta):
             node = node._parent
         return node
 
-    def _event_definitions(self) -> dict[str, Event]:
+    def _event_definitions(self) -> dict[str, Event[Any]]:
         return type(self).events()
 
-    def _handler_candidates(self, owner: object, prefix: str):
-        candidates = []
+    def _handler_candidates(self, owner: object, prefix: str) -> list[tuple[str, object]]:
+        candidates: list[tuple[str, object]] = []
         for event_name, definition in self._event_definitions().items():
             method_name = f"{prefix}_on_{event_name}"
-            callback = getattr(owner, method_name, None)
+            callback: object = getattr(owner, method_name, None)
             if callback is not None:
                 try:
-                    validate_callback(callback, definition.event_type)
+                    validate_callback(cast(Callable[..., object], callback), definition.event_type)
                 except Exception as error:
                     annotate_error(
                         error,
@@ -848,10 +892,44 @@ def blueprint(
     return Blueprint(cast(type[C], control_type), tuple(properties.items()))
 
 
+def _blueprint_order(definitions: Mapping[str, Blueprint[Any]]) -> list[str]:
+    """Validate and order parent dependencies in linear time without recursion."""
+    ordered: list[str] = []
+    completed: set[str] = set()
+    for name in definitions:
+        if name in completed:
+            continue
+        path: list[str] = []
+        visiting: set[str] = set()
+        current: str | None = name
+        while current is not None and current not in completed:
+            if current in visiting:
+                raise BindingError("Blueprint parent references contain a cycle")
+            visiting.add(current)
+            path.append(current)
+            declaration = definitions[current]
+            if not issubclass(declaration.control_type, Control) or getattr(
+                declaration.control_type, "_is_app", False
+            ):
+                raise BindingError("Blueprints require a Control subclass, excluding App")
+            parent_name = declaration.parent_name
+            if parent_name is not None:
+                if parent_name not in definitions or not issubclass(
+                    definitions[parent_name].control_type, Container
+                ):
+                    raise BindingError(
+                        f"Blueprint parent {parent_name!r} must name a Container declaration"
+                    )
+            current = parent_name
+        completed.update(path)
+        ordered.extend(reversed(path))
+    return ordered
+
+
 class Container(Control, FactoryTypes):
     """Also the handler scope for composite controls; private state stays Python."""
 
-    def _child_effect_clip(self, rect, content_clip, inherited_clip):
+    def _child_effect_clip(self, rect: Rect, content_clip: Rect, inherited_clip: Rect) -> Rect:
         # Transparent layout wrappers have no visible edge. Shadows can extend
         # to the nearest painted surface, while scroll/custom content viewports
         # retain their strict boundaries. Layout itself stays control-agnostic.
@@ -865,7 +943,7 @@ class Container(Control, FactoryTypes):
             return inherited_clip
         return self._clip.intersect(inherited_clip)
 
-    def paint(self, painter, /):
+    def paint(self, painter: Painter, /) -> None:
         # Layout containers remain transparent until given a background. Once
         # visible, their body uses the same part styling as other surfaces.
         if self.background is not None:
@@ -906,8 +984,11 @@ class Container(Control, FactoryTypes):
         controls unchanged; ordinary property notifications still run per field.
         """
         self._check_live()
-        prepared = []
-        for control, values in updates.items():
+        # Hooks may retain or mutate input mappings. Commit the snapshot that
+        # passed preflight, including when an earlier child notifies a callback.
+        batches = [(control, dict(values)) for control, values in updates.items()]
+        prepared: list[tuple[Control, Mapping[str, object]]] = []
+        for control, values in batches:
             if not isinstance(control, Control):
                 raise TypeError("Update targets must be controls")
             node = control.parent
@@ -915,7 +996,7 @@ class Container(Control, FactoryTypes):
                 node = node.parent
             if node is not self:
                 raise ValueError("Update targets must be descendants of this container")
-            values = control._prepare_update(values)
+            values = dict(control._prepare_update(values))
             control._validate_candidate(values)
             prepared.append((control, values))
         previous = self._batch_dirty
@@ -938,43 +1019,17 @@ class Container(Control, FactoryTypes):
         if self._blueprints_materialized:
             return
         definitions = dict(self._blueprints)
-        ordered: list[str] = []
-        visiting: set[str] = set()
-
-        def visit(name: str) -> None:
-            if name in ordered:
-                return
-            if name in visiting:
-                raise BindingError("Blueprint parent references contain a cycle")
-            visiting.add(name)
-            declaration = definitions[name]
-            if not issubclass(declaration.control_type, Control) or getattr(
-                declaration.control_type, "_is_app", False
-            ):
-                raise BindingError(
-                    "Blueprints require a Control subclass, excluding App"
-                )
-            parent_name = declaration.parent_name
-            if parent_name is not None:
-                if parent_name not in definitions or not issubclass(
-                    definitions[parent_name].control_type, Container
-                ):
-                    raise BindingError(
-                        f"Blueprint parent {parent_name!r} must name a Container declaration"
-                    )
-                visit(parent_name)
-            visiting.remove(name)
-            ordered.append(name)
-
         for name in definitions:
             if name in vars(self):
                 raise BindingError(f"Do not replace blueprint {name!r} during __init__")
-            visit(name)
-        created = []
+        ordered = _blueprint_order(definitions)
+        created: list[Control] = []
         try:
             for name in ordered:
                 declaration = definitions[name]
-                control = declaration.control_type(**dict(declaration.properties))
+                control: Control = declaration.control_type(
+                    **_dynamic_properties(dict(declaration._properties))
+                )
                 created.append(control)
                 if declaration.parent_name is not None:
                     parent = self._bindings[declaration.parent_name]
@@ -987,20 +1042,20 @@ class Container(Control, FactoryTypes):
             raise
         self._blueprints_materialized = True
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
         if name in ("column_tracks", "row_tracks"):
             from .layout import _track
 
-            for track in value:
+            for track in _sequence(value):
                 _track(track)
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         return self.measure_content(host)
 
     def measure_content(
-        self, host, *, width: float | None = None, height: float | None = None
-    ):
+        self, host: Host, *, width: float | None = None, height: float | None = None
+    ) -> tuple[float, float]:
         """Measure the declared child layout and padding for custom container chrome.
 
         Override measure_available to add headings or other non-content insets.
@@ -1011,16 +1066,18 @@ class Container(Control, FactoryTypes):
         with _measurement_rows(self, host):
             if self.width is not None and self.height is not None:
                 return self.width, self.height
-            return _natural_size(
-                self,
-                lambda child, **limits: _size(child, host, **limits),
-                width=width,
-                height=height,
-            )
+
+            def _child_size(
+                child: Control, *, width: float | None = None,
+                height: float | None = None,
+            ) -> tuple[float, float]:
+                return _size(child, host, width=width, height=height)
+
+            return _natural_size(self, _child_size, width=width, height=height)
 
     def measure_available(
-        self, host, *, width: float | None = None, height: float | None = None
-    ):
+        self, host: Host, *, width: float | None = None, height: float | None = None
+    ) -> tuple[float, float]:
         """Use available space for intrinsic flow/stack content without changing properties."""
         from .layout import _measurement_rows
 
@@ -1050,7 +1107,7 @@ class Container(Control, FactoryTypes):
         include_unbound also reports names reserved for controls not created yet.
         """
         self._check_live()
-        diagnostics = []
+        diagnostics: list[str] = []
         scopes: list[Container] = [self]
         while scopes:
             scope = scopes.pop()
@@ -1092,8 +1149,7 @@ class Container(Control, FactoryTypes):
             ]
             prefixes = tuple(f"{name}_on_" for name in (*targets, *aliases))
             for name, member in sorted(namespace.items()):
-                if isinstance(member, (staticmethod, classmethod)):
-                    member = member.__func__
+                member = _unwrapped(member)
                 if (
                     name.startswith("_")
                     or "_on_" not in name
@@ -1133,7 +1189,11 @@ class Container(Control, FactoryTypes):
         """Override with child/Rect pairs, or return None for the declared layout."""
         return None
 
-    def _arrange_declared(self, area, measure):
+    def _arrange_declared(
+        self,
+        area: Rect,
+        measure: Callable[..., tuple[float, float]],
+    ) -> object:
         from .layout import _declared_boxes
 
         return _declared_boxes(self, area, measure)
@@ -1157,7 +1217,7 @@ class Container(Control, FactoryTypes):
             or getattr(control_type, "_is_app", False)
         ):
             raise TypeError("Control creation requires a Control subclass, excluding App")
-        control = control_type(*args, **properties)
+        control = cast(C, control_type(*args, **properties))
         try:
             return self.add(control)
         except BaseException:
@@ -1213,13 +1273,11 @@ class Container(Control, FactoryTypes):
             return super().__setattr__(name, value)
         if isinstance(value, Control):
             value._check_live()
-            declaration = inspect.getattr_static(type(self), name, None)
-            if isinstance(declaration, Blueprint) and not isinstance(
-                value, declaration.control_type
-            ):
-                raise TypeError(
-                    f"Blueprint {name!r} requires {declaration.control_type.__name__}"
-                )
+            declaration = member
+            if isinstance(declaration, Blueprint):
+                expected = cast(Blueprint[Control], declaration).control_type
+                if not isinstance(value, expected):
+                    raise TypeError(f"Blueprint {name!r} requires {expected.__name__}")
             if (
                 not name.isidentifier()
                 or keyword.iskeyword(name)
@@ -1237,7 +1295,7 @@ class Container(Control, FactoryTypes):
                 raise BindingError(
                     "Binding owner and control must belong to the same tree"
                 )
-            candidates = []
+            candidates: list[tuple[str, object]] = []
             if value._name is None:
                 # Resolve pairs, never split user method names on underscores.
                 methods = {

@@ -2,7 +2,7 @@
 # Unicode data: https://www.unicode.org/Public/17.0.0/ucd/
 # Copyright Unicode, Inc. See assets/UNICODE-LICENSE.txt.
 UNICODE_VERSION = "17.0.0"
-GCB = (
+GCB: tuple[tuple[int, int, str], ...] = (
     (0, 9, "Control"),
     (10, 10, "LF"),
     (11, 12, "Control"),
@@ -1390,7 +1390,7 @@ GCB = (
     (917760, 917999, "Extend"),
     (918000, 921599, "Control"),
 )
-PICTOGRAPHIC = (
+PICTOGRAPHIC: tuple[tuple[int, int, str], ...] = (
     (169, 169, "EP"),
     (174, 174, "EP"),
     (8252, 8252, "EP"),
@@ -1548,7 +1548,7 @@ PICTOGRAPHIC = (
     (129646, 129791, "EP"),
     (130048, 131069, "EP"),
 )
-INCB = (
+INCB: tuple[tuple[int, int, str], ...] = (
     (768, 879, "Extend"),
     (1155, 1161, "Extend"),
     (1425, 1469, "Extend"),

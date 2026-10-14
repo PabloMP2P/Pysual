@@ -1,12 +1,17 @@
 """Bounded PNG decoding and sampling for character-cell image approximations."""
 
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 from .._nine_slice import slice_regions
 from .._png import MAX_ENCODED_BYTES, decode_png, png_source_pixels
 from .._image_fit import image_rects
+from ..geometry import Rect
+
+_Pixels = tuple[int, int, bytes]
+_Sample = tuple[int, int, int, int]
 
 
 class ImageCache:
@@ -15,11 +20,11 @@ class ImageCache:
     MAX_BYTES = 32 * 1024 * 1024
     MAX_ENTRIES = 64
 
-    def __init__(self):
-        self._entries = OrderedDict()
+    def __init__(self) -> None:
+        self._entries: OrderedDict[str, tuple[_Pixels, int]] = OrderedDict()
         self.byte_size = 0
 
-    def get(self, source):
+    def get(self, source: str) -> _Pixels | None:
         if not isinstance(source, str):
             raise TypeError("Image sources must be strings")
         if source in self._entries:
@@ -30,7 +35,7 @@ class ImageCache:
         return result
 
     @staticmethod
-    def _decode(source):
+    def _decode(source: str) -> _Pixels:
         if source.startswith("data:"):
             return png_source_pixels(source)
         if "://" in source:
@@ -38,7 +43,7 @@ class ImageCache:
         with Path(source).open("rb") as stream:
             return decode_png(stream.read(MAX_ENCODED_BYTES + 1))
 
-    def _store(self, source, result):
+    def _store(self, source: str, result: _Pixels) -> bool:
         # Four bytes per character also bounds non-ASCII native path strings.
         size = len(result[2]) + len(source) * 4
         if size <= self.MAX_BYTES and self.MAX_ENTRIES > 0:
@@ -53,16 +58,16 @@ class ImageCache:
             return True
         return False
 
-    def clear(self):
+    def clear(self) -> None:
         self._entries.clear()
         self.byte_size = 0
 
-    def invalidate(self, source):
+    def invalidate(self, source: str) -> None:
         entry = self._entries.pop(source, None)
         if entry is not None:
             self.byte_size -= entry[1]
 
-    def close(self):
+    def close(self) -> None:
         self.clear()
 
 
@@ -77,20 +82,20 @@ class AsyncImageCache(ImageCache):
 
     MAX_SOURCE_CHARS = ((MAX_ENCODED_BYTES + 2) // 3) * 4 + 128
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
-        self._executor = None
-        self._pending = None
+        self._executor: ThreadPoolExecutor | None = None
+        self._pending: tuple[str, Future[_Pixels]] | None = None
         self._pending_invalidated = False
-        self._failures = OrderedDict()
+        self._failures: OrderedDict[str, str] = OrderedDict()
         self._failure_bytes = 0
         # One valid image may exceed the LRU charge once its source is included.
         # Keep that completion usable instead of repeatedly showing a placeholder.
-        self._uncached = None
+        self._uncached: tuple[str, _Pixels | None, str | None] | None = None
         self._closed = False
         self._synchronous = False
 
-    def get(self, source):
+    def get(self, source: str) -> _Pixels | None:
         if not isinstance(source, str):
             raise TypeError("Image sources must be strings")
         if len(source) > self.MAX_SOURCE_CHARS:
@@ -115,7 +120,7 @@ class AsyncImageCache(ImageCache):
             self._pending = source, self._executor.submit(self._decode, source)
         return None
 
-    def poll(self):
+    def poll(self) -> bool:
         """Publish at most one result on the owner; return whether to repaint."""
         if self._closed or self._pending is None or not self._pending[1].done():
             return False
@@ -147,19 +152,19 @@ class AsyncImageCache(ImageCache):
                 self._uncached = source, result, None
         return True
 
-    def _use_synchronous_cache(self):
+    def _use_synchronous_cache(self) -> None:
         self._synchronous = True
         if self._executor is not None:
             self._executor.shutdown(wait=False, cancel_futures=True)
             self._executor = None
 
-    def finish_frame(self):
+    def finish_frame(self) -> None:
         # A result too large for the LRU is available during its first repaint,
         # then follows the existing synchronous uncached path. There is never
         # both a spare completion and another background job.
         self._uncached = None
 
-    def invalidate(self, source):
+    def invalidate(self, source: str) -> None:
         super().invalidate(source)
         message = self._failures.pop(source, None)
         if message is not None:
@@ -170,7 +175,7 @@ class AsyncImageCache(ImageCache):
             self._pending_invalidated = True
             self._pending[1].cancel()
 
-    def clear(self):
+    def clear(self) -> None:
         # No completion callback can repopulate a closed cache. A new opening
         # gets another instance; running decoding only retains its own input.
         if self._pending is not None:
@@ -187,12 +192,22 @@ class AsyncImageCache(ImageCache):
         self._synchronous = False
         super().clear()
 
-    def close(self):
+    def close(self) -> None:
         self.clear()
         self._closed = True
 
 
-def image_cells(image, rect, bounds, cell_width, cell_height, tint, edges=None, *, fit="stretch"):
+def image_cells(
+    image: _Pixels,
+    rect: Rect,
+    bounds: tuple[int, int, int, int],
+    cell_width: float,
+    cell_height: float,
+    tint: _Sample,
+    edges: tuple[int, int, int, int] | None = None,
+    *,
+    fit: str = "stretch",
+) -> Iterator[tuple[int, int, _Sample, _Sample]]:
     """Yield two RGBA samples per visible cell with constant work per cell.
 
     Four taps per half cell soften downsampling without scanning source-sized
@@ -211,7 +226,7 @@ def image_cells(image, rect, bounds, cell_width, cell_height, tint, edges=None, 
                     (destination.x - rect.x, destination.y - rect.y,
                      destination.width, destination.height)),)
 
-    def sample(x, y):
+    def sample(x: float, y: float) -> _Sample:
         # Regions can overlap when the destination is smaller than its edges;
         # the last region wins, matching the painter order of slice_regions.
         for (sx, sy, sw, sh), (dx, dy, dw, dh) in reversed(regions):
@@ -219,10 +234,11 @@ def image_cells(image, rect, bounds, cell_width, cell_height, tint, edges=None, 
                 px = min(width - 1, max(0, int(sx + (x - dx) / dw * sw)))
                 py = min(height - 1, max(0, int(sy + (y - dy) / dh * sh)))
                 offset = (py * width + px) * 4
-                return pixels[offset : offset + 4]
+                red, green, blue, alpha = pixels[offset : offset + 4]
+                return red, green, blue, alpha
         return (0, 0, 0, 0)
 
-    def half(column, row, lower):
+    def half(column: int, row: int, lower: int) -> _Sample:
         red = green = blue = alpha = 0
         for y in (0.125, 0.375):
             for x in (0.25, 0.75):
@@ -249,7 +265,9 @@ def image_cells(image, rect, bounds, cell_width, cell_height, tint, edges=None, 
             yield column, row, half(column, row, 0), half(column, row, 1)
 
 
-def luminance_glyph(upper, lower):
+def luminance_glyph(
+    upper: tuple[int, int, int], lower: tuple[int, int, int]
+) -> str:
     """Use increasing ASCII ink density when the terminal cannot show color."""
     ramp = " .:-=+*#%@"
     luminance = sum(

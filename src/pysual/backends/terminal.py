@@ -1,22 +1,42 @@
 """Terminal presentation with an optional C renderer and a pure Python fallback."""
 
 import os
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
+from ..geometry import Rect
 from ..host import CapabilityError
 from ._native_client import NativeHostError, native_executable
+from ._term_io import TerminalTransport
 from ._term_session import TerminalSession, install_signal_restoration
 from .native import NativeTermTextHost
 from .term_text import TermTextHost
+
+if TYPE_CHECKING:
+    from ..host import Input, TextFile, Viewport
+
+
+class _NativeTerminal(Protocol):
+    def open(
+        self,
+        title: str,
+        width: float,
+        height: float,
+        resizable: bool,
+        scale: float | None,
+    ) -> None: ...
+
+    def snapshot(self) -> object: ...
 
 
 _OVERRIDE: ContextVar[str | None] = ContextVar("pysual_build_terminal_renderer", default=None)
 
 
 @contextmanager
-def terminal_renderer_override(name):
+def terminal_renderer_override(name: str) -> Generator[None, None, None]:
     """Keep a build's selected renderer consistent with its bundled resources."""
     if name not in {"auto", "c", "python"}:
         raise ValueError("terminal renderer must be 'auto', 'c' or 'python'")
@@ -29,14 +49,25 @@ def terminal_renderer_override(name):
 
 class _HeadlessIO:
     """No console modes or writes: deterministic cell rendering for tests/tools."""
-    def __init__(self, width, height):
-        self.columns, self.rows = max(1, int(width / 8)), max(1, int(height / 16))
 
-    def enter(self): pass
-    def exit(self): pass
-    def read(self, timeout=0): return b""
-    def write(self, data): pass
-    def dimensions(self): return self.columns, self.rows, self.columns * 8, self.rows * 16
+    def __init__(self, width: float, height: float) -> None:
+        self.columns = max(1, int(width / 8))
+        self.rows = max(1, int(height / 16))
+
+    def enter(self) -> None:
+        pass
+
+    def exit(self) -> None:
+        pass
+
+    def read(self, timeout: float = 0) -> bytes:
+        return b""
+
+    def write(self, data: bytes) -> None:
+        pass
+
+    def dimensions(self) -> tuple[int, int, int, int]:
+        return self.columns, self.rows, self.columns * 8, self.rows * 16
 
 
 class TerminalHost:
@@ -51,8 +82,66 @@ class TerminalHost:
     backend = "terminal"
     text_row_height = 16
 
-    def __init__(self, *, renderer=None, hidden=False, color="auto", io=None,
-                 executable=None, probe_timeout=0.15, environ=None):
+    # These members are forwarded by __getattr__, not implemented by the wrapper.
+    # In particular, surface operations must remain absent on a native renderer
+    # that does not advertise render_surfaces. Keep declarations type-only so
+    # static consumers know the Host contract without changing capability probes.
+    if TYPE_CHECKING:
+        size: tuple[float, float]
+        viewport: Viewport
+
+        def poll(self) -> list[Input]: ...
+        def set_title(self, title: str) -> None: ...
+        def set_size(self, width: float, height: float) -> None: ...
+        def begin(self, background: str) -> None: ...
+        def rect(
+            self, rect: Rect, fill: str, radius: float = 0,
+            border: str = "", border_width: float = 1,
+        ) -> None: ...
+        def text(
+            self, text: str, x: float, y: float, color: str, size: float,
+            mono: bool = False,
+        ) -> None: ...
+        def measure(
+            self, text: str, size: float, mono: bool = False,
+        ) -> tuple[float, float]: ...
+        def line(
+            self, x1: float, y1: float, x2: float, y2: float,
+            color: str, width: float = 1,
+        ) -> None: ...
+        def image(
+            self, source: str, rect: Rect, *, tint: str = "#ffffff",
+            fit: Literal["stretch", "contain", "cover"] = "stretch",
+            _edges: tuple[int, int, int, int] | None = None,
+        ) -> None: ...
+        def surface_create(self, rect: Rect) -> object: ...
+        def surface_begin(self, surface: object) -> None: ...
+        def surface_end(self) -> None: ...
+        def surface_blit(self, surface: object) -> None: ...
+        def surface_release(self, surface: object) -> None: ...
+        def present(self) -> None: ...
+        def text_input(self, rect: Rect | None) -> None: ...
+        async def clipboard_read(self) -> str: ...
+        async def clipboard_write(self, text: str) -> None: ...
+        async def open_text_file(self) -> TextFile | None: ...
+        async def save_text_file(
+            self, text: str, suggested_name: str, location: str | None,
+        ) -> TextFile | None: ...
+        async def read_session(self, key: str) -> str | None: ...
+        async def write_session(self, key: str, text: str | None) -> None: ...
+        async def open_url(self, url: str) -> None: ...
+
+    def __init__(
+        self,
+        *,
+        renderer: Literal["auto", "c", "python"] | None = None,
+        hidden: bool = False,
+        color: Literal["auto", "truecolor", "256", "16", "none"] = "auto",
+        io: TerminalTransport | None = None,
+        executable: str | Path | None = None,
+        probe_timeout: float = 0.15,
+        environ: Mapping[str, str] | None = None,
+    ) -> None:
         from .._config import current
         configured = current().terminal_renderer
         choice = renderer if renderer is not None else _OVERRIDE.get() or configured or os.environ.get("PYSUAL_TERMINAL", "auto")
@@ -62,69 +151,110 @@ class TerminalHost:
             raise ValueError("color must be auto, truecolor, 256, 16 or none")
         if io is not None and choice == "c":
             raise ValueError("an injected terminal byte transport requires renderer='python'")
-        self.requested_renderer, self.renderer = choice, None
-        self.fallback_reason = None
-        self._hidden, self._color, self._io = bool(hidden), color, io
+        self.requested_renderer = choice
+        self.renderer: str | None = None
+        self.fallback_reason: str | None = None
+        self._hidden = bool(hidden)
+        self._color = color
+        self._io = io
         self._executable = Path(executable) if executable is not None else native_executable()
-        self._probe_timeout, self._environ = probe_timeout, environ
-        self._wake, self._namespace, self._policy = None, None, None
-        self._host, self._opened, self._closed = None, False, False
+        self._probe_timeout = probe_timeout
+        self._environ = environ
+        self._wake: Callable[[], None] | None = None
+        self._namespace: str | None = None
+        self._policy: dict[str, object] | None = None
+        self._host: NativeTermTextHost | TermTextHost | None = None
+        self._opened = False
+        self._closed = False
 
-    def __getattr__(self, name):
-        host = self.__dict__.get("_host")
+    def __getattr__(self, name: str) -> Any:
+        # Renderer-specific extensions remain dynamic, as on _SingleSurfaceHost.
+        # The declarations above keep the shared core API precisely checked.
+        host = cast("dict[str, object]", self.__dict__).get("_host")
         if host is None:
             raise AttributeError(name)
         return getattr(host, name)
 
     @property
-    def capabilities(self):
+    def capabilities(self) -> frozenset[str]:
         return self._host.capabilities if self._host is not None else frozenset()
 
     @property
-    def hidden(self):
+    def hidden(self) -> bool:
         return self._hidden
 
-    def set_wake_callback(self, callback):
-        self._wake = callback
-        if self._host is not None:
-            wake = getattr(self._host, "set_wake_callback", None)
-            if wake is not None:
-                wake(callback)
+    @property
+    def render_scale(self) -> float:
+        host = self._host
+        if host is None:
+            raise AttributeError("render_scale")
+        return host.render_scale
 
-    def set_session_namespace(self, name):
+    @property
+    def resource_revision(self) -> int:
+        host = self._host
+        if host is None:
+            raise AttributeError("resource_revision")
+        return host.resource_revision
+
+    def clip(self, rect: Rect | None) -> None:
+        host = self._host
+        if host is None:
+            raise AttributeError("clip")
+        host.clip(rect)
+
+    def set_wake_callback(self, callback: Callable[[], None] | None) -> None:
+        self._wake = callback
+        host = self._host
+        if host is not None:
+            wake = getattr(cast(object, host), "set_wake_callback", None)
+            if wake is not None:
+                cast(Callable[[Callable[[], None] | None], object], wake)(callback)
+
+    def set_session_namespace(self, name: str) -> None:
         self._namespace = name
         if self._host is not None:
             self._host.set_session_namespace(name)
 
-    def configure_rendering(self, **settings):
-        if self._host is not None:
-            configure = getattr(self._host, "configure_rendering", None)
+    def configure_rendering(self, **settings: object) -> None:
+        host = self._host
+        if host is not None:
+            configure = getattr(cast(object, host), "configure_rendering", None)
             if configure is not None:
-                configure(**settings)
+                cast(Callable[..., object], configure)(**settings)
         self._policy = settings
 
-    def _prepare(self, host):
+    def _prepare(self, host: NativeTermTextHost | TermTextHost) -> None:
         if self._namespace is not None:
             host.set_session_namespace(self._namespace)
-        wake = getattr(host, "set_wake_callback", None)
+        wake = getattr(cast(object, host), "set_wake_callback", None)
         if wake is not None and self._wake is not None:
-            wake(self._wake)
+            cast(Callable[[Callable[[], None]], object], wake)(self._wake)
         if self._policy is not None:
-            configure = getattr(host, "configure_rendering", None)
+            configure = getattr(cast(object, host), "configure_rendering", None)
             if configure is not None:
-                configure(**self._policy)
+                cast(Callable[..., object], configure)(**self._policy)
 
-    def open(self, title, width, height, resizable, scale):
+    def open(
+        self,
+        title: str,
+        width: float,
+        height: float,
+        resizable: bool,
+        scale: float | None,
+    ) -> None:
         if self._opened or self._closed:
             raise RuntimeError("Create a new terminal host for each opening")
         if scale not in (None, 1):
             raise CapabilityError("Terminal cells use ui_scale=1")
         use_c = self.requested_renderer != "python" and self._io is None
         if use_c:
-            host = NativeTermTextHost(hidden=self._hidden, executable=self._executable, color=self._color)
+            host = cast(
+                Callable[..., NativeTermTextHost], NativeTermTextHost
+            )(hidden=self._hidden, executable=self._executable, color=self._color)
             self._prepare(host)
             try:
-                host.open(title, width, height, resizable, scale)
+                cast(_NativeTerminal, host).open(title, width, height, resizable, scale)
             except (NativeHostError, OSError, TimeoutError) as error:
                 host.close()
                 if self.requested_renderer == "c":
@@ -146,12 +276,20 @@ class TerminalHost:
             raise
         self._host, self.renderer, self._opened = host, "python", True
 
-    def snapshot(self):
+    def snapshot(self) -> object:
         if not self._opened:
             raise RuntimeError("Terminal is not open")
+        host = self._host
+        if host is None:
+            raise RuntimeError("Terminal is not open")
         if self.renderer == "c":
-            return self._host.snapshot()
-        renderer = self._host._renderer
+            snapshot = getattr(cast(object, host), "snapshot", None)
+            if not callable(snapshot):
+                raise RuntimeError("Native terminal host cannot capture cells")
+            return cast(Callable[[], object], snapshot)()
+        if not isinstance(host, TermTextHost):
+            raise RuntimeError("Terminal host has no cell renderer")
+        renderer = host._renderer
         cells = renderer.cells
         return {
             "columns": renderer.columns, "rows": renderer.rows,
@@ -162,7 +300,7 @@ class TerminalHost:
                        "underline": cell.underline} for cell in cells],
         }
 
-    def close(self):
+    def close(self) -> None:
         if not self._closed:
             self._closed = True
             if self._host is not None:
@@ -170,12 +308,29 @@ class TerminalHost:
             self._opened = False
 
 
-def terminal(*, renderer=None, **options):
+def terminal(
+    *,
+    renderer: Literal["auto", "c", "python"] | None = None,
+    hidden: bool = False,
+    color: Literal["auto", "truecolor", "256", "16", "none"] = "auto",
+    io: TerminalTransport | None = None,
+    executable: str | Path | None = None,
+    probe_timeout: float = 0.15,
+    environ: Mapping[str, str] | None = None,
+) -> TerminalHost:
     """Construct a terminal target, e.g. ``app.run(backend=terminal(renderer='python'))``."""
-    return TerminalHost(renderer=renderer, **options)
+    return TerminalHost(
+        renderer=renderer,
+        hidden=hidden,
+        color=color,
+        io=io,
+        executable=executable,
+        probe_timeout=probe_timeout,
+        environ=environ,
+    )
 
 
-def prepare_signal_restoration(backend=None) -> bool:
+def prepare_signal_restoration(backend: object = None) -> bool:
     """Own SIGTERM/SIGHUP console restoration before a Python terminal opening.
 
     Window gateways call this on the caller's thread, because sessions open on
@@ -187,7 +342,10 @@ def prepare_signal_restoration(backend=None) -> bool:
         from . import resolve_backend
 
         try:
-            selected = resolve_backend(resolved_backend(backend))
+            from . import BackendName
+            selected = resolve_backend(
+                resolved_backend(cast("BackendName | None", backend))
+            )
         except Exception:
             return False  # open_window reports the invalid selection itself.
         if selected != "terminal":

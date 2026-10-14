@@ -2,20 +2,23 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar, Literal
+from collections.abc import Callable
+from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
 from ._text_display import single_line
 from .behaviors import PressBehavior
 from .controls import Container, Control
-from .errors import BindingError
+from .errors import BindingError, LifecycleError
 from .events import ChangeEvent, Event
 from .geometry import Rect
 from .icons import icon_names
-from .painting import resolve_style
-from .schema import Dirty, _init_argument, prop
+from .painting import resolve_style, Painter
+from .schema import Dirty, Field, _init_argument, expect_flag, prop
+from .theme import ResolvedStyle
+from .host import Host, Input
 
 
-def _line(painter, text, area, style):
+def _line(painter: Painter, text: str, area: Rect, style: ResolvedStyle) -> None:
     """A single, clipped line that respects the chosen theme's font metrics."""
     if area.width <= 0 or area.height <= 0:
         return
@@ -29,7 +32,7 @@ def _line(painter, text, area, style):
                      font_family=style.font_family)
 
 
-def _details(painter, text, area, style):
+def _details(painter: Painter, text: str, area: Rect, style: ResolvedStyle) -> None:
     """Wrap a tile's explanation into at most three measured, clipped lines."""
     if not text or area.width <= 0 or area.height <= 0:
         return
@@ -83,16 +86,16 @@ class ChoiceCard(Control):
     style_fallbacks: ClassVar[tuple[str, ...]] = ("Button",)
     style_parts: ClassVar[tuple[str, ...]] = ("body", "icon", "description", "check")
 
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
         self._press = PressBehavior()
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
         if name == "icon" and value and value not in icon_names():
             raise ValueError(f"Unknown icon {value!r}")
 
-    def _exclusive(self):
+    def _exclusive(self) -> None:
         if self.checked and self._parent is not None:
             for sibling in self._parent.children:
                 if (isinstance(sibling, ChoiceCard) and sibling is not self
@@ -104,10 +107,10 @@ class ChoiceCard(Control):
                     finally:
                         sibling._origin = previous
 
-    def on_attached(self):
+    def on_attached(self) -> None:
         self._exclusive()
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         self._press.reset(self)
         if field.name in ("checked", "group"):
             self._exclusive()
@@ -119,7 +122,7 @@ class ChoiceCard(Control):
         if self.effective_enabled and not self.read_only:
             self.checked = True
 
-    def handle_input(self, event, /):
+    def handle_input(self, event: Input, /) -> bool | None:
         self._check_live()
         if not self.effective_enabled or self.read_only:
             self._press.reset(self)
@@ -150,7 +153,7 @@ class ChoiceCard(Control):
         if self._press.handle_input(self, event):
             self.select()
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         style, description = resolve_style(self), resolve_style(self, "description")
         title_width, title_height = host.measure(single_line(self.text), style.font_size,
                                                  style.font_family == "mono")
@@ -169,7 +172,7 @@ class ChoiceCard(Control):
         return max(180, max(title_width, detail_width) + padding * 2 + 30
                    + (48 if self.icon else 0)), max(72, height)
 
-    def paint(self, painter, /):
+    def paint(self, painter: Painter, /) -> None:
         style = painter.style(selected=self.checked)
         bounds = Rect(0, 0, painter.width, painter.height)
         painter.surface(bounds, style)
@@ -208,7 +211,7 @@ class ChoiceCard(Control):
                 _line(painter, self.description,
                       Rect(left, top + title_height + 5, max(0, right - left), detail_height), detail)
 
-    def _paint_vertical(self, painter, area, style):
+    def _paint_vertical(self, painter: Painter, area: Rect, style: ResolvedStyle) -> None:
         check_size = min(20, area.width, area.height)
         check = Rect(area.right - check_size, area.y, check_size, check_size)
         painter.marker(check, painter.style("check", selected=self.checked),
@@ -232,7 +235,7 @@ class ChoiceCard(Control):
                  Rect(area.x, top, area.width, max(0, area.bottom - top)),
                  painter.style("description", selected=self.checked))
 
-    def destroy(self):
+    def destroy(self) -> None:
         self._press.reset(self)
         super().destroy()
 
@@ -242,17 +245,24 @@ class _DisclosureHeader(Control):
 
     focusable: bool = prop(default=True, affects=Dirty.HIT_TEST)
 
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
         self._press = PressBehavior()
 
-    def _part_style(self, part):
+    def _section(self) -> Disclosure:
+        parent = self._parent
+        if not isinstance(parent, Disclosure):
+            raise LifecycleError("Disclosure heading requires its section")
+        return parent
+
+    def _part_style(self, part: str) -> ResolvedStyle:
         state = ("disabled" if not self.effective_enabled else "pressed" if self._pressed
                  else "hover" if self._hover else "normal")
-        return resolve_style(self._parent, part, selected=self._parent.expanded, state=state)
+        section = self._section()
+        return resolve_style(section, part, selected=section.expanded, state=state)
 
-    def measure(self, host):
-        owner = self._parent
+    def measure(self, host: Host) -> tuple[float, float]:
+        owner = self._section()
         style, summary = self._part_style("header"), self._part_style("summary")
         width, height = host.measure(single_line(owner.title), style.font_size,
                                      style.font_family == "mono")
@@ -263,12 +273,12 @@ class _DisclosureHeader(Control):
         padding = max(10, style.padding)
         return max(160, width + 28 + padding * 2), max(40, height + padding * 2)
 
-    def handle_input(self, event, /):
+    def handle_input(self, event: Input, /) -> bool | None:
         self._check_live()
         if not self.effective_enabled:
             self._press.reset(self)
             return
-        owner = self._parent
+        owner = self._section()
         previous = owner._origin
         owner._origin = self._origin
         try:
@@ -280,8 +290,8 @@ class _DisclosureHeader(Control):
         finally:
             owner._origin = previous
 
-    def paint(self, painter, /):
-        owner = self._parent
+    def paint(self, painter: Painter, /) -> None:
+        owner = self._section()
         style = self._part_style("header")
         bounds = Rect(0, 0, painter.width, painter.height)
         with painter._clipped(bounds):
@@ -303,7 +313,7 @@ class _DisclosureHeader(Control):
             if owner.summary:
                 _line(painter, owner.summary, Rect(area.x, top + height + 4, width, detail), summary)
 
-    def destroy(self):
+    def destroy(self) -> None:
         self._press.reset(self)
         super().destroy()
 
@@ -329,7 +339,7 @@ class Disclosure(Container):
     if TYPE_CHECKING:
         _content_input: Control | None = _init_argument(default=None, alias="content")
     else:
-        def __init__(self, *, content: Control | None = None, **properties):
+        def __init__(self, *, content: Control | None = None, **properties: object) -> None:
             if content is not None:
                 if not isinstance(content, Control):
                     raise TypeError("content must be a detached Control or None")
@@ -345,13 +355,13 @@ class Disclosure(Container):
                     self.destroy()
                 raise
 
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
         self._header = _DisclosureHeader(parent=self)
         self._content = Container(parent=self, layout="stack", padding=16, spacing=12,
                                   visible=self.expanded)
 
-    def _validate_live_update(self, name, value):
+    def _validate_live_update(self, name: str, value: object) -> None:
         super()._validate_live_update(name, value)
         if name == "expanded":
             # A modal dialog may own, or live inside, this subtree. Preflight
@@ -364,7 +374,7 @@ class Disclosure(Container):
         self._check_live()
         return self._content
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         self._header._press.reset(self._header)
         if field.name == "expanded":
             runtime = getattr(self._root(), "_runtime", None)
@@ -372,9 +382,10 @@ class Disclosure(Container):
             node = focused
             while node is not None and node is not self._content:
                 node = node._parent
-            if not value and node is self._content:
+            shown = expect_flag(value)
+            if not shown and node is self._content:
                 self._header.focus()
-            self._content.visible = value
+            self._content.visible = shown
         if field.name in ("title", "summary", "expanded", "font_size", "font_family",
                           "foreground", "background", "theme_override", "enabled"):
             self._header.invalidate(Dirty.MEASURE | Dirty.PAINT)
@@ -396,7 +407,7 @@ class Disclosure(Container):
         self._check_live()
         return self._header.focused
 
-    def handle_input(self, event, /):
+    def handle_input(self, event: Input, /) -> bool | None:
         self._check_live()
         previous = self._header._origin
         self._header._origin = self._origin
@@ -405,20 +416,30 @@ class Disclosure(Container):
         finally:
             self._header._origin = previous
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         return self.measure_available(host)
 
-    def measure_available(self, host, *, width=None, height=None):
-        from .layout import _size
+    def measure_available(
+        self, host: Host, *, width: float | None = None, height: float | None = None
+    ) -> tuple[float, float]:
+        from . import layout
 
+        size = getattr(layout, "_size")
         inner_width = None if width is None else max(0, width - self.padding * 2)
-        hw, hh = _size(self._header, host, width=inner_width)
-        cw, ch = _size(self._content, host, width=inner_width) if self.expanded else (0, 0)
+        hw, hh = cast(tuple[float, float], size(self._header, host, width=inner_width))
+        cw, ch = (
+            cast(tuple[float, float], size(self._content, host, width=inner_width))
+            if self.expanded else (0, 0)
+        )
         return max(hw, cw) + self.padding * 2, hh + ch + self.padding * 2
 
-    def arrange_children(self, area, measure):
+    def arrange_children(
+        self, area: Rect, measure: Callable[[Control], tuple[float, float]]
+    ) -> dict[Control, Rect] | None:
         header_height = min(area.height, measure(self._header)[1])
-        boxes = {self._header: Rect(area.x, area.y, area.width, header_height)}
+        boxes: dict[Control, Rect] = {
+            self._header: Rect(area.x, area.y, area.width, header_height)
+        }
         if self._content.visible:
             boxes[self._content] = Rect(area.x, area.y + header_height, area.width,
                                         max(0, area.height - header_height))
@@ -430,7 +451,7 @@ class Disclosure(Container):
                 boxes[child] = Rect(area.x + child.left, area.y + child.top, w, h)
         return boxes
 
-    def paint(self, painter, /):
+    def paint(self, painter: Painter, /) -> None:
         painter.body()
 
 

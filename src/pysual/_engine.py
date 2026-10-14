@@ -1,3 +1,4 @@
+# pyright: reportUnusedCallResult=true, reportImplicitOverride=true, reportPrivateUsage=true, reportUnnecessaryIsInstance=true, reportUnnecessaryComparison=true, reportUnnecessaryCast=true, reportUnusedFunction=true
 """One lazy Python UI owner, bounded dispatch and explicit interpreter lifetime.
 
 No native resources are created here. The daemon owner never keeps a script
@@ -10,16 +11,17 @@ from __future__ import annotations
 import asyncio
 import atexit
 from collections import deque
+from collections.abc import Callable, Coroutine, Generator, Iterable
 from concurrent.futures import Future, InvalidStateError, TimeoutError as FutureTimeout
 from contextlib import contextmanager
-from contextvars import ContextVar, copy_context
+from contextvars import Context, ContextVar, copy_context
 from dataclasses import dataclass
 from functools import wraps
 import inspect
 import sys
 import threading
 from time import monotonic
-from typing import Any, Callable, TypeVar, cast
+from typing import Any, TypeVar, cast
 
 from .errors import LifecycleError
 
@@ -27,7 +29,7 @@ from .errors import LifecycleError
 class DispatchTimeout(TimeoutError):
     """A timed-out UI operation; started operations must never be retried blindly."""
 
-    def __init__(self, started: bool):
+    def __init__(self, started: bool) -> None:
         self.started = started
         super().__init__(
             "UI operation timed out after execution began; its outcome is indeterminate"
@@ -48,6 +50,7 @@ _instance: Engine | None = None
 _instance_lock = threading.Lock()
 _exiting = False
 _F = TypeVar("_F", bound=Callable[..., Any])
+_R = TypeVar("_R")
 _BROWSER_SLICE = 0.008
 
 
@@ -58,7 +61,7 @@ def caller_side(function: _F) -> _F:
 
 
 @contextmanager
-def critical_phase(name):
+def critical_phase(name: str | None) -> Generator[None, None, None]:
     token = _phase.set(name)
     try:
         yield
@@ -66,13 +69,13 @@ def critical_phase(name):
         _phase.reset(token)
 
 
-def ensure_presentable():
+def ensure_presentable() -> None:
     if phase := _phase.get():
         raise LifecycleError(f"Cannot open or change a presentation during {phase}")
 
 
 def capture_origin(owner: object) -> tuple[tuple[object, object, int], ...]:
-    result = []
+    result: list[tuple[object, object, int]] = []
     while owner is not None:
         if hasattr(owner, "_presentation"):
             result.append(
@@ -118,14 +121,18 @@ def check_origin(obj: object) -> None:
 
 @dataclass
 class _Request:
-    function: Callable
-    future: Future
-    context: Any
+    function: Callable[[], Any]
+    future: Future[Any]
+    context: Context
     asynchronous: bool = False
 
 
 class Engine:
-    def __init__(self, *, capacity: int = 10000, timeout: float = 10.0):
+    # Set only for the browser owner. Native threads never call _browser_call.
+    _browser_busy: bool
+    _browser_checkpoint_at: float
+
+    def __init__(self, *, capacity: int = 10000, timeout: float = 10.0) -> None:
         self.capacity = capacity
         self.timeout = timeout
         self._inbox: deque[_Request] = deque()
@@ -137,10 +144,10 @@ class Engine:
         self._thread: threading.Thread | None = None
         self._ident: int | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._shutdown_hooks: list[tuple[Callable, bool]] = []
-        self._tasks: set[asyncio.Task] = set()
+        self._shutdown_hooks: list[tuple[Callable[[], Any], bool]] = []
+        self._tasks: set[asyncio.Task[Any]] = set()
         self._startup_error: BaseException | None = None
-        self._shutdown_future: Future | None = None
+        self._shutdown_future: Future[list[BaseException]] | None = None
         self._browser = sys.platform == "emscripten"
         self.calls_submitted = 0
         self.calls_completed = 0
@@ -154,14 +161,14 @@ class Engine:
                 target=self._serve, name="Pysual UI", daemon=True
             )
             self._thread.start()
-            self._ready.wait()
+            _ = self._ready.wait()
             if self._startup_error is not None:
                 raise LifecycleError(
                     "The UI owner could not start"
                 ) from self._startup_error
 
     @property
-    def loop(self):
+    def loop(self) -> asyncio.AbstractEventLoop:
         if self._browser:
             return asyncio.get_running_loop()
         if self._loop is None:
@@ -171,7 +178,7 @@ class Engine:
     def is_ui_thread(self) -> bool:
         return self._ident == threading.get_ident()
 
-    def _serve(self):
+    def _serve(self) -> None:
         try:
             self._ident = threading.get_ident()
             self._loop = asyncio.new_event_loop()
@@ -188,8 +195,10 @@ class Engine:
             self._loop.close()
             self._ident = None  # A later OS thread may reuse the numeric ID.
 
-    def _admit(self, function, *, asynchronous=False) -> Future:
-        future: Future = Future()
+    def _admit(
+        self, function: Callable[[], Any], *, asynchronous: bool = False
+    ) -> Future[Any]:
+        future: Future[Any] = Future()
         request = _Request(function, future, copy_context(), asynchronous)
         with self._lock:
             if self._stopping:
@@ -202,10 +211,10 @@ class Engine:
             self.calls_submitted += 1
             if not self._scheduled:
                 self._scheduled = True
-                self.loop.call_soon_threadsafe(self._drain)
+                _ = self.loop.call_soon_threadsafe(self._drain)
         return future
 
-    def _drain(self):
+    def _drain(self) -> None:
         deadline = monotonic() + 0.004
         count = 0
         while count < 64 and monotonic() < deadline:
@@ -219,7 +228,7 @@ class Engine:
             count += 1
         with self._lock:
             if self._inbox:
-                self.loop.call_soon(self._drain)
+                _ = self.loop.call_soon(self._drain)
             else:
                 self._scheduled = False
 
@@ -244,7 +253,7 @@ class Engine:
                 self._active_requests += 1
             self._run_request(request)
 
-    def _run_request(self, request):
+    def _run_request(self, request: _Request) -> None:
         future = request.future
         if request.asynchronous:
             if future.cancelled():
@@ -273,15 +282,15 @@ class Engine:
             else:
                 self._release_request()
 
-    def _release_request(self):
+    def _release_request(self) -> None:
         with self._lock:
             self._active_requests -= 1
             self.calls_completed += 1
 
-    def _start_async(self, request):
+    def _start_async(self, request: _Request) -> None:
         future = request.future
 
-        async def execute():
+        async def execute() -> Any:
             if future.cancelled():
                 raise asyncio.CancelledError
             result = request.function()
@@ -290,11 +299,11 @@ class Engine:
         task = self.loop.create_task(execute())
         self._tasks.add(task)
 
-        def complete(done):
+        def complete(done: asyncio.Task[Any]) -> None:
             self._tasks.discard(done)
             self._release_request()
             if done.cancelled():
-                future.cancel()
+                _ = future.cancel()
                 return
             error = done.exception()
             try:
@@ -307,26 +316,33 @@ class Engine:
                 if not future.cancelled():
                     raise
 
-        def cancel(done):
+        def cancel(done: Future[Any]) -> None:
             if done.cancelled() and not task.done():
                 try:
-                    self.loop.call_soon_threadsafe(task.cancel)
+                    _ = self.loop.call_soon_threadsafe(task.cancel)
                 except RuntimeError:
                     pass
 
         task.add_done_callback(complete)
         future.add_done_callback(cancel)
         if future.cancelled():
-            task.cancel()
+            _ = task.cancel()
 
-    def call(self, function, *args, **kwargs):
+    def call(self, function: Callable[..., _R], *args: Any, **kwargs: Any) -> _R:
         return self._call(function, args, kwargs, timeout=self.timeout)
 
-    def call_opening(self, function, *args, **kwargs):
+    def call_opening(self, function: Callable[..., _R], *args: Any, **kwargs: Any) -> _R:
         """Wait for an opening's actual result, however long its first frame takes."""
         return self._call(function, args, kwargs, timeout=None)
 
-    def _call(self, function, args, kwargs, *, timeout):
+    def _call(
+        self,
+        function: Callable[..., _R],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        *,
+        timeout: float | None,
+    ) -> _R:
         if self.is_ui_thread():
             if self._stopping:
                 raise LifecycleError("The UI engine has shut down")
@@ -335,15 +351,15 @@ class Engine:
             return function(*args, **kwargs)
         future = self._admit(lambda: function(*args, **kwargs))
         try:
-            return future.result(timeout)
+            return cast(_R, future.result(timeout))
         except FutureTimeout:
             # TimeoutError may also be the actual result of the operation.
             if future.done():
-                return future.result()
+                return cast(_R, future.result())
             cancelled = future.cancel()
             raise DispatchTimeout(started=not cancelled) from None
 
-    def _browser_call(self, function, *args, **kwargs):
+    def _browser_call(self, function: Callable[..., _R], *args: Any, **kwargs: Any) -> _R:
         """Give the shared browser loop time between complete UI operations."""
         # Runtime work and UI callbacks already cooperate at explicit awaits.
         if self._browser_busy or _phase.get() is not None or _origin.get():
@@ -363,7 +379,7 @@ class Engine:
             # Includes nested methods, property notifications and JSPI reentry.
             self._browser_busy = False
 
-    def submit(self, coroutine):
+    def submit(self, coroutine: Coroutine[Any, Any, _R]) -> Future[_R] | asyncio.Task[_R]:
         if self._browser:
             return self.loop.create_task(coroutine)
         try:
@@ -374,11 +390,11 @@ class Engine:
 
         # A submitted coroutine rejected or cancelled before entry must be
         # closed on its owner, without racing the moment it starts executing.
-        def close_unstarted(done):
+        def close_unstarted(done: Future[Any]) -> None:
             if not done.cancelled() and done.exception() is None:
                 return
 
-            def close():
+            def close() -> None:
                 if inspect.getcoroutinestate(coroutine) == inspect.CORO_CREATED:
                     coroutine.close()
 
@@ -386,30 +402,32 @@ class Engine:
                 close()
             else:
                 try:
-                    self.loop.call_soon_threadsafe(close)
+                    _ = self.loop.call_soon_threadsafe(close)
                 except RuntimeError:
                     # A closed loop cannot begin executing the coroutine.
                     close()
 
         future.add_done_callback(close_unstarted)
-        return future
+        return cast(Future[_R], future)
 
-    async def call_async(self, function, *args, **kwargs):
+    async def call_async(self, function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         if self.is_ui_thread():
             result = function(*args, **kwargs)
             return await result if inspect.isawaitable(result) else result
         future = self._admit(lambda: function(*args, **kwargs), asynchronous=True)
         return await asyncio.wrap_future(future)
 
-    def add_shutdown_hook(self, callback, *, finalization=False):
-        def add():
+    def add_shutdown_hook(
+        self, callback: Callable[[], Any], *, finalization: bool = False
+    ) -> None:
+        def add() -> None:
             if (callback, finalization) not in self._shutdown_hooks:
                 self._shutdown_hooks.append((callback, finalization))
 
         self.call(add)
 
     @staticmethod
-    def _settle_rejected(pending):
+    def _settle_rejected(pending: Iterable[_Request]) -> None:
         for request in pending:
             try:
                 if not request.future.done():
@@ -420,15 +438,15 @@ class Engine:
                 if not request.future.cancelled():
                     raise
 
-    def _reject_pending(self):
+    def _reject_pending(self) -> None:
         with self._lock:
             self._stopping = True
             pending, self._inbox = self._inbox, deque()
         self._settle_rejected(pending)
 
-    async def _stop(self, *, finalizing=False):
+    async def _stop(self, *, finalizing: bool = False) -> list[BaseException]:
         self._reject_pending()
-        errors = []
+        errors: list[BaseException] = []
         for callback, at_exit in reversed(self._shutdown_hooks):
             if finalizing and not at_exit:
                 continue
@@ -447,7 +465,7 @@ class Engine:
             if task is not current and not task.done()
         ]
         for task in tasks:
-            task.cancel()
+            _ = task.cancel()
         if tasks:
             _, pending = await asyncio.wait(tasks, timeout=0.5)
             if pending:
@@ -456,7 +474,20 @@ class Engine:
                 )
         return errors
 
-    def shutdown(self, *, timeout=3.0, finalizing=False):
+    def shutdown_at_exit(self) -> None:
+        """Join a background owner during interpreter shutdown.
+
+        The browser shares the host loop, so it must not stop that loop here.
+        Finalization never starts user close decisions or pins the process.
+        """
+        if self._browser:
+            return
+        try:
+            self.shutdown(finalizing=True)
+        except BaseException:
+            pass
+
+    def shutdown(self, *, timeout: float = 3.0, finalizing: bool = False) -> None:
         if self.is_ui_thread():
             raise LifecycleError(
                 "Call shutdown() outside the UI owner; UI handlers can use close_async()"
@@ -486,7 +517,7 @@ class Engine:
             errors = future.result(timeout)
         finally:
             try:
-                self.loop.call_soon_threadsafe(self.loop.stop)
+                _ = self.loop.call_soon_threadsafe(self.loop.stop)
             except RuntimeError:
                 pass  # Another joined shutdown may already have closed it.
             if self._thread is not None:
@@ -506,7 +537,7 @@ def get_engine() -> Engine:
                     )
                 from ._config import freeze
 
-                freeze()
+                _ = freeze()
                 _instance = Engine()
     return _instance
 
@@ -522,32 +553,32 @@ def check_ui_thread() -> None:
         raise LifecycleError("This internal operation belongs to the Pysual UI owner")
 
 
-def call(function, *args, **kwargs):
+def call(function: Callable[..., _R], *args: Any, **kwargs: Any) -> _R:
     return get_engine().call(function, *args, **kwargs)
 
 
-def call_opening(function, *args, **kwargs):
+def call_opening(function: Callable[..., _R], *args: Any, **kwargs: Any) -> _R:
     return get_engine().call_opening(function, *args, **kwargs)
 
 
-async def call_async(function, *args, **kwargs):
+async def call_async(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     return await get_engine().call_async(function, *args, **kwargs)
 
 
-def submit(coroutine):
+def submit(coroutine: Coroutine[Any, Any, _R]) -> Future[_R] | asyncio.Task[_R]:
     return get_engine().submit(coroutine)
 
 
 class TaskHandle:
     """A control-owned task whose await/cancellation follows asyncio.Task semantics."""
 
-    def __init__(self, task):
+    def __init__(self, task: asyncio.Task[Any]) -> None:
         self._task = task
-        self._future: Future = Future()
+        self._future: Future[Any] = Future()
 
-        def complete(done):
+        def complete(done: asyncio.Task[Any]) -> None:
             if done.cancelled():
-                self._future.cancel()
+                _ = self._future.cancel()
                 return
             error = done.exception()
             try:
@@ -570,7 +601,7 @@ class TaskHandle:
             return self._task.cancel()
         try:
             # Cancellation is lifecycle traffic and bypasses a saturated inbox.
-            self._task.get_loop().call_soon_threadsafe(self._task.cancel)
+            _ = self._task.get_loop().call_soon_threadsafe(self._task.cancel)
         except RuntimeError:
             return False
         return True
@@ -585,21 +616,21 @@ class TaskHandle:
             return self._task.cancelled()
         return self._future.cancelled()
 
-    def result(self, timeout=None):
+    def result(self, timeout: float | None = None) -> Any:
         if is_ui_thread():
             if not self._task.done():
                 raise LifecycleError("Await an unfinished task on the UI owner")
             return self._task.result()
         return self._future.result(timeout)
 
-    def exception(self, timeout=None):
+    def exception(self, timeout: float | None = None) -> BaseException | None:
         if is_ui_thread():
             if not self._task.done():
                 raise LifecycleError("Await an unfinished task on the UI owner")
             return self._task.exception()
         return self._future.exception(timeout)
 
-    async def _wait(self):
+    async def _wait(self) -> Any:
         bridge = asyncio.wrap_future(self._future)
         bridge.add_done_callback(
             lambda done: None if done.cancelled() else done.exception()
@@ -610,11 +641,11 @@ class TaskHandle:
             except asyncio.CancelledError:
                 if bridge.done():
                     raise
-                self.cancel()
+                _ = self.cancel()
                 # Await the actual outcome, including cancellation cleanup or
                 # a task that deliberately suppresses cancellation and returns.
 
-    def __await__(self):
+    def __await__(self) -> Any:
         return self._wait().__await__()
 
 
@@ -623,24 +654,20 @@ def shutdown() -> None:
         _instance.shutdown()
 
 
-def _at_exit():
+def _at_exit() -> None:
     global _exiting
     _exiting = True
-    if _instance is not None and not _instance._browser:
-        try:
-            _instance.shutdown(finalizing=True)
-        except BaseException:
-            # Finalization never starts user close decisions or pins the process.
-            pass
+    if _instance is not None:
+        _instance.shutdown_at_exit()
 
 
-atexit.register(_at_exit)
+_ = atexit.register(_at_exit)
 
 
 def prioritize_finalization() -> None:
     """Release UI-owned resources before lazily imported bindings' exit hooks."""
     atexit.unregister(_at_exit)
-    atexit.register(_at_exit)
+    _ = atexit.register(_at_exit)
 
 
 def ui_operation(function: _F) -> _F:
@@ -649,7 +676,7 @@ def ui_operation(function: _F) -> _F:
         return function
 
     @wraps(function)
-    def operation(*args, **kwargs):
+    def operation(*args: Any, **kwargs: Any) -> Any:
         # Reading class-level property defaults must not start/freeze the engine.
         if _instance is None:
             return function(*args, **kwargs)
@@ -668,7 +695,7 @@ def ui_method(function: _F) -> _F:
     if inspect.iscoroutinefunction(function):
 
         @wraps(function)
-        async def asynchronous(*args, **kwargs):
+        async def asynchronous(*args: Any, **kwargs: Any) -> Any:
             if is_ui_thread():
                 if args:
                     check_origin(args[0])
@@ -679,7 +706,7 @@ def ui_method(function: _F) -> _F:
     else:
 
         @wraps(function)
-        def synchronous(*args, **kwargs):
+        def synchronous(*args: Any, **kwargs: Any) -> Any:
             if is_ui_thread():
                 if args:
                     check_origin(args[0])

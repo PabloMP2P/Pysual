@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from functools import partial
 from time import monotonic
@@ -157,7 +158,7 @@ def validate_callback(
         target = getattr(target, "__call__")
     annotation = get_type_hints(target).get(parameters[0].name)
 
-    def accepts(annotation):
+    def accepts(annotation: Any) -> bool:
         if annotation is None or annotation is Any:
             return True
         origin = get_origin(annotation)
@@ -171,7 +172,7 @@ def validate_callback(
 
 
 class EventOwner(Protocol):
-    _channels: dict[str, Channel]
+    _channels: dict[str, Channel[Any]]
     _dispatcher: Dispatcher | None
     _disposed: bool
 
@@ -245,15 +246,17 @@ class Channel(Generic[E]):
         )
 
     def _snapshot(self) -> tuple[Callback[E], ...]:
-        callbacks = (
-            ([self._convention] if self._convention else [])
-            + ([self._namespace] if self._namespace else [])
-            + self._listeners
-        )
-        return tuple(
-            callback
-            for i, callback in enumerate(callbacks)
-            if callback not in callbacks[:i]
+        bound: list[Callback[E]] = []
+        for callback in (self._convention, self._namespace):
+            if callback is not None and callback not in bound:
+                bound.append(callback)
+        # connect() already deduplicates explicit listeners. Only the two
+        # binding sources can overlap with them at dispatch time.
+        if not bound:
+            return tuple(self._listeners)
+        return (
+            *bound,
+            *(callback for callback in self._listeners if callback not in bound),
         )
 
     @ui_method
@@ -280,12 +283,12 @@ class Dispatcher:
         self.limit = limit
         self.pending = 0
         self._running = 0
-        self._tasks: set[asyncio.Task] = set()
+        self._tasks: set[asyncio.Task[Any]] = set()
         self._errors: list[BaseException] = []
         self._stopped = False
-        self._owners: dict[asyncio.Task, object] = {}
-        self._counted: set[asyncio.Task] = set()
-        self._survivors: set[asyncio.Task] = set()
+        self._owners: dict[asyncio.Task[Any], object] = {}
+        self._counted: set[asyncio.Task[Any]] = set()
+        self._survivors: set[asyncio.Task[Any]] = set()
 
     def _record_error(self, error: BaseException) -> None:
         # An overload both raises at the call site and signals fatal failure.
@@ -295,7 +298,7 @@ class Dispatcher:
         ):
             self._errors.append(error)
 
-    def _reserve(self, count: int, channel: Channel, *, terminal=False) -> None:
+    def _reserve(self, count: int, channel: Channel[Any], *, terminal: bool = False) -> None:
         check_ui_thread()
         if self._stopped and not terminal:
             raise LifecycleError("Event dispatcher has stopped")
@@ -309,22 +312,39 @@ class Dispatcher:
             raise error
         self.pending += count
 
-    def emit(self, channel: Channel[E], event: E, *, terminal=False) -> None:
+    def emit(self, channel: Channel[E], event: E, *, terminal: bool = False) -> None:
         listeners = channel._snapshot()
         self._reserve(len(listeners), channel, terminal=terminal)
-        for callback in listeners:
-            token = _origin.set(capture_origin(channel.owner))
-            try:
-                task = asyncio.create_task(
-                    self._deliver(channel, callback, event, terminal=terminal),
-                    name=f"{source_label(channel.owner)}.{channel.declaration.name} -> {callback_label(callback)}",
-                )
-            finally:
-                _origin.reset(token)
-            self._track(task, channel.owner, counted=True)
+        remaining = len(listeners)
+        try:
+            for callback in listeners:
+                token = _origin.set(capture_origin(channel.owner))
+                try:
+                    delivery = self._deliver(channel, callback, event, terminal=terminal)
+                    try:
+                        task = asyncio.create_task(
+                            delivery,
+                            name=f"{source_label(channel.owner)}.{channel.declaration.name} -> {callback_label(callback)}",
+                        )
+                    except BaseException:
+                        if inspect.getcoroutinestate(delivery) != inspect.CORO_CREATED:
+                            remaining -= 1
+                        delivery.close()
+                        raise
+                    remaining -= 1
+                    # Eager factories can enter _deliver before _track. Once
+                    # entered, its finally block owns the reservation release.
+                    self._track(
+                        task, channel.owner,
+                        counted=inspect.getcoroutinestate(delivery) == inspect.CORO_CREATED,
+                    )
+                finally:
+                    _origin.reset(token)
+        finally:
+            self.pending -= remaining
 
     async def _deliver(
-        self, channel: Channel[E], callback: Callback[E], event: E, *, terminal=False
+        self, channel: Channel[E], callback: Callback[E], event: E, *, terminal: bool = False
     ) -> None:
         # Until entry, _finished owns cancellation-before-start cleanup. After
         # entry this finally block releases the invocation immediately, including
@@ -351,7 +371,7 @@ class Dispatcher:
             self._running -= 1
             self.pending -= 1
 
-    def _finished(self, task: asyncio.Task) -> None:
+    def _finished(self, task: asyncio.Task[Any]) -> None:
         self._survivors.discard(task)
         if task in self._counted:
             self.pending -= 1
@@ -368,7 +388,9 @@ class Dispatcher:
                     "task": task,
                 })
 
-    def _track(self, task, owner, counted=False):
+    def _track(
+        self, task: asyncio.Task[Any], owner: object, counted: bool = False
+    ) -> asyncio.Task[Any]:
         self._tasks.add(task)
         self._owners[task] = owner
         if counted:
@@ -376,27 +398,34 @@ class Dispatcher:
         task.add_done_callback(self._finished)
         return task
 
-    def create_task(self, coroutine, owner):
+    def create_task(
+        self, coroutine: Coroutine[Any, Any, Any], owner: object
+    ) -> asyncio.Task[Any]:
         if self._stopped:
             coroutine.close()
             raise LifecycleError("Runtime is closing")
         token = _origin.set(capture_origin(owner))
         started = False
-        async def execute():
+        async def execute() -> Any:
             nonlocal started
             started = True
             with critical_phase(None):
                 return await coroutine
         try:
-            task = self._track(
-                asyncio.create_task(
-                    execute(), name=f"{source_label(owner)}: {callback_label(coroutine)}"
-                ),
-                owner,
-            )
+            execution = execute()
+            try:
+                task = asyncio.create_task(
+                    execution, name=f"{source_label(owner)}: {callback_label(coroutine)}"
+                )
+            except BaseException:
+                execution.close()
+                if not started:
+                    coroutine.close()
+                raise
+            self._track(task, owner)
             # Cancelling an asyncio task before its first turn never enters its
             # coroutine. Close the caller's inner coroutine in that case too.
-            def release_unstarted(_):
+            def release_unstarted(_: object) -> None:
                 if not started:
                     coroutine.close()
             task.add_done_callback(release_unstarted)
@@ -404,19 +433,20 @@ class Dispatcher:
         finally:
             _origin.reset(token)
 
-    def preserve_task(self, task):
+    def preserve_task(self, task: asyncio.Task[Any] | None) -> None:
         if task is not None and task in self._tasks:
             self._survivors.add(task)
 
-    def release_task(self, task):
-        self._survivors.discard(task)
+    def release_task(self, task: asyncio.Task[Any] | None) -> None:
+        if task is not None:
+            self._survivors.discard(task)
 
-    def cancel_owner(self, owner, *, force=False):
+    def cancel_owner(self, owner: object, *, force: bool = False) -> None:
         for task, source in tuple(self._owners.items()):
             if source is owner and task is not asyncio.current_task() and (force or task not in self._survivors):
                 task.cancel()
 
-    def raise_errors(self):
+    def raise_errors(self) -> None:
         if self._errors:
             errors, self._errors = self._errors, []
             if len(errors) == 1:

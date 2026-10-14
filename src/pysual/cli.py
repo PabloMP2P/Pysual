@@ -18,6 +18,7 @@ import importlib.util
 import json
 import os
 import shutil
+from collections.abc import Sequence
 from pathlib import Path
 import subprocess
 import sys
@@ -46,7 +47,7 @@ _CHECKOUT_REQUIRED = (
 )
 
 
-def _native_available(*, window=False):
+def _native_available(*, window: bool = False) -> Path | None:
     executable = SOURCE / "pysual" / "bin" / ("pysual-host.exe" if os.name == "nt" else "pysual-host")
     if not executable.is_file():
         return None
@@ -66,9 +67,11 @@ def _license_path() -> Path | None:
         return ROOT / "LICENSE"
     try:
         from importlib.metadata import PackageNotFoundError, distribution
-
+    except ImportError:
+        return None
+    try:
         installed = distribution("pysual")
-    except (ImportError, PackageNotFoundError):
+    except PackageNotFoundError:
         return None
     for path in installed.files or ():
         if str(path).endswith(".dist-info/licenses/LICENSE"):
@@ -77,7 +80,7 @@ def _license_path() -> Path | None:
     return None
 
 
-def _python_license_path(override=None) -> Path:
+def _python_license_path(override: str | Path | None = None) -> Path:
     """Locate the full notice shipped with the interpreter used by PyInstaller."""
     prefix = Path(sys.base_prefix)
     version = f"python{sys.version_info.major}.{sys.version_info.minor}"
@@ -97,8 +100,16 @@ def _python_license_path(override=None) -> Path:
     )
 
 
-def build_executable(script, output, *, backend="window", terminal="auto", includes=(), packages=(),
-                     python_license=None):
+def build_executable(
+    script: str | Path,
+    output: str | Path,
+    *,
+    backend: str = "window",
+    terminal: str = "auto",
+    includes: Sequence[str] = (),
+    packages: Sequence[str] = (),
+    python_license: str | Path | None = None,
+) -> Path:
     """Freeze an application using the current platform's Python and PyInstaller.
 
     Build failures leave an existing output intact. Extra assets are relative to
@@ -116,7 +127,7 @@ def build_executable(script, output, *, backend="window", terminal="auto", inclu
     ast.parse(script.read_text(encoding="utf-8-sig"), filename=str(script))
     if importlib.util.find_spec("PyInstaller") is None:
         raise RuntimeError("Executable builds need PyInstaller. Install with: python -m pip install 'pysual[build]'")
-    assets = []
+    assets: list[tuple[Path, str]] = []
     for include in includes:
         relative = Path(include)
         if relative.is_absolute() or ".." in relative.parts:
@@ -197,7 +208,9 @@ def build_executable(script, output, *, backend="window", terminal="auto", inclu
     return output
 
 
-def _run_script(script: Path, backend: str, terminal: str, arguments=()) -> int:
+def _run_script(
+    script: Path, backend: str, terminal: str, arguments: Sequence[str] = ()
+) -> int:
     environment = os.environ.copy()
     environment["PYSUAL_TERMINAL"] = terminal
     environment["PYTHONPATH"] = str(SOURCE) + os.pathsep + environment.get("PYTHONPATH", "")
@@ -210,7 +223,7 @@ def _run_script(script: Path, backend: str, terminal: str, arguments=()) -> int:
                            env=environment)
 
 
-def main(argv=None):
+def main(argv: Sequence[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     program = "pysual"
     if argv and argv[0] == "native":

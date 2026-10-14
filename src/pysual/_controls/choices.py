@@ -11,8 +11,10 @@ from ..controls import Control
 from ..events import ChangeEvent, Event
 from ..geometry import Rect
 from ..popup import Popup
-from ..schema import Dirty, prop
+from ..schema import Dirty, Field, _sequence, expect_number, prop
 from ..widgets import ListView, TextBox
+from ..host import Host, Input
+from ..painting import Painter
 
 
 class _Choices(ListView):
@@ -21,7 +23,7 @@ class _Choices(ListView):
         self._commit: Callable[[int], None] | None = None
         self._down = -1
 
-    def handle_input(self, e, /):
+    def handle_input(self, e: Input, /) -> bool | None:
         super().handle_input(e)
         commit = self._commit
         assert commit is not None
@@ -43,7 +45,7 @@ class _Choices(ListView):
                 commit(self.selected_index)
 
 
-def _open_choices(owner):
+def _open_choices(owner: Dropdown | ComboBox) -> None:
     previous = getattr(owner, "_popup", None)
     if previous is not None and previous.is_open:
         previous.dismiss()
@@ -66,7 +68,7 @@ def _open_choices(owner):
         )
     )
 
-    def commit(index):
+    def commit(index: int) -> None:
         old_origin = owner._origin
         owner._origin = "user"
         try:
@@ -88,7 +90,7 @@ def _open_choices(owner):
     choices._scroll = max(0, choices.selected_index - count + 1)
 
 
-def _arrow(p):
+def _arrow(p: Painter) -> None:
     x, y = p.width - 17, p.height / 2
     color = p.style("arrow").foreground
     p.icon("chevron_down", x - 8, y - 8, size=16, color=color)
@@ -117,25 +119,25 @@ class Dropdown(Control):
     def selected_item(self) -> str | None:
         return self.items[self.selected_index] if self.selected_index >= 0 else None
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
-        if name == "selected_index" and value >= len(self.items):
+        if name == "selected_index" and expect_number(value) >= len(self.items):
             raise ValueError("Selected index is outside items")
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         if field.name == "items":
             self._prefix, self._typed_at = "", 0.0
             popup = getattr(self, "_popup", None)
             if popup is not None and popup.is_open:
                 popup.dismiss()
-            if self.selected_index >= len(value):
+            if self.selected_index >= len(_sequence(value)):
                 self.selected_index = -1
         super()._changed(field, old, value)
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         return 200, self._control_height(host)
 
-    def _choose(self, index):
+    def _choose(self, index: int) -> None:
         self.selected_index = index
 
     def open(self) -> None:
@@ -147,7 +149,7 @@ class Dropdown(Control):
         self._check_live()
         _open_choices(self)
 
-    def handle_input(self, e, /):
+    def handle_input(self, e: Input, /) -> bool | None:
         if self._press.handle_input(self, e):
             self.open()
         elif e.kind == "blur":
@@ -171,7 +173,7 @@ class Dropdown(Control):
                     self._choose(index)
                     break
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         s = p.body()
         selected = self.selected_item
         text = self.placeholder if selected is None else selected
@@ -191,7 +193,7 @@ class ComboBox(TextBox):
     visible_rows: int = prop(default=8, minimum=1)
     style_parts: ClassVar[tuple[str, ...]] = (*TextBox.style_parts, "arrow")
 
-    def _text_viewport(self):
+    def _text_viewport(self) -> Rect:
         area = super()._text_viewport()
         return Rect(area.x, area.y, max(0, area.width - 30), area.height)
 
@@ -202,7 +204,7 @@ class ComboBox(TextBox):
         except ValueError:
             return -1
 
-    def _choose(self, index):
+    def _choose(self, index: int) -> None:
         self.select_all()
         self.replace_selection(self.items[index])
 
@@ -216,17 +218,17 @@ class ComboBox(TextBox):
         if not self.read_only:
             _open_choices(self)
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         if field.name in ("items", "text", "read_only"):
             popup = getattr(self, "_popup", None)
             if popup is not None and popup.is_open:
                 popup.dismiss()
         super()._changed(field, old, value)
 
-    def _popup_press_passthrough(self, event):
+    def _popup_press_passthrough(self, event: Input) -> bool:
         return event.x < self.bounds.right - 30
 
-    def handle_input(self, e, /):
+    def handle_input(self, e: Input, /) -> bool | None:
         opener = (e.kind == "pointer_down" and e.x >= self.bounds.right - 30) or (
             e.kind == "key_down" and e.key == "ArrowDown"
         )
@@ -235,7 +237,7 @@ class ComboBox(TextBox):
         else:
             super().handle_input(e)
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         super().paint(p)
         s = p.style()
         p.rect(

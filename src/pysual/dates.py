@@ -1,6 +1,9 @@
 """ISO date selection assembled from reusable draft content and buttons."""
 
+from __future__ import annotations
+
 from calendar import monthrange
+from collections.abc import Mapping
 from datetime import date
 from typing import ClassVar
 
@@ -9,8 +12,10 @@ from .controls import Button, Container, Control, Label
 from .editing import EditorContent, EditorPopup
 from .events import ChangeEvent, Event, KeyEvent
 from .geometry import Rect
-from .schema import Dirty, prop
+from .schema import Dirty, Field, _dynamic_properties, prop
 from .text import TextBox
+from .host import Host, Input
+from .painting import Painter
 
 
 _FIRST = "0001-01-01"
@@ -21,7 +26,7 @@ _MONTHS = (
 )
 
 
-def _iso_date(value: str, name: str = "value") -> date:
+def _iso_date(value: object, name: str = "value") -> date:
     if not isinstance(value, str):
         raise TypeError(f"{name} must be an ISO date string (YYYY-MM-DD)")
     try:
@@ -33,7 +38,7 @@ def _iso_date(value: str, name: str = "value") -> date:
     return parsed
 
 
-def _date_range(value: str, minimum: str, maximum: str):
+def _date_range(value: str, minimum: str, maximum: str) -> tuple[date, date, date]:
     selected = _iso_date(value)
     low, high = _iso_date(minimum, "minimum"), _iso_date(maximum, "maximum")
     if low > high:
@@ -53,7 +58,7 @@ class _CalendarNavButton(Button):
 class _CalendarEntry(TextBox):
     """Keep the calendar in sync before queued text observers run."""
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         super()._changed(field, old, value)
         editor = getattr(self, "_editor_content", None)
         if field.name == "text" and editor is not None:
@@ -70,10 +75,10 @@ class _DayButton(Button):
     style_parts: ClassVar[tuple[str, ...]] = ("body", "row")
     selected: bool = prop(default=False)
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         return 32, self._control_height(host)
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         style = p.style("row", selected=self.selected)
         p.surface(Rect(0, 0, p.width, p.height), style)
         text = p.elide(self.text, max(0, p.width - 4), size=style.font_size)
@@ -81,7 +86,12 @@ class _DayButton(Button):
         p.text(text, max(0, (p.width - width) / 2), max(0, (p.height - height) / 2),
                color=style.foreground, size=style.font_size)
 
-    def activate(self):
+    def __init__(self, editor: CalendarEditor, **properties: object) -> None:
+        self._editor = editor
+        self._date_value: str = ""
+        super().__init__(**_dynamic_properties(properties))
+
+    def activate(self) -> None:
         self._check_activation()
         if self.effective_enabled:
             # Update the draft before queued click observers run. The same
@@ -89,7 +99,7 @@ class _DayButton(Button):
             self._editor.select(self._date_value)
         super().activate()
 
-    def handle_input(self, event, /):
+    def handle_input(self, event: Input, /) -> bool | None:
         if event.kind == "key_down" and event.key in (
             "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown",
             "Home", "End", "PageUp", "PageDown", "Enter",
@@ -105,7 +115,7 @@ class _DayButton(Button):
         super().handle_input(event)
 
 
-class CalendarEditor(EditorContent):
+class CalendarEditor(EditorContent[str]):
     """A reusable Monday-first month grid for one canonical ISO date.
 
     Mount inline with parent=, or pass fresh content to EditorPopup. select()
@@ -121,13 +131,14 @@ class CalendarEditor(EditorContent):
     def __init__(
         self, value: str, *, minimum: str = _FIRST, maximum: str = _LAST,
         **properties: object,
-    ):
+    ) -> None:
         self._selected, self._minimum, self._maximum = _date_range(value, minimum, maximum)
-        self._view_year, self._view_month = self._selected.year, self._selected.month
+        self._view_year: int = self._selected.year
+        self._view_month: int = self._selected.month
         self._untouched = True
-        super().__init__(value, **properties)
+        super().__init__(value, **_dynamic_properties(properties))
 
-    def build(self, value):
+    def build(self, value: str) -> None:
         self.entry = _CalendarEntry(text=value, placeholder="YYYY-MM-DD", height=38,
                                     tooltip="Date (YYYY-MM-DD)")
         self._initial_text = value
@@ -144,11 +155,11 @@ class CalendarEditor(EditorContent):
             Label(parent=self.weekdays, text=name, grid_row=0, grid_col=column, font_size=12)
         self.days = Container(layout="grid", column_tracks=("1*",) * 7,
                               row_tracks=("1*",) * 6, spacing=4, height=224)
-        self._day_buttons = []
+        self._day_buttons: list[_DayButton] = []
         for index in range(42):
-            button = _DayButton(parent=self.days, grid_row=index // 7, grid_col=index % 7)
-            button._editor = self
-            button._date_value = ""
+            button = _DayButton(
+                self, parent=self.days, grid_row=index // 7, grid_col=index % 7,
+            )
             self._day_buttons.append(button)
         self._refresh()
         self.entry._editor_content = self
@@ -168,7 +179,7 @@ class CalendarEditor(EditorContent):
     def is_untouched(self) -> bool:
         return self._untouched and self.entry.text == self._initial_text and not self.entry.can_undo
 
-    def entry_on_key_down(self, event: KeyEvent):
+    def entry_on_key_down(self, event: KeyEvent) -> None:
         if event.key == "Enter":
             self.submit()
 
@@ -185,7 +196,7 @@ class CalendarEditor(EditorContent):
         self.entry.select_all()
         self._refresh()
 
-    def _sync_date(self, text):
+    def _sync_date(self, text: object) -> None:
         try:
             selected = _iso_date(text)
         except ValueError:
@@ -213,19 +224,19 @@ class CalendarEditor(EditorContent):
             self._view_year, self._view_month = year, month + 1
             self._refresh()
 
-    def previous_button_on_click(self, event):
+    def previous_button_on_click(self, event: object) -> None:
         self.navigate(-1)
 
-    def next_button_on_click(self, event):
+    def next_button_on_click(self, event: object) -> None:
         self.navigate(1)
 
-    def _refresh(self):
+    def _refresh(self) -> None:
         year, month = self._view_year, self._view_month
         first, count = monthrange(year, month)
         self.month_label.text = f"{_MONTHS[month - 1]} {year:04d}"
         self.previous_button.enabled = (year, month) > (self._minimum.year, self._minimum.month)
         self.next_button.enabled = (year, month) < (self._maximum.year, self._maximum.month)
-        updates = {}
+        updates: dict[Control, Mapping[str, object]] = {}
         for index, button in enumerate(self._day_buttons):
             day = index - first + 1
             current = date(year, month, day) if 1 <= day <= count else None
@@ -239,7 +250,7 @@ class CalendarEditor(EditorContent):
             }
         self.update_children(updates)
 
-    def _day_key(self, value, key):
+    def _day_key(self, value: str, key: str) -> None:
         current = _iso_date(value)
         if key == "Enter":
             self.select(value)
@@ -263,7 +274,7 @@ class CalendarEditor(EditorContent):
         self.select(target.isoformat())
         self._focus_selected()
 
-    def _focus_selected(self):
+    def _focus_selected(self) -> None:
         for button in self._day_buttons:
             if button._date_value == self._selected.isoformat():
                 button.focus()
@@ -283,18 +294,19 @@ class DatePicker(Control):
     style_fallbacks: ClassVar[tuple[str, ...]] = ("TextBox",)
     style_parts: ClassVar[tuple[str, ...]] = ("body", "icon")
 
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
         self._press = PressBehavior(keys=())
-        self._popup = None
+        self._popup: EditorPopup[str] | None = None
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
-        if name in ("value", "minimum", "maximum"):
-            values = {**self._values, name: value}
-            _date_range(values["value"], values["minimum"], values["maximum"])
+        if name not in ("value", "minimum", "maximum"):
+            return
+        pending = self._pending(name, value)
+        _date_range(pending.text("value"), pending.text("minimum"), pending.text("maximum"))
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         if ((field.name == "read_only" and value)
                 or (field.name in ("enabled", "visible") and not value)):
             if self._popup is not None and self._popup.is_open:
@@ -318,10 +330,10 @@ class DatePicker(Control):
         self._popup.show(self)
         content._focus_selected()
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         return 180, self._control_height(host)
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         style = p.body()
         text = p.elide(self.value, max(0, p.width - 42), size=style.font_size)
         _, height = p.measure(text, size=style.font_size)
@@ -334,7 +346,7 @@ class DatePicker(Control):
         p.line(x + 4, y - 2, x + 4, y + 2, color)
         p.line(x + 12, y - 2, x + 12, y + 2, color)
 
-    def handle_input(self, event, /):
+    def handle_input(self, event: Input, /) -> bool | None:
         if self._press.handle_input(self, event):
             self.open()
         elif event.kind == "key_down" and event.key in ("Enter", "Space", "ArrowDown"):

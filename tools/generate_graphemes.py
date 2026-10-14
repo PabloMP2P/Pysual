@@ -19,7 +19,7 @@ def render():
         f'UNICODE_VERSION = "{GRAPHEME_VERSION}"',
     ]
     for name, rows in grapheme_tables().items():
-        lines.append(f"{name} = (")
+        lines.append(f"{name}: tuple[tuple[int, int, str], ...] = (")
         lines.extend(f'    ({first}, {last}, "{value}"),' for first, last, value in rows)
         lines.append(")")
     return "\n".join(lines) + "\n"

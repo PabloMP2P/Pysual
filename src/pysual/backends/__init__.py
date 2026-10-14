@@ -1,13 +1,15 @@
 """Three presentation targets sharing one control, layout and event model."""
 
+from __future__ import annotations
+
 import importlib
 import sys
 import threading
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import Any, Literal, cast
 from ..host import CapabilityError, Host
 
 BackendName = Literal["window", "terminal", "web"]
@@ -59,32 +61,41 @@ def create_host(name: BackendName) -> Host:
 
 
 class _SingleSurfaceSession:
-    def __init__(self, name):
-        self.name, self.active = name, None
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.active: _SingleSurfaceHost | None = None
 
-    def close(self):
+    def close(self) -> None:
         if self.active is not None:
             self.active.close()
 
 
 class _SingleSurfaceHost:
-    def __init__(self, session, host):
-        self._session, self._host = session, host
+    def __init__(self, session: _SingleSurfaceSession, host: Host) -> None:
+        self._session = session
+        self._host = host
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> Any:
         return getattr(self._host, name)
 
     @property
-    def diagnostic_name(self):
+    def diagnostic_name(self) -> str:
         return getattr(self._host, "diagnostic_name", type(self._host).__name__)
 
-    def open(self, *args):
+    def open(
+        self,
+        title: str,
+        width: float,
+        height: float,
+        resizable: bool,
+        scale: float | None,
+    ) -> None:
         if self._session.active is not None:
             raise CapabilityError(f"The {self._session.name} backend owns one presentation surface")
-        self._host.open(*args)
+        self._host.open(title, width, height, resizable, scale)
         self._session.active = self
 
-    def close(self):
+    def close(self) -> None:
         try:
             self._host.close()
         finally:
@@ -108,7 +119,7 @@ def create_managed_host(name: BackendName) -> Host:
 
 
 def shutdown_managed_hosts() -> None:
-    failures = []
+    failures: list[BaseException] = []
     for key, session in tuple(_MANAGED_SESSIONS.items()):
         if key[0] == threading.get_ident():
             del _MANAGED_SESSIONS[key]
@@ -121,7 +132,7 @@ def shutdown_managed_hosts() -> None:
 
 
 @contextmanager
-def backend_override(name: str) -> Iterator[None]:
+def backend_override(name: str) -> Generator[None, None, None]:
     token = _OVERRIDE.set(get_backend(name).name)
     try:
         yield

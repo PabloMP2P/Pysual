@@ -2,21 +2,24 @@
 
 from time import perf_counter as monotonic
 from math import inf
-from typing import ClassVar
+from typing import Any, ClassVar, cast
 from ._text_display import single_line
-from .controls import Label
+from .controls import Control, Label
+from .geometry import Rect
+from .host import Input
+from .painting import Painter
 
 
 class _Hint(Label):
     _overlay: ClassVar[bool] = True
 
-    def _layout_size(self, width, height):
+    def _layout_size(self, width: float, height: float) -> tuple[float, float]:
         if self.parent is not None:
             area = self.parent.content_bounds(self.parent.bounds)
             return min(area.width, width), min(area.height, height)
         return width, height
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         style = p.body()
         p.text(
             p.elide(
@@ -30,31 +33,34 @@ class _Hint(Label):
 
 
 class Hints:
-    def __init__(self, runtime):
+    def __init__(self, runtime: Any) -> None:
+        # Live Runtime. Its attributes are still unannotated, so naming that
+        # class here would mark every session access unknown.
         self.runtime = runtime
-        self.owner = self.control = None
+        self.owner: Control | None = None
+        self.control: _Hint | None = None
         self.active = False
         self._keyboard = False
         self._since = 0.0
         self._text = ""
 
     @property
-    def next_deadline(self):
+    def next_deadline(self) -> float:
         """One hint delay, never a recurring frame or input polling timer."""
         if self.active and self.owner is not None and self.control is None:
             return self._since + 0.5
         return inf
 
-    def clear(self):
+    def clear(self) -> None:
         if self.control is not None:
             self.control.destroy()
         self.owner = self.control = None
         self._text = ""
 
-    def observe(self, event):
+    def observe(self, event: Input) -> None:
         if self._keyboard and event.kind == "key_up":
             return
-        focus = self.runtime.router.focus
+        focus: Control | None = self.runtime.router.focus
         keyboard = (
             event.kind == "key_down"
             and event.key == "Tab"
@@ -65,9 +71,11 @@ class Hints:
         self._keyboard = keyboard
         self.active = keyboard or event.kind == "pointer_move"
 
-    def update(self):
+    def update(self) -> None:
         runtime = self.runtime
-        owner = runtime.router.focus if self._keyboard else runtime.router.hover
+        owner: Control | None = (
+            runtime.router.focus if self._keyboard else runtime.router.hover
+        )
         if (
             not self.active
             or runtime.popup is not None
@@ -87,14 +95,17 @@ class Hints:
         if self.control is None:
             if now - self._since < 0.5:
                 return
-            self.control = runtime.app.add(
-                _Hint(
-                    text=self._text,
-                    height=32,
-                    enabled=False,
-                )
+            self.control = cast(
+                _Hint,
+                runtime.app.add(
+                    _Hint(
+                        text=self._text,
+                        height=32,
+                        enabled=False,
+                    )
+                ),
             )
-        area = runtime.app.content_bounds(runtime.app.bounds)
+        area: Rect = runtime.app.content_bounds(runtime.app.bounds)
         hint = self.control
         theme = owner.effective_theme
         hint.theme_override = theme

@@ -12,8 +12,10 @@ from ..errors import LifecycleError
 from ..events import ClosingEvent, Event
 from ..geometry import Rect
 from ..schema import Dirty, prop
-from ..painting import resolve_style
+from ..painting import resolve_style, Painter
+from ..theme import ResolvedStyle
 from ..presentation import Outcome, Presentation, ensure_wait_allowed
+from ..host import Host, Input
 
 
 class SubWindow(Container):
@@ -30,14 +32,16 @@ class SubWindow(Container):
     _style_kind: ClassVar[str] = "SubWindow"
     style_parts: ClassVar[tuple[str, ...]] = ("body", "titlebar", "close")
 
-    def _title_metrics(self):
+    def _title_metrics(self) -> tuple[ResolvedStyle, int]:
         style = resolve_style(self, "titlebar")
         return style, ceil(style.font_size * 1.2 + style.padding * 2)
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         return self.measure_available(host)
 
-    def measure_available(self, host, *, width=None, height=None):
+    def measure_available(
+        self, host: Host, *, width: float | None = None, height: float | None = None
+    ) -> tuple[float, float]:
         style, title_height = self._title_metrics()
         w, h = self.measure_content(host, width=width,
             height=None if height is None else max(0, height - title_height))
@@ -48,12 +52,12 @@ class SubWindow(Container):
             h += title_height
         return w, h
 
-    def _close_bounds(self):
+    def _close_bounds(self) -> Rect:
         _, height = self._title_metrics()
         return Rect(max(0, self._rect.width - height), 0,
                     min(height, self._rect.width), min(height, self._rect.height))
 
-    def _title_drag_at(self, x, y):
+    def _title_drag_at(self, x: float, y: float) -> bool:
         _, title_height = self._title_metrics()
         return (
             self.draggable and 0 <= x < self._rect.width and 0 <= y < title_height
@@ -62,22 +66,22 @@ class SubWindow(Container):
                      and y > self._rect.height - 20)
         )
 
-    def content_bounds(self, bounds):
+    def content_bounds(self, bounds: Rect) -> Rect:
         area = super().content_bounds(bounds)
         _, height = self._title_metrics()
         return Rect(area.x, min(area.bottom, area.y + height), area.width, max(0, area.height - height))
 
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
-        self._drag = None
+        self._drag: tuple[float, float, float, float, float, float, bool] | None = None
         self._close_pending: asyncio.Task[bool] | None = None
-        self._close_armed = None
+        self._close_armed: int | None = None
         self._close_hover = False
         self._presentation: Presentation | None = None
         self._generation = 0
         self._presentation_error: BaseException | None = None
 
-    def _close_style(self):
+    def _close_style(self) -> ResolvedStyle:
         state = (
             "disabled" if not self.effective_enabled else
             "pressed" if self._close_armed is not None and self._close_hover else
@@ -86,7 +90,7 @@ class SubWindow(Container):
         )
         return resolve_style(self, "close", state=state)
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         p.body()
         titlebar = p.style("titlebar")
         _, height = self._title_metrics()
@@ -129,7 +133,7 @@ class SubWindow(Container):
                 p.theme.tokens.muted,
             )
 
-    def handle_input(self, e, /):
+    def handle_input(self, e: Input, /) -> bool | None:
         x, y = e.x - self._rect.x, e.y - self._rect.y
         if e.kind in ("pointer_down", "pointer_move", "pointer_up"):
             hovered = self.closable and self._close_bounds().contains(x, y)
@@ -194,7 +198,7 @@ class SubWindow(Container):
         elif e.kind == "key_down" and e.key == "Escape" and self.closable:
             self.create_task(self.close_async())
 
-    def _request_close(self, result=None):
+    def _request_close(self, result: object = None) -> asyncio.Task[bool] | None:
         if self._disposed:
             return None
         if not self.visible and (self._presentation is None or self._presentation.done):
@@ -215,7 +219,7 @@ class SubWindow(Container):
         presentation = self._presentation
         closing = self.closing
 
-        async def decide():
+        async def decide() -> bool:
             if (self._disposed or self._presentation is not presentation
                     or (presentation is not None and presentation.done)):
                 return True
@@ -233,11 +237,11 @@ class SubWindow(Container):
         self._close_pending = dispatcher.create_task(decide(), self._root())
         return self._close_pending
 
-    def close(self, result=None) -> None:
+    def close(self, result: object = None) -> None:
         """Request vetoable closure; retain this control tree for another run."""
         self._request_close(result)
 
-    async def close_async(self, result=None) -> bool:
+    async def close_async(self, result: object = None) -> bool:
         """Await the shared closing decision without owning its cancellation."""
         pending = self._request_close(result)
         if pending is None:
@@ -254,13 +258,13 @@ class SubWindow(Container):
             raise LifecycleError("In-app windows require a running owner Window")
         return runtime._modality.show(self, modal=modal, owner=owner)
 
-    def run(self):
+    def run(self) -> SubWindow:
         """Show modelessly through its first frame and return this instance."""
         self.show()
         return self
 
     @caller_side
-    def run_blocking(self):
+    def run_blocking(self) -> SubWindow:
         """Show modelessly and wait for this exact opening to close."""
         self._check_waiting_caller("run_blocking", "wait_async")
         presentation = call(self.show)
@@ -268,7 +272,7 @@ class SubWindow(Container):
         return self
 
     @staticmethod
-    def _check_waiting_caller(operation, alternative):
+    def _check_waiting_caller(operation: str, alternative: str) -> None:
         try:
             ensure_wait_allowed()
         except LifecycleError as error:
@@ -306,12 +310,12 @@ class SubWindow(Container):
         super().destroy()
 
     @caller_side
-    def show_modal(self, *, owner: Control | None = None):
+    def show_modal(self, *, owner: Control | None = None) -> object:
         """Open owner-modally and wait on the invoking application thread."""
         self._check_waiting_caller("show_modal", "show_modal_async")
         return call(self.show, modal=True, owner=owner).wait().result
 
-    async def show_modal_async(self, *, owner: Control | None = None):
+    async def show_modal_async(self, *, owner: Control | None = None) -> object:
         """Open owner-modally without blocking the UI event loop."""
         return (await self.show(modal=True, owner=owner).wait_async()).result
 

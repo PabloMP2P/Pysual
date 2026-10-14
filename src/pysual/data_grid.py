@@ -1,20 +1,26 @@
 """Bounded typed table data, viewport painting and ordinary popup cell editing."""
 
+from __future__ import annotations
+
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from math import ceil, isfinite
 from time import monotonic
-from typing import ClassVar, Literal, TypeAlias
+from typing import ClassVar, Literal, TypeAlias, cast
 
 from ._text_display import single_line
-from ._scrolling import can_scroll, clamp_scroll, scrollbar, handle_scrollbars, paint_scrollbars
+from ._scrolling import (
+    Scrollbar, can_scroll, clamp_scroll, scrollbar, handle_scrollbars, paint_scrollbars,
+)
 from .controls import Control, Label
 from .events import ChangeEvent, Event, UiEvent
 from .geometry import Rect
 from .popup import Popup
-from .schema import Dirty, _persist_record, prop
+from .schema import Dirty, Field, _persist_record, prop
 from .widgets import ListView, TextBox
+from .host import Host, Input
+from .painting import Painter
 
 CellValue: TypeAlias = str | int | float | bool | None
 
@@ -32,7 +38,7 @@ class GridColumn:
     prefix: str = ""
     suffix: str = ""
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if (
             not isinstance(self.key, str)
             or not self.key
@@ -88,7 +94,7 @@ class GridRow:
     key: str
     cells: tuple[CellValue, ...]
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not isinstance(self.key, str) or not self.key:
             raise ValueError("GridRow.key must be a nonempty string")
         if not isinstance(self.cells, tuple) or any(
@@ -104,9 +110,10 @@ class GridRow:
                 "Cells need finite numbers and text of at most 4096 characters"
             )
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         if type(other) is not type(self):
             return NotImplemented
+        other = cast(GridRow, other)
         return (
             self.key == other.key
             and len(self.cells) == len(other.cells)
@@ -132,7 +139,11 @@ class GridEditEvent(UiEvent):
     new_value: CellValue
 
 
-def _validate_data(columns, rows, previous_rows=()):
+def _validate_data(
+    columns: tuple[GridColumn, ...],
+    rows: tuple[GridRow, ...],
+    previous_rows: tuple[GridRow, ...] = (),
+) -> None:
     if len(columns) > 64 or len(rows) > 20_000 or len(columns) * len(rows) > 200_000:
         raise ValueError(
             "DataGrid supports at most 64 columns, 20,000 rows and 200,000 cells"
@@ -171,7 +182,7 @@ def _validate_data(columns, rows, previous_rows=()):
                     ) from error
 
 
-def _display(value, column=None):
+def _display(value: CellValue, column: GridColumn | None = None) -> str:
     if value is None:
         return ""
     if column is None:
@@ -180,7 +191,16 @@ def _display(value, column=None):
     return column.prefix + text + column.suffix
 
 
-def _aligned_x(painter, text, column, x, size, font_family, *, trailing=0):
+def _aligned_x(
+    painter: Painter,
+    text: str,
+    column: GridColumn,
+    x: float,
+    size: float,
+    font_family: Literal["ui", "mono"],
+    *,
+    trailing: float = 0,
+) -> float:
     if column.align == "left":
         return x + 8
     spare = max(
@@ -193,7 +213,7 @@ def _aligned_x(painter, text, column, x, size, font_family, *, trailing=0):
     return x + 8 + spare * (0.5 if column.align == "center" else 1)
 
 
-def _parse_number(text, column=None):
+def _parse_number(text: str, column: GridColumn | None = None) -> int | float | None:
     text = text.strip()
     if not text:
         return None
@@ -226,12 +246,19 @@ def _parse_number(text, column=None):
     return float(number) / 100 if percentage else _parse_number(number)
 
 
+def _row_sort_key(index: int) -> Callable[[GridRow], tuple[bool, CellValue]]:
+    def ordering(row: GridRow) -> tuple[bool, CellValue]:
+        cell = row.cells[index]
+        return cell is None, cell
+    return ordering
+
+
 class _CellEditor(TextBox):
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
         self._commit: Callable[[], None] | None = None
 
-    def handle_input(self, e, /):
+    def handle_input(self, e: Input, /) -> bool | None:
         if e.kind == "key_down" and e.key == "Enter":
             assert self._commit is not None
             self._commit()
@@ -240,12 +267,12 @@ class _CellEditor(TextBox):
 
 
 class _BooleanEditor(ListView):
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
         self._commit: Callable[[], None] | None = None
-        self._down_index = None
+        self._down_index: int | None = None
 
-    def handle_input(self, e, /):
+    def handle_input(self, e: Input, /) -> bool | None:
         super().handle_input(e)
         if e.kind == "pointer_down":
             self._down_index = self.index_at(e.x, e.y) if e.button == 1 else None
@@ -264,7 +291,7 @@ class _BooleanEditor(ListView):
 
 
 class _CellMessage(Label):
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         style = p.body()
         p.text(
             p.elide(self.text, p.width, size=style.font_size),
@@ -276,7 +303,7 @@ class _CellMessage(Label):
 
 
 class _CellPopup(Popup):
-    def reposition(self):
+    def reposition(self) -> None:
         if self._session is not None:
             grid = self._owner
             assert isinstance(grid, DataGrid) and grid.selected_key is not None
@@ -317,23 +344,24 @@ class DataGrid(Control):
         ("header", "cell", "scrollbar", "track", "thumb")
     )
 
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
         _validate_data(self.columns, self.rows)
-        self._scroll, self._scroll_x = 0, 0.0
+        self._scroll = 0
+        self._scroll_x = 0.0
         self._pending_reveal = True
         self._wheel = 0.0
-        self._drag = None
-        self._resize = None
-        self._resize_columns = None
+        self._drag: tuple[int, int, float] | None = None
+        self._resize: tuple[int, float, tuple[GridColumn, ...], float] | None = None
+        self._resize_columns: tuple[GridColumn, ...] | None = None
         self._applying_data = False
-        self._pending_order = None
-        self._pending_cell = None
-        self._last_click = None
-        self._popup = None
+        self._pending_order: tuple[dict[str, GridRow], list[GridRow], dict[str, int]] | None = None
+        self._pending_cell: tuple[GridRow, list[GridRow] | None, dict[str, int] | None] | None = None
+        self._last_click: tuple[str | None, str, str, float, float, float] | None = None
+        self._popup: _CellPopup | None = None
         self._rebuild()
 
-    def _validation_copy(self, values):
+    def _validation_copy(self, values: Mapping[str, object]) -> DataGrid:
         candidate = super()._validation_copy(values)
         if candidate.columns is not self.columns or candidate.rows is not self.rows:
             _validate_data(candidate.columns, candidate.rows,
@@ -341,13 +369,19 @@ class DataGrid(Control):
             candidate._by_key = {row.key: row for row in candidate.rows}
         return candidate
 
-    def _prepare_update(self, values):
-        values = dict(super()._prepare_update(values))
-        if not values.keys() & {"columns", "rows"}:
-            return values
+    def _prepare_update(self, values: Mapping[str, object]) -> Mapping[str, object]:
+        prepared = dict(super()._prepare_update(values))
+        if not prepared.keys() & {"columns", "rows"}:
+            return prepared
         self._check_live()
-        columns = values.get("columns", self.columns)
-        rows = values.get("rows", self.rows)
+        columns: tuple[GridColumn, ...] = (
+            cast(tuple[GridColumn, ...], prepared["columns"])
+            if "columns" in prepared else self.columns
+        )
+        rows: tuple[GridRow, ...] = (
+            cast(tuple[GridRow, ...], prepared["rows"])
+            if "rows" in prepared else self.rows
+        )
         for name, value in (("columns", columns), ("rows", rows)):
             self._schema[name].validate(value, previous=getattr(self, name))
         row_keys = {row.key for row in rows}
@@ -357,25 +391,25 @@ class DataGrid(Control):
         )
         # Omitted dependent fields retain surviving keys. Explicit requests are
         # left intact so candidate validation can reject invalid selections.
-        values.setdefault("sort_key", self.sort_key if self.sort_key in keys else None)
-        values.setdefault(
+        prepared.setdefault("sort_key", self.sort_key if self.sort_key in keys else None)
+        prepared.setdefault(
             "selected_key", self.selected_key if self.selected_key in row_keys else None
         )
-        values.setdefault(
+        prepared.setdefault(
             "selected_column",
-            keys.index(selected_column) if selected_column in keys
+            keys.index(selected_column) if isinstance(selected_column, str) and selected_column in keys
             else min(self.selected_column, max(0, len(columns) - 1)),
         )
-        return values
+        return prepared
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
         if name in ("columns", "rows"):
             # Construction and candidate copies already validated these objects.
             if value is not getattr(self, name):
                 _validate_data(
-                    value if name == "columns" else self.columns,
-                    value if name == "rows" else self.rows,
+                    cast(tuple[GridColumn, ...], value) if name == "columns" else self.columns,
+                    cast(tuple[GridRow, ...], value) if name == "rows" else self.rows,
                     self.rows if name == "rows" else (),
                 )
         elif name == "selected_key" and value is not None and value not in self._by_key:
@@ -393,7 +427,7 @@ class DataGrid(Control):
         ):
             raise ValueError(f"Unknown grid column {value!r}")
 
-    def _commit_update(self, properties):
+    def _commit_update(self, properties: Mapping[str, object]) -> None:
         if not any(
             name in properties and properties[name] != self._values[name]
             for name in ("columns", "rows", "sort_key", "sort_descending")
@@ -411,7 +445,7 @@ class DataGrid(Control):
             self._applying_data = False
             self._pending_order = None
 
-    def _rebuild(self):
+    def _rebuild(self) -> None:
         self._by_key = {row.key: row for row in self.rows}
         self._order = list(self.rows)
         index = next(
@@ -419,18 +453,20 @@ class DataGrid(Control):
         )
         if index is not None:
             self._order.sort(
-                key=lambda row: (row.cells[index] is None, row.cells[index]),
+                key=cast(
+                    Callable[[GridRow], tuple[int, int]], _row_sort_key(index),
+                ),
                 reverse=self.sort_descending,
             )
         self._positions = {row.key: i for i, row in enumerate(self._order)}
         self._clamp()
 
-    def _close_editor(self):
+    def _close_editor(self) -> None:
         if self._popup is not None and self._popup.is_open:
             self._popup.dismiss()
         self._popup = None
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         if field.name == "rows" and self._pending_cell is not None:
             replacement, order, positions = self._pending_cell
             self._pending_cell = None
@@ -539,36 +575,40 @@ class DataGrid(Control):
             else None
         )
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         return 560, 300
 
-    def _row_height(self):
+    def _row_height(self) -> float:
         return self.effective_row_height(self.row_height)
 
-    def _header_height(self):
+    def _header_height(self) -> float:
         return self.effective_row_height(self.header_height)
 
-    def _viewport(self):
+    def _viewport(self) -> tuple[float, float]:
         # Reserve tracks consistently, so scrollbars never change column sizing.
         return max(0, self.bounds.width - 12), max(
             0, self.bounds.height - self._header_height() - 12
         )
 
-    def _view_columns(self):
+    def _view_columns(self) -> tuple[GridColumn, ...]:
         return self._resize_columns or self.columns
 
-    def _page_rows(self):
+    def _page_rows(self) -> int:
         return max(1, int(self._viewport()[1] / self._row_height()))
 
-    def _clamp(self):
-        self._scroll = clamp_scroll(self._scroll, len(self._order), self._page_rows())
+    def _clamp(self) -> None:
+        # Row offsets stay whole. clamp_scroll is annotated float, but the row
+        # count and page size are ints and max/min preserve that integer.
+        self._scroll = cast(
+            int, clamp_scroll(self._scroll, len(self._order), self._page_rows())
+        )
         self._scroll_x = clamp_scroll(
             self._scroll_x,
             sum(c.width for c in self._view_columns()),
             self._viewport()[0],
         )
 
-    def _reveal(self):
+    def _reveal(self) -> None:
         # Data can be assigned during build(), before layout gives us a viewport.
         # Defer scrolling until the selected cell can be measured against it.
         width, height = self._viewport()
@@ -597,7 +637,7 @@ class DataGrid(Control):
                     self._scroll_x = x + column_width - width
         self._clamp()
 
-    def _scrollbars(self):
+    def _scrollbars(self) -> list[Scrollbar]:
         width, height = self._viewport()
         x, y = self.bounds.x, self.bounds.y + self._header_height()
         bars = (
@@ -608,13 +648,13 @@ class DataGrid(Control):
         )
         return [bar for bar in bars if bar is not None]
 
-    def _thumbs(self):
+    def _thumbs(self) -> tuple[Rect | None, Rect | None]:
         thumbs = {bar.axis: Rect(bar.thumb.x - self.bounds.x, bar.thumb.y - self.bounds.y,
                                 bar.thumb.width, bar.thumb.height)
                   for bar in self._scrollbars()}
         return thumbs.get(1), thumbs.get(0)
 
-    def _column_at(self, x):
+    def _column_at(self, x: float) -> int | None:
         offset = -self._scroll_x
         for i, column in enumerate(self._view_columns()):
             if offset <= x < offset + column.width:
@@ -622,7 +662,7 @@ class DataGrid(Control):
             offset += column.width
         return None
 
-    def scroll_input(self, e, /) -> bool:
+    def scroll_input(self, e: Input, /) -> bool:
         self._clamp()
         offset = self._scroll_x if e.shift else self._scroll
         limit = (
@@ -635,7 +675,7 @@ class DataGrid(Control):
         self.handle_input(e)
         return True
 
-    def handle_input(self, e, /):
+    def handle_input(self, e: Input, /) -> bool | None:
         previous_view = self._scroll, self._scroll_x, self._resize_columns, self._resize
         if e.kind == "focus" and self._should_reveal_focus():
             self._reveal()
@@ -788,7 +828,7 @@ class DataGrid(Control):
             self.invalidate()
 
 
-    def _activate_cell(self):
+    def _activate_cell(self) -> None:
         row = self.selected_row
         if row is None or not self.columns:
             return
@@ -828,7 +868,7 @@ class DataGrid(Control):
         editor = popup.add(
             _BooleanEditor(
                 items=("True", "False", "Empty"),
-                selected_index=choices.index(row.cells[index]),
+                selected_index=choices.index(cast(bool | None, row.cells[index])),
                 row_height=30,
                 height=choice_height,
             )
@@ -850,7 +890,7 @@ class DataGrid(Control):
             )
         )
 
-        def commit():
+        def commit() -> None:
             try:
                 if isinstance(editor, _BooleanEditor):
                     value: CellValue = choices[editor.selected_index]
@@ -950,13 +990,16 @@ class DataGrid(Control):
             # assignment path. Their extra validation uses the slower path.
             self._schema["rows"].validate(candidate, previous=rows)
             self._validate_update("rows", candidate)
-        order = positions = None
+        order: list[GridRow] | None = None
+        positions: dict[str, int] | None = None
         if self.sort_key == column_key:
             # Start from publication order to preserve stable ties when a value
             # joins an existing group. All comparisons finish before mutation.
             order = list(candidate)
             order.sort(
-                key=lambda item: (item.cells[index] is None, item.cells[index]),
+                key=cast(
+                    Callable[[GridRow], tuple[int, int]], _row_sort_key(index),
+                ),
                 reverse=self.sort_descending,
             )
             positions = {item.key: i for i, item in enumerate(order)}
@@ -980,14 +1023,14 @@ class DataGrid(Control):
             )
         )
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         row_height, header_height = self._row_height(), self._header_height()
         p.body()
         if self._pending_reveal:
             self._reveal()
         self._clamp()
         width, height = self._viewport()
-        visible_columns = []
+        visible_columns: list[tuple[int, GridColumn, float]] = []
         x = -self._scroll_x
         for i, column in enumerate(self._view_columns()):
             if x + column.width > max(0, self._clip.x - self.bounds.x) and x < min(
@@ -1110,6 +1153,6 @@ class DataGrid(Control):
             )
         paint_scrollbars(p, self._scrollbars())
 
-    def destroy(self):
+    def destroy(self) -> None:
         self._close_editor()
         super().destroy()

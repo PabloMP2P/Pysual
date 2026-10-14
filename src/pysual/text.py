@@ -8,24 +8,35 @@ from collections import Counter, OrderedDict
 from dataclasses import replace
 from math import ceil, floor, isfinite
 from time import monotonic
-from typing import ClassVar
+from collections.abc import Mapping
+from typing import ClassVar, cast
+
+from .theme import ResolvedStyle
 
 from .controls import Control
 from .events import ChangeEvent, Event
 from .geometry import Rect
-from .schema import Dirty, prop
-from .painting import resolve_style
+from .schema import Dirty, Field, expect_text, prop
+from .painting import resolve_style, Painter
+from ._engine import TaskHandle
 from .graphemes import boundaries, floor_boundary, is_boundary, previous_boundary, next_boundary
-from ._scrolling import can_scroll, scrollbar, handle_scrollbars, paint_scrollbars
+from ._scrolling import Scrollbar, can_scroll, scrollbar, handle_scrollbars, paint_scrollbars
 from ._text_display import single_line
+from .host import Host, Input
+
+_Snapshot = tuple[str, int, int]
+_Lines = tuple[list[str], list[int]]
+_EditSlice = tuple[_Lines, list[str], list[str]]
 
 
 class _TabStops:
     """Sparse source/display offsets; only tabs need an index entry."""
 
-    def __init__(self, line, size):
+    def __init__(self, line: str, size: int) -> None:
         self.line, self.size = line, size
-        self.tabs, self.stops, self.extra = [], [], []
+        self.tabs: list[int] = []
+        self.stops: list[int] = []
+        self.extra: list[int] = []
         offset, extra = line.find("\t"), 0
         while offset >= 0:
             extra += size - (offset + extra) % size - 1
@@ -34,16 +45,16 @@ class _TabStops:
             self.extra.append(extra)
             offset = line.find("\t", offset + 1)
 
-    def display_offset(self, offset):
+    def display_offset(self, offset: int) -> int:
         index = bisect.bisect_left(self.tabs, offset)
         return offset + (self.extra[index - 1] if index else 0)
 
-    def source_offset(self, column):
+    def source_offset(self, column: int) -> int:
         index = bisect.bisect_right(self.stops, column)
         offset = column - (self.extra[index - 1] if index else 0)
         return min(offset, self.tabs[index] if index < len(self.tabs) else len(self.line))
 
-    def expand(self, start=0, end=None):
+    def expand(self, start: int = 0, end: int | None = None) -> str:
         # A fragment's first tab still belongs to the complete row's tab grid.
         prefix = self.display_offset(start) % self.size
         return (" " * prefix + self.line[start:end]).expandtabs(self.size)[prefix:]
@@ -52,21 +63,21 @@ class _TabStops:
 class _MaskStops:
     """Map stored string offsets to one password bullet per grapheme."""
 
-    def __init__(self, line):
+    def __init__(self, line: str) -> None:
         self.offsets = boundaries(line)
 
-    def display_offset(self, offset):
+    def display_offset(self, offset: int) -> int:
         return bisect.bisect_left(self.offsets, offset)
 
-    def source_offset(self, column):
+    def source_offset(self, column: int) -> int:
         return self.offsets[min(max(0, column), len(self.offsets) - 1)]
 
-    def expand(self, start=0, end=None):
+    def expand(self, start: int = 0, end: int | None = None) -> str:
         end = self.offsets[-1] if end is None else end
         return "•" * (self.display_offset(end) - self.display_offset(start))
 
 
-def _word_kind(char):
+def _word_kind(char: str) -> str:
     return "space" if char.isspace() else "word" if char.isalnum() or char == "_" else "punct"
 
 
@@ -91,65 +102,67 @@ class TextBox(Control):
     _contained_style_parts: ClassVar[frozenset[str]] = frozenset(("track", "thumb"))
 
     @staticmethod
-    def _normalize_text(text, multiline):
+    def _normalize_text(text: str, multiline: bool) -> str:
         text = text.replace("\r\n", "\n").replace("\r", "\n")
         return text if multiline else text.replace("\n", " ")
 
-    def __setattr__(self, name, value):
+    def __setattr__(self, name: str, value: object) -> None:
         if name == "text" and isinstance(value, str) and hasattr(self, "_values"):
             value = self._normalize_text(value, self.multiline)
         super().__setattr__(name, value)
 
-    def _prepare_update(self, values):
-        if "text" in values and isinstance(values["text"], str):
-            return {**values, "text": self._normalize_text(
-                values["text"], values.get("multiline", self.multiline))}
+    def _prepare_update(self, values: Mapping[str, object]) -> Mapping[str, object]:
+        text = values.get("text")
+        if isinstance(text, str):
+            multiline = values.get("multiline", self.multiline)
+            return {**values, "text": self._normalize_text(text, bool(multiline))}
         return values
 
     def _initialize(self):
         super()._initialize()
         self._values["text"] = self._normalize_text(self.text, self.multiline)
-        self._caret = self._anchor = len(self.text)
-        self._undo = []
-        self._redo = []
-        self._edit_group = None
-        self._scroll = 0
+        self._caret: int = len(self.text)
+        self._anchor: int = len(self.text)
+        self._undo: list[_Snapshot] = []
+        self._redo: list[_Snapshot] = []
+        self._edit_group: tuple[str, int, float] | None = None
+        self._scroll: int = 0
         self._wheel = 0.0
         self._scroll_x = 0.0
-        self._scroll_drag = None
+        self._scroll_drag: tuple[int, int, float] | None = None
         self._scroll_axes = (False, False)
-        self._width_cache = {}
-        self._width_cache_key = None
+        self._width_cache: dict[str, float] = {}
+        self._width_cache_key: tuple[object, ...] | None = None
         # Count duplicate rows while retaining one metric per distinct line.
-        self._width_line_counts = None
-        self._width_pending = set()
+        self._width_line_counts: Counter[str] | None = None
+        self._width_pending: set[str] = set()
         # Equal widths share the maximum until their last measured line leaves.
-        self._width_counts = Counter()
+        self._width_counts: Counter[float] = Counter()
         self._reveal_after_paint = True
-        self._text_viewport_metrics = None
+        self._text_viewport_metrics: tuple[float, float, float, float, bool, int] | None = None
         self._composition = ""
-        self._line_cache = None
-        self._pending_line_cache = None
-        self._fixed_line_cache = {}
-        self._preferred_column = None
-        self._extent_cache = None
-        self._measure_host = None
+        self._line_cache: _Lines | None = None
+        self._pending_line_cache: tuple[str, _EditSlice | None] | None = None
+        self._fixed_line_cache: dict[int, bool] = {}
+        self._preferred_column: tuple[object, int | float] | None = None
+        self._extent_cache: float | None = None
+        self._measure_host: Host | None = None
         self._history_availability = (False, False)
-        self._tab_maps = OrderedDict()
+        self._tab_maps: OrderedDict[str, _TabStops | _MaskStops] = OrderedDict()
         self._tab_map_chars = 0
         # Only one bounded row of whole-prefix measurements. Keeping offsets,
         # rather than prefix strings or isolated glyph advances, preserves host
         # kerning/shaping without retaining quadratic amounts of text.
-        self._hit_widths = OrderedDict()
-        self._hit_context = None
-        self._hit_host = None
-        self._last_click = None
-        self._word_drag = None
-        self._selection_pointer = None
-        self._selection_task = None
-        self._selection_token = None
+        self._hit_widths: OrderedDict[int, float] = OrderedDict()
+        self._hit_context: tuple[object, ...] | None = None
+        self._hit_host: Host | None = None
+        self._last_click: tuple[float, float, float, int, str] | None = None
+        self._word_drag: tuple[int, int] | None = None
+        self._selection_pointer: Input | None = None
+        self._selection_task: TaskHandle | None = None
+        self._selection_token: object | None = None
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         if field.name == "text" or (field.name in ("enabled", "visible") and not value):
             self._stop_selection_scroll()
         if field.name in ("text", "tab_size", "password"):
@@ -168,9 +181,10 @@ class TextBox(Control):
                 self._redo.clear()
                 self.text = normalized
         if field.name == "text":
+            text = expect_text(value)
             self._edit_group = None
             pending = self._pending_line_cache
-            prepared = pending[1] if pending is not None and pending[0] == value else None
+            prepared = pending[1] if pending is not None and pending[0] == text else None
             self._line_cache = prepared[0] if prepared is not None else None
             self._pending_line_cache = None
             self._fixed_line_cache.clear()
@@ -183,8 +197,8 @@ class TextBox(Control):
                     changes.subtract(prepared[1])
                 self._update_line_widths(changes)
             self._preferred_column = None
-            self._caret = floor_boundary(value, min(self._caret, len(value)))
-            self._anchor = floor_boundary(value, min(self._anchor, len(value)))
+            self._caret = floor_boundary(text, min(self._caret, len(text)))
+            self._anchor = floor_boundary(text, min(self._anchor, len(text)))
             self._ensure_caret()
         if field.name == "max_undo_bytes":
             self._trim_history()
@@ -197,7 +211,7 @@ class TextBox(Control):
             self._notify_history()
         super()._changed(field, old, value)
 
-    def measure(self, host):
+    def measure(self, host: Host) -> tuple[float, float]:
         self._measure_host = host
         style = resolve_style(self)
         return (
@@ -304,7 +318,7 @@ class TextBox(Control):
         self._check_live()
         return not self.read_only and bool(self._redo)
 
-    def _notify_history(self):
+    def _notify_history(self) -> None:
         current = self.can_undo, self.can_redo
         previous = self._history_availability
         self._history_availability = current
@@ -314,11 +328,11 @@ class TextBox(Control):
                 old_value=previous, new_value=current,
             ))
 
-    def _remember(self, stack, snapshot):
+    def _remember(self, stack: list[_Snapshot], snapshot: _Snapshot) -> None:
         stack.append(snapshot)
         self._trim_history()
 
-    def _trim_history(self):
+    def _trim_history(self) -> None:
         # Account for worst-case Python Unicode storage, not just UTF-8 bytes.
         for stack in (self._undo, self._redo):
             budget = 0
@@ -335,10 +349,10 @@ class TextBox(Control):
             stack = self._undo if len(self._undo) >= len(self._redo) else self._redo
             budget -= len(stack.pop(0)[0]) * 4 + 128
 
-    def _snapshot(self):
+    def _snapshot(self) -> _Snapshot:
         return self.text, self._caret, self._anchor
 
-    def replace_selection(self, text):
+    def replace_selection(self, text: str) -> None:
         """Replace the selection, or insert at the caret, as one undoable edit.
         Normalizes line endings and moves the caret after inserted text; changed
         edits clear redo. Read-only controls do nothing; rejected validation
@@ -347,7 +361,9 @@ class TextBox(Control):
         """
         self._replace_range(text, *self.selection_range)
 
-    def _replace_range(self, text, a, b, *, group=None):
+    def _replace_range(
+        self, text: str, a: int, b: int, *, group: str | None = None
+    ) -> None:
         self._check_live()
         if self.read_only:
             return
@@ -386,21 +402,21 @@ class TextBox(Control):
         self._notify_history()
         self.invalidate()
 
-    def undo(self):
+    def undo(self) -> None:
         self._check_live()
         self._edit_group = None
         if self.read_only or not self._undo:
             return
         self._restore_history(self._undo, self._redo)
 
-    def redo(self):
+    def redo(self) -> None:
         self._check_live()
         self._edit_group = None
         if self.read_only or not self._redo:
             return
         self._restore_history(self._redo, self._undo)
 
-    def _restore_history(self, source, destination):
+    def _restore_history(self, source: list[_Snapshot], destination: list[_Snapshot]) -> None:
         previous = self._snapshot()
         snapshot = source[-1]
         text, caret, anchor = snapshot
@@ -415,7 +431,7 @@ class TextBox(Control):
         self._notify_history()
         self.invalidate()
 
-    def _edited_lines(self, start, end, inserted):
+    def _edited_lines(self, start: int, end: int, inserted: str) -> _EditSlice | None:
         """Splice an edit's rows, retaining all unaffected lines and metrics."""
         if self._line_cache is None:
             return None
@@ -437,7 +453,7 @@ class TextBox(Control):
             positions.extend(position + delta for position in starts[last + 1:])
         return (updated, positions), lines[row:last + 1], replacement
 
-    def _update_line_widths(self, changes):
+    def _update_line_widths(self, changes: Counter[str]) -> None:
         """Keep measured widths only for lines still present in this document."""
         line_counts = self._width_line_counts
         assert line_counts is not None
@@ -460,10 +476,10 @@ class TextBox(Control):
                         if width == self._extent_cache:
                             self._extent_cache = None
 
-    def _lines(self):
+    def _lines(self) -> _Lines:
         if self._line_cache is None:
             lines = self.text.split("\n")
-            starts = []
+            starts: list[int] = []
             cursor = 0
             for line in lines:
                 starts.append(cursor)
@@ -471,7 +487,7 @@ class TextBox(Control):
             self._line_cache = (lines, starts)
         return self._line_cache
 
-    def _ensure_caret(self):
+    def _ensure_caret(self) -> None:
         self._reveal_after_paint = True
         _, starts = self._lines()
         row = bisect.bisect_right(starts, self._caret) - 1
@@ -480,20 +496,20 @@ class TextBox(Control):
         if row >= self._scroll + capacity:
             self._scroll = row - capacity + 1
 
-    def _line_height(self):
+    def _line_height(self) -> float:
         style = resolve_style(self)
         fallback = style.font_size * 1.4
         if not self.multiline:
             return fallback
         return self.effective_row_height(fallback)
 
-    def _page_rows(self):
+    def _page_rows(self) -> int:
         style = resolve_style(self)
         return max(
             1, int((self._text_viewport().height - 2 * style.padding) / self._line_height())
         )
 
-    def _clamp_scroll(self, host=None):
+    def _clamp_scroll(self, host: Host | None = None) -> None:
         self._scroll = max(0, min(self._scroll, self.line_count - self._page_rows()))
         # Zero is valid for every document extent. Keep ordinary edits bounded
         # to visible-row measurement until horizontal scrolling needs a bound.
@@ -502,7 +518,7 @@ class TextBox(Control):
             return
         self._scroll_x = min(self._scroll_x, self._horizontal_limit(host))
 
-    def _document_width(self, host=None):
+    def _document_width(self, host: Host | None = None) -> float | None:
         runtime = getattr(self._root(), "_runtime", None)
         host = host or (runtime.host if runtime is not None else self._measure_host)
         if host is None:
@@ -522,18 +538,18 @@ class TextBox(Control):
         if self._width_pending:
             advance = host.measure("M", style.font_size, True)[0]
             measure_many = getattr(host, "measure_many", None)
-            pending = []
+            pending: list[tuple[str, str]] = []
             pending_chars = 0
 
-            def record(line, measured):
+            def record(line: str, measured: float) -> None:
                 self._width_cache[line] = measured
                 self._width_counts[measured] += 1
                 self._width_pending.remove(line)
                 if self._extent_cache is not None:
                     self._extent_cache = max(self._extent_cache, measured)
 
-            def flush():
-                if pending:
+            def flush() -> None:
+                if pending and measure_many is not None:
                     widths = measure_many([display for _, display in pending],
                                           style.font_size, mono)
                     for (line, _), (width, _) in zip(pending, widths):
@@ -563,14 +579,14 @@ class TextBox(Control):
             self._extent_cache = max(self._width_counts, default=0)
         return self._extent_cache
 
-    def _horizontal_limit(self, host=None):
+    def _horizontal_limit(self, host: Host | None = None) -> float:
         width = self._document_width(host)
         if width is None:
             return self._scroll_x if self.text else 0.0
         available = max(0, self._text_viewport().right - self._text_left() - 14)
         return max(0, width - available)
 
-    def _sync_scrollbars(self, host=None):
+    def _sync_scrollbars(self, host: Host | None = None) -> None:
         if not self.multiline:
             self._scroll_axes = (False, False)
             return
@@ -586,13 +602,13 @@ class TextBox(Control):
             vertical = self.line_count > page
         self._scroll_axes = horizontal, vertical
 
-    def _scrollbars(self):
+    def _scrollbars(self) -> list[Scrollbar]:
         if not self.multiline:
             return []
         area = self._text_viewport()
         horizontal, vertical = self._scroll_axes
         x, y = self._rect.x, self._rect.y
-        bars = []
+        bars: list[Scrollbar] = []
         if vertical:
             bar = scrollbar(Rect(x + area.right, y, min(12, self._rect.width), area.height),
                             self.line_count, self._page_rows(), self._scroll)
@@ -606,7 +622,7 @@ class TextBox(Control):
                 bars.append(bar)
         return bars
 
-    def _text_left(self):
+    def _text_left(self) -> float:
         style = resolve_style(self)
         return (
             style.padding + 8 + len(str(self.line_count)) * style.font_size * 0.65
@@ -614,13 +630,13 @@ class TextBox(Control):
             else style.padding + 2
         )
 
-    def _text_viewport(self):
+    def _text_viewport(self) -> Rect:
         """Local text area; derived editors can reserve space for adornments."""
         horizontal, vertical = self._scroll_axes if self.multiline else (False, False)
         return Rect(0, 0, max(0, self._rect.width - (12 if vertical else 0)),
                     max(0, self._rect.height - (12 if horizontal else 0)))
 
-    def indent_selection(self, *, unindent=False):
+    def indent_selection(self, *, unindent: bool = False) -> None:
         """Indent selected complete lines as one undo operation."""
         if self.read_only:
             return
@@ -645,7 +661,7 @@ class TextBox(Control):
         self._replace_range(value, start, end)
         self.select(start, start + len(value))
 
-    def _tab_map(self, line):
+    def _tab_map(self, line: str) -> _TabStops | _MaskStops | None:
         if "\t" not in line and not self.password:
             return None
         if line in self._tab_maps:
@@ -663,7 +679,7 @@ class TextBox(Control):
             self._tab_map_chars += len(line)
         return tabs
 
-    def _fixed_line(self, row, line, *, mono):
+    def _fixed_line(self, row: int | None, line: str, *, mono: bool) -> bool:
         # Fixed-pitch printable ASCII admits exact indexed viewport painting.
         # Other text retains the host's complete shaping/measurement operation.
         if not mono or self.password:
@@ -678,7 +694,7 @@ class TextBox(Control):
                 line.isprintable() or line.replace("\t", "").isprintable())
         return self._fixed_line_cache[row]
 
-    def _word_boundary(self, offset, direction):
+    def _word_boundary(self, offset: int, direction: int) -> int:
         """Move across a word/punctuation run and its adjacent whitespace.
 
         Words contain Unicode letters/numbers or underscore. Each step is a
@@ -687,7 +703,7 @@ class TextBox(Control):
         text = self.text
         offset = floor_boundary(text, offset)
 
-        def kind(index):
+        def kind(index: int) -> str:
             return _word_kind(text[index])
 
         if direction > 0:
@@ -707,7 +723,7 @@ class TextBox(Control):
         return offset
 
     @staticmethod
-    def _word_span(line, offset):
+    def _word_span(line: str, offset: int) -> tuple[int, int]:
         if not line:
             return 0, 0
         start = floor_boundary(line, min(offset, len(line) - 1))
@@ -719,7 +735,9 @@ class TextBox(Control):
             end = next_boundary(line, end)
         return start, end
 
-    def _pointer_columns(self, row, line, x, host, size, mono):
+    def _pointer_columns(
+        self, row: int | None, line: str, x: float, host: Host, size: float, mono: bool
+    ) -> tuple[int, int]:
         """Return the nearest insertion boundary and the grapheme under x."""
         tabs = self._tab_map(line)
         if self._fixed_line(row, line, mono=mono):
@@ -727,13 +745,14 @@ class TextBox(Control):
             column = max(0, int(x / advance))
             low = tabs.source_offset(column) if tabs else min(len(line), column)
 
-            def fixed_width(offset):
+            def fixed_width(offset: int) -> float:
                 return (tabs.display_offset(offset) if tabs else offset) * advance
             width = fixed_width
         else:
             display = tabs.expand() if tabs else line
             context = (getattr(host, "resource_revision", 0), size, mono,
                        self.password, self.tab_size, line)
+            widths: OrderedDict[int, float]
             if len(line) <= 65536:
                 if self._hit_host is not host or self._hit_context != context:
                     self._hit_widths.clear()
@@ -743,7 +762,7 @@ class TextBox(Control):
                 # Oversized rows only reuse duplicate probes within this call.
                 widths = OrderedDict()
 
-            def measured_width(offset):
+            def measured_width(offset: int) -> float:
                 if offset in widths:
                     widths.move_to_end(offset)
                     return widths[offset]
@@ -770,7 +789,7 @@ class TextBox(Control):
         # the caret at the start of the following whitespace or punctuation.
         return caret, low
 
-    def scroll_input(self, e, /) -> bool:
+    def scroll_input(self, e: Input, /) -> bool:
         self._clamp_scroll()
         offset = self._scroll_x if e.shift else self._scroll
         limit = (
@@ -783,13 +802,13 @@ class TextBox(Control):
         self.handle_input(e)
         return True
 
-    def _stop_selection_scroll(self):
+    def _stop_selection_scroll(self) -> None:
         task, self._selection_task = self._selection_task, None
         self._selection_pointer = self._selection_token = None
         if task is not None:
             task.cancel()
 
-    def _selection_can_scroll(self):
+    def _selection_can_scroll(self) -> bool:
         event = self._selection_pointer
         if event is None:
             return False
@@ -802,7 +821,7 @@ class TextBox(Control):
             or (x >= area.right and self._scroll_x < self._horizontal_limit())
         )
 
-    def _sync_selection_scroll(self, event):
+    def _sync_selection_scroll(self, event: Input) -> None:
         self._selection_pointer = event
         if not self._selection_can_scroll():
             self._stop_selection_scroll()
@@ -810,7 +829,7 @@ class TextBox(Control):
             token = self._selection_token = object()
             self._selection_task = self.create_task(self._scroll_selection(token))
 
-    async def _scroll_selection(self, token):
+    async def _scroll_selection(self, token: object) -> None:
         try:
             while self._selection_token is token:
                 await asyncio.sleep(0.05)
@@ -824,6 +843,8 @@ class TextBox(Control):
                 # Reuse pointer selection (including word/grapheme behavior),
                 # limiting each tick even when the pointer is far off screen.
                 event = self._selection_pointer
+                if event is None:
+                    break
                 area = self._text_viewport()
                 event = replace(event, kind="pointer_move",
                     x=max(self._rect.x - 16, min(event.x, self._rect.x + area.right + 16)),
@@ -845,7 +866,7 @@ class TextBox(Control):
         self._stop_selection_scroll()
         super().destroy()
 
-    def handle_input(self, e, /):
+    def handle_input(self, e: Input, /) -> bool | None:
         if e.kind in ("blur", "pointer_cancel", "pointer_up", "key_down", "text", "composition", "wheel"):
             self._stop_selection_scroll()
         before = (self._caret, self._anchor, self._scroll, self._scroll_x, self._composition)
@@ -1032,7 +1053,7 @@ class TextBox(Control):
                                    self.password, self.tab_size)
                     if self._preferred_column is None or self._preferred_column[0] != context:
                         tabs = self._tab_map(lines[row])
-                        if context is None:
+                        if host is None or mono:
                             preferred = tabs.display_offset(col) if tabs else col
                         else:
                             prefix = tabs.expand(0, col) if tabs else lines[row][:col]
@@ -1043,13 +1064,15 @@ class TextBox(Control):
                     row = max(
                         0, min(len(lines) - 1, row + delta * (-1 if key in ("ArrowUp", "PageUp") else 1))
                     )
-                    if context is not None:
+                    if context is not None and host is not None:
                         column, _ = self._pointer_columns(
                             row, lines[row], preferred, host, style.font_size, mono)
                     else:
                         tabs = self._tab_map(lines[row])
-                        column = (tabs.source_offset(preferred) if tabs
-                                  else min(preferred, len(lines[row])))
+                        column = (
+                            tabs.source_offset(cast(int, preferred)) if tabs
+                            else min(cast(int, preferred), len(lines[row]))
+                        )
                     self._caret = starts[row] + column
                     self._caret = starts[row] + floor_boundary(
                         lines[row], self._caret - starts[row]
@@ -1082,7 +1105,7 @@ class TextBox(Control):
         if before != (self._caret, self._anchor, self._scroll, self._scroll_x, self._composition):
             self.invalidate()
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         s = p.body()
         self._measure_host = p.host
         self._sync_scrollbars(p.host)
@@ -1091,7 +1114,7 @@ class TextBox(Control):
             self._paint_text(p, s, viewport)
         paint_scrollbars(p, self._scrollbars())
 
-    def _paint_text(self, p, s, viewport):
+    def _paint_text(self, p: Painter, s: ResolvedStyle, viewport: Rect) -> None:
         self._measure_host = p.host
         mono = self.monospace or s.font_family == "mono"
         metrics = (viewport.width, viewport.height, self._line_height(), s.padding, mono, self.tab_size)
@@ -1232,7 +1255,16 @@ class TextBox(Control):
                 p.rect(Rect(1, y, text_left - 6, lh), s.fill)
                 p.text(str(i + 1), 5, y, size=size, color=t.muted, mono=True)
 
-    def paint_line_fragment(self, painter, text, x, y, row, style, start_column):
+    def paint_line_fragment(
+        self,
+        painter: Painter,
+        text: str,
+        x: float,
+        y: float,
+        row: int,
+        style: ResolvedStyle,
+        start_column: int,
+    ) -> None:
         """Paint a visible line fragment; offsets refer to the original line.
 
         Decorators with indexed spans can override this alongside paint_line.
@@ -1243,7 +1275,9 @@ class TextBox(Control):
                 text = tabs.expand(start_column, start_column + len(text))
         self.paint_line(painter, text, x, y, row, style)
 
-    def paint_line(self, painter, text, x, y, row, style):
+    def paint_line(
+        self, painter: Painter, text: str, x: float, y: float, row: int, style: ResolvedStyle
+    ) -> None:
         """Public extension point for text decoration; selection/caret stay shared."""
         painter.text(
             text.expandtabs(self.tab_size) if "\t" in text and not self.password else text,

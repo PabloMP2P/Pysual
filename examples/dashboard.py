@@ -126,7 +126,7 @@ class Dashboard(App):
 
 def main():
     # Activate CLI/environment settings only when launching this script.
-    from pysual import autoconfig  # noqa: F401
+    from pysual import autoconfig as autoconfig
 
     parser = argparse.ArgumentParser(
         description=__doc__,

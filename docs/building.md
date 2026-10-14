@@ -273,8 +273,27 @@ screenshots are saved under `.build/web-smoke` and `.build/web-live`; wheel and
 executable diagnostics are also saved under `.build`.
 
 With the development dependencies installed, `python tools/check_typing.py`
-checks valid consumer code and marked invalid expressions using Pyright against
-this checkout. CI runs it alongside the ordinary test suite. Native text,
+typechecks `src/pysual` and `examples`. The library uses Pyright strict mode,
+including unknown-parameter, unknown-argument, unknown-variable, unknown-member,
+and missing-parameter rules. `reportMissingTypeArgument` stays on for every
+module and cannot be disabled. Every module under `src/pysual` enforces those
+rules. Committed properties live in a `dict` subclass. A stub types the known
+control and container keys, so layout, input, and paint read them with a normal
+dictionary lookup. A core test checks those keys against the declared properties.
+A module that is not annotated yet would opt out with one `# pyright:`
+comment, and the checker requires that comment and the exemption list in
+`tools/check_typing.py` to name exactly the same files, so a new module is
+checked unless it is added to that list. `geometry.py` and `_engine.py` also
+enable the strict rules the project leaves off: unused call results, implicit
+overrides, private use, redundant `isinstance` and comparisons, unnecessary
+casts, and unused functions. Those stay off elsewhere because private helpers
+are shared across modules, and host and schema code keeps runtime `isinstance`
+checks for values that arrive from outside a typed signature. Examples stay in
+strict mode with the unknown-type rules off. Consumer fixtures in `tests/typing`
+stay in standard mode. Each project needs its `pyrightconfig.json`, and the
+checker requires Pyright to analyze every included Python file. Marked invalid
+expressions must be rejected and nothing else. CI runs it alongside the ordinary
+test suite. Native text,
 resource and diagnostics tests run again after building the native host;
 Windows CI also opts into the existing isolated console-restoration test.
 

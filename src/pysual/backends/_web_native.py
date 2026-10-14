@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict, deque
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 import json
+from pathlib import Path
 from math import isfinite
 import re
 import secrets
@@ -22,11 +24,12 @@ from socketserver import TCPServer
 import sys
 import threading
 import time
-from typing import cast
-from urllib.parse import parse_qs, urlsplit
+from typing import NotRequired, TypedDict, TypeGuard, cast
+from urllib.parse import SplitResult, parse_qs, urlsplit
 import webbrowser
 import zlib
 
+from ..geometry import Rect
 from ..host import CapabilityError, Input, MAX_TEXT_BYTES, TextFile, Viewport
 from . import _font
 from ._native import NativeServices
@@ -59,12 +62,74 @@ _INPUT_KINDS = frozenset(
         "image_error",
     }
 )
+_INPUT_FIELDS = frozenset(Input.__dataclass_fields__)
 
 
-def _number(value):
-    if type(value) not in (int, float) or not isfinite(value):
+def _number(value: object) -> int | float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("Coordinates must be finite numbers")
+    try:
+        finite = isfinite(value)
+    except OverflowError:
+        finite = False
+    if not finite:
         raise ValueError("Coordinates must be finite numbers")
     return value
+
+
+def _is_dict(value: object) -> TypeGuard[dict[object, object]]:
+    return isinstance(value, dict)
+
+
+def _is_list(value: object) -> TypeGuard[list[object]]:
+    return isinstance(value, list)
+
+
+def _bounded_list(value: object, limit: int) -> list[object]:
+    if not _is_list(value) or len(value) > limit:
+        raise ValueError("Too many events or replies")
+    return value
+
+
+class _ViewportData(TypedDict):
+    width: float
+    height: float
+    scale: NotRequired[float]
+    safe_area: NotRequired[tuple[float, float, float, float]]
+    keyboard_occlusion: NotRequired[float]
+
+
+class _InputData(TypedDict):
+    kind: str
+    x: NotRequired[float]
+    y: NotRequired[float]
+    key: NotRequired[str]
+    text: NotRequired[str]
+    delta: NotRequired[float]
+    shift: NotRequired[bool]
+    ctrl: NotRequired[bool]
+    button: NotRequired[int]
+    pointer_id: NotRequired[int]
+    pointer_kind: NotRequired[str]
+    viewport: NotRequired[Viewport | None]
+    paste: NotRequired[bool]
+
+
+class _TransportPacket(TypedDict):
+    revision: int
+    closed: bool
+    reset: NotRequired[bool]
+    length: NotRequired[int]
+    updates: NotRequired[list[object]]
+    definitions: NotRequired[list[object]]
+    remove_definitions: NotRequired[list[str]]
+    image_sources: NotRequired[dict[str, str]]
+    remove_images: NotRequired[list[str]]
+    width: NotRequired[float]
+    height: NotRequired[float]
+    title: NotRequired[str]
+    text_input: NotRequired[list[float] | None]
+    commands: NotRequired[list[object]]
 
 
 def _accepts_gzip(value: str) -> bool:
@@ -74,7 +139,7 @@ def _accepts_gzip(value: str) -> bool:
     conflicting duplicate settings fail closed rather than enabling a coding
     the client may have excluded. An explicit identity preference is honored.
     """
-    qualities = {}
+    qualities: dict[str, float] = {}
     for item in value.split(","):
         parts = item.split(";")
         coding = parts[0].strip().lower()
@@ -110,13 +175,13 @@ class _Server(ThreadingHTTPServer):
     block_on_close = False
     allow_reuse_address = True
 
-    def __init__(self, address, adapter):
+    def __init__(self, address: tuple[str, int], adapter: LiveSVGHost) -> None:
         self.adapter = adapter
-        self.token = adapter._token
+        self.token: str = adapter._token
         self.slots = threading.BoundedSemaphore(_MAX_CONNECTIONS)
         super().__init__(address, _Handler)
 
-    def server_bind(self):
+    def server_bind(self) -> None:
         # HTTPServer resolves the bound address with getfqdn(). This listener
         # is strictly numeric loopback; reverse DNS adds no information and
         # can block the shared UI owner while an OS resolver times out.
@@ -124,21 +189,21 @@ class _Server(ThreadingHTTPServer):
         self.server_name = "localhost"
         self.server_port = self.server_address[1]
 
-    def process_request(self, request, client_address):
+    def process_request(self, request: object, client_address: object) -> None:
         if not self.slots.acquire(False):
-            self.shutdown_request(request)
+            self.shutdown_request(cast(socket.socket, request))
             return
         try:
-            super().process_request(request, client_address)
+            super().process_request(cast(socket.socket, request), client_address)
         except BaseException:
             self.slots.release()
             raise
 
-    def process_request_thread(self, request, client_address):
+    def process_request_thread(self, request: object, client_address: object) -> None:
         try:
             assert isinstance(request, socket.socket)
             request.settimeout(25)
-            super().process_request_thread(request, client_address)
+            super().process_request_thread(cast(socket.socket, request), client_address)
         finally:
             self.slots.release()
 
@@ -150,17 +215,17 @@ class _Handler(BaseHTTPRequestHandler):
     server_version = "PysualWebLive/1"
 
     @property
-    def adapter(self):
+    def adapter(self) -> LiveSVGHost:
         return cast(_Server, self.server).adapter
 
     @property
-    def launch_token(self):
+    def launch_token(self) -> str:
         return cast(_Server, self.server).token
 
-    def log_message(self, format, *args):
+    def log_message(self, format: str, *args: object) -> None:
         pass
 
-    def handle_one_request(self):
+    def handle_one_request(self) -> None:
         try:
             super().handle_one_request()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
@@ -169,13 +234,13 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _send(
         self,
-        status,
+        status: int,
         body: bytes | str = b"",
-        content_type="application/json; charset=utf-8",
+        content_type: str = "application/json; charset=utf-8",
         *,
-        compress=False,
-        events_ack=False,
-    ):
+        compress: bool = False,
+        events_ack: bool = False,
+    ) -> None:
         if isinstance(body, str):
             body = body.encode("utf-8")
         encoded = compress and _accepts_gzip(
@@ -220,7 +285,9 @@ class _Handler(BaseHTTPRequestHandler):
             presented.encode("utf-8"), expected.encode("ascii")
         )
 
-    def _allowed(self, authenticated=False, query_token=None):
+    def _allowed(
+        self, authenticated: bool = False, query_token: str | None = None
+    ) -> bool:
         adapter = self.adapter
         origin = self.headers.get("Origin")
         if self.headers.get("Host") != adapter._authority or (
@@ -250,7 +317,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"\r\n")
         self.wfile.flush()
 
-    def _stream(self, parsed):
+    def _stream(self, parsed: SplitResult) -> None:
         token = parse_qs(parsed.query).get("token", [""])[0]
         if not self._allowed(True, query_token=token):
             return
@@ -308,7 +375,7 @@ class _Handler(BaseHTTPRequestHandler):
         ):
             self.close_connection = True
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         parsed = urlsplit(self.path)
         if parsed.path == "/stream":
             self._stream(parsed)
@@ -329,7 +396,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "text/javascript; charset=utf-8",
             )
         elif parsed.path in ("/font-sans.ttf", "/font-mono.ttf"):
-            self._send(
+                self._send(
                 200, _font.font_bytes(parsed.path == "/font-mono.ttf"), "font/ttf"
             )
         elif parsed.path == "/export.svg":
@@ -367,7 +434,7 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, '{"error":"Not found"}')
 
-    def do_POST(self):
+    def do_POST(self) -> None:
         if not self._allowed(True):
             return
         if self.path != "/events":
@@ -384,7 +451,8 @@ class _Handler(BaseHTTPRequestHandler):
             data = self.rfile.read(length)
             if len(data) != length:
                 raise ValueError("Incomplete request")
-            accepted = self.adapter._receive(json.loads(data), token=self.launch_token)
+            loaded: object = json.loads(data)
+            accepted = self.adapter._receive(loaded, token=self.launch_token)
             self._send(200 if accepted else 410, "{}", events_ack=accepted)
         except (ValueError, TypeError, KeyError, UnicodeError) as exc:
             self._send(400, json.dumps({"error": str(exc)[:200]}))
@@ -420,7 +488,9 @@ class LiveSVGHost(SVGRenderer, NativeServices):
         }
     )
 
-    def __init__(self, *, open_browser=True, host="127.0.0.1", port=0):
+    def __init__(
+        self, *, open_browser: bool = True, host: str = "127.0.0.1", port: int = 0
+    ) -> None:
         if host != "127.0.0.1":
             raise ValueError("LiveSVGHost only listens on 127.0.0.1")
         if type(port) is not int or not 0 <= port <= 65535:
@@ -431,22 +501,29 @@ class LiveSVGHost(SVGRenderer, NativeServices):
         self._session_lock = asyncio.Lock()
         self._condition = threading.Condition()
         self._closed_delivered = threading.Event()
-        self._events = deque()
-        self._commands = OrderedDict()
-        self._pending = {}
+        self._events: deque[Input] = deque()
+        self._commands: OrderedDict[int, dict[str, object]] = OrderedDict()
+        self._pending: dict[int, tuple[asyncio.AbstractEventLoop, asyncio.Future[object]]] = {}
         self._operation = 0
         self._sent_metadata_revision = -1
-        self._delivered_frames = OrderedDict()
+        self._delivered_frames: OrderedDict[int, _FrameSnapshot] = OrderedDict()
         self._closed = True
-        self._server = None
-        self._thread = None
+        self._server: _Server | None = None
+        self._thread: threading.Thread | None = None
         self._token = ""
         self._origin = self._authority = ""
-        self._disconnect_at = None
-        self._last_contact = None
-        self.url = None
+        self._disconnect_at: float | None = None
+        self._last_contact: float | None = None
+        self.url: str | None = None
 
-    def open(self, title, width, height, resizable, scale):
+    def open(
+        self,
+        title: str,
+        width: float,
+        height: float,
+        resizable: bool,
+        scale: float | None,
+    ) -> None:
         if not self._closed:
             raise RuntimeError("web host is already open")
         if scale not in (None, 1):
@@ -490,17 +567,17 @@ class LiveSVGHost(SVGRenderer, NativeServices):
             self.close()
             raise
 
-    def set_size(self, width, height):
+    def set_size(self, width: float, height: float) -> None:
         raise CapabilityError("The browser owns the web viewport size")
 
-    def set_title(self, title):
+    def set_title(self, title: object) -> None:
         with self._condition:
             previous = self._metadata_revision
             super().set_title(title)
             if previous != self._metadata_revision:
                 self._condition.notify_all()
 
-    def poll(self):
+    def poll(self) -> list[Input]:
         with self._condition:
             result = list(self._events)
             self._events.clear()
@@ -523,20 +600,24 @@ class LiveSVGHost(SVGRenderer, NativeServices):
         return result
 
     @staticmethod
-    def _input(data):
-        if not isinstance(data, dict) or data.get("kind") not in _INPUT_KINDS:
+    def _input(data: object) -> Input:
+        if not _is_dict(data):
             raise ValueError("Unknown input event")
-        if data["kind"] == "image_error" and (
-            set(data) != {"kind", "text"}
-            or not isinstance(data.get("text"), str)
-            or not data["text"].isascii()
-            or not data["text"].isdigit()
-            or len(data["text"]) > 20
+        kind = data.get("kind")
+        if not isinstance(kind, str) or kind not in _INPUT_KINDS:
+            raise ValueError("Unknown input event")
+        text = data.get("text")
+        if kind == "image_error" and (
+            data.keys() != {"kind", "text"}
+            or not isinstance(text, str)
+            or not text.isascii()
+            or not text.isdigit()
+            or len(text) > 20
         ):
             raise ValueError("Invalid image resource identifier")
-        values = dict(data)
-        if set(values) - set(Input.__dataclass_fields__):
+        if data.keys() - _INPUT_FIELDS:
             raise ValueError("Unknown input fields")
+        values = dict(data)
         for field_name in ("x", "y", "delta"):
             if field_name in values:
                 _number(values[field_name])
@@ -554,44 +635,44 @@ class LiveSVGHost(SVGRenderer, NativeServices):
             ):
                 raise ValueError("Input text is too large")
         if values.get("viewport") is not None:
-            data = dict(values["viewport"])
-            data["safe_area"] = tuple(data.get("safe_area", (0, 0, 0, 0)))
-            viewport = Viewport(**data)
+            viewport_fields = dict(cast(Mapping[object, object], values["viewport"]))
+            safe_area = viewport_fields.get("safe_area", (0, 0, 0, 0))
+            viewport_fields["safe_area"] = tuple(cast(Iterable[object], safe_area))
+            viewport = Viewport(**cast(_ViewportData, viewport_fields))
             if viewport.width > 32768 or viewport.height > 32768 or viewport.scale > 16:
                 raise ValueError("Viewport exceeds host limits")
             values["viewport"] = viewport
         if values["kind"] == "viewport" and values.get("viewport") is None:
             raise ValueError("Viewport event requires viewport data")
-        return Input(**values)
+        return Input(**cast(_InputData, values))
 
-    def _receive(self, data, *, token: str | None = None):
-        if not isinstance(data, dict) or set(data) - {
-            "events",
-            "replies",
-            "disconnect",
-        }:
+    def _receive(self, data: object, *, token: str | None = None) -> bool:
+        if not _is_dict(data):
             raise ValueError("Invalid event envelope")
-        events, replies = data.get("events", []), data.get("replies", [])
-        if (
-            not isinstance(events, list)
-            or not isinstance(replies, list)
-            or len(events) > 256
-            or len(replies) > 32
-        ):
-            raise ValueError("Too many events or replies")
+        envelope = data
+        if set(envelope) - {"events", "replies", "disconnect"}:
+            raise ValueError("Invalid event envelope")
+        raw_events = envelope.get("events", [])
+        raw_replies = envelope.get("replies", [])
+        events = _bounded_list(raw_events, 256)
+        replies: list[dict[object, object]] = []
+        for reply in _bounded_list(raw_replies, 32):
+            if not _is_dict(reply):
+                raise ValueError("Invalid service reply")
+            replies.append(reply)
         parsed = [self._input(event) for event in events]
         for reply in replies:
+            reply_error = reply.get("error", "")
             if (
-                not isinstance(reply, dict)
-                or type(reply.get("id")) is not int
-                or not isinstance(reply.get("error", ""), str)
+                type(reply.get("id")) is not int
+                or not isinstance(reply_error, str)
             ):
                 raise ValueError("Invalid service reply")
         with self._condition:
             if self._closed or (token is not None and token != self._token):
                 return False
             self._last_contact = time.monotonic()
-            if data.get("disconnect"):
+            if envelope.get("disconnect"):
                 # A reload can reconnect before this grace period; closing the
                 # tab requests app closure even when no frame was being painted.
                 self._disconnect_at = time.monotonic() + 2
@@ -603,6 +684,13 @@ class LiveSVGHost(SVGRenderer, NativeServices):
                     self._events
                     and event.kind in ("pointer_move", "viewport")
                     and self._events[-1].kind == event.kind
+                    and (
+                        event.kind == "viewport"
+                        or (
+                            self._events[-1].pointer_id == event.pointer_id
+                            and self._events[-1].pointer_kind == event.pointer_kind
+                        )
+                    )
                 ):
                     self._events[-1] = event
                 else:
@@ -614,18 +702,21 @@ class LiveSVGHost(SVGRenderer, NativeServices):
                     event for event in self._events if event.kind != "pointer_move"
                 )
             for reply in replies:
-                operation = reply["id"]
+                operation = cast(int, reply["id"])
                 pending = self._pending.pop(operation, None)
                 self._commands.pop(operation, None)
                 if pending is not None:
                     loop, future = pending
 
-                    def finish(future=future, reply=reply):
+                    def finish(
+                        future: asyncio.Future[object] = future,
+                        reply: dict[object, object] = reply,
+                    ) -> None:
                         if not future.done():
-                            if reply.get("error"):
-                                future.set_exception(
-                                    CapabilityError(reply["error"][:1000])
-                                )
+                            error = reply.get("error")
+                            if error:
+                                message = error if isinstance(error, str) else cast(str, error)
+                                future.set_exception(CapabilityError(message[:1000]))
                             else:
                                 future.set_result(reply.get("value"))
 
@@ -634,7 +725,7 @@ class LiveSVGHost(SVGRenderer, NativeServices):
             return True
 
     @staticmethod
-    def _ended_packet():
+    def _ended_packet() -> _TransportPacket:
         return {
             "revision": 0,
             "reset": True,
@@ -648,7 +739,13 @@ class LiveSVGHost(SVGRenderer, NativeServices):
             "closed": True,
         }
 
-    def _frame_packet(self, revision, *, token: str | None = None, cursor=None):
+    def _frame_packet(
+        self,
+        revision: int,
+        *,
+        token: str | None = None,
+        cursor: _FrameCursor | None = None,
+    ) -> _TransportPacket:
         with self._condition:
             if token is not None and token != self._token:
                 return self._ended_packet()
@@ -689,37 +786,40 @@ class LiveSVGHost(SVGRenderer, NativeServices):
                 self._delivered_frames.move_to_end(snapshot.revision)
                 while len(self._delivered_frames) > _MAX_CONNECTIONS:
                     self._delivered_frames.popitem(last=False)
-            return {
-                **packet,
-                "commands": list(self._commands.values()),
-                "closed": self._closed,
-            }
+            return cast(
+                _TransportPacket,
+                {
+                    **packet,
+                    "commands": list(self._commands.values()),
+                    "closed": self._closed,
+                },
+            )
 
-    def _image_error(self, detail, source_key):
+    def _image_error(self, detail: object, source_key: int) -> None:
         with self._condition:
             super()._image_error(detail, source_key)
 
-    def reload_image(self, source):
+    def reload_image(self, source: object) -> None:
         with self._condition:
             super().reload_image(source)
 
-    def _resource_error(self, message):
+    def _resource_error(self, message: str) -> None:
         with self._condition:
             self._events.append(Input("resource_error", text=message))
 
-    def present(self):
+    def present(self) -> None:
         with self._condition:
             if self.publish_scene():
                 self._condition.notify_all()
 
-    def text_input(self, rect):
+    def text_input(self, rect: Rect | None) -> None:
         with self._condition:
             previous = self._metadata_revision
             super().text_input(rect)
             if previous != self._metadata_revision:
                 self._condition.notify_all()
 
-    async def _rpc(self, method, **arguments):
+    async def _rpc(self, method: str, **arguments: object) -> object:
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         with self._condition:
@@ -744,7 +844,7 @@ class LiveSVGHost(SVGRenderer, NativeServices):
                 self._metadata_revision += 1
                 self._condition.notify_all()
 
-    async def clipboard_read(self):
+    async def clipboard_read(self) -> str:
         value = await self._rpc("clipboard_read")
         if not isinstance(value, str) or len(value.encode("utf-8")) > MAX_TEXT_BYTES:
             raise CapabilityError(
@@ -752,7 +852,7 @@ class LiveSVGHost(SVGRenderer, NativeServices):
             )
         return value
 
-    async def clipboard_write(self, text):
+    async def clipboard_write(self, text: str) -> None:
         try:
             valid = isinstance(text, str) and len(text.encode("utf-8")) <= MAX_TEXT_BYTES
         except UnicodeError:
@@ -762,20 +862,25 @@ class LiveSVGHost(SVGRenderer, NativeServices):
         if not await self._rpc("clipboard_write", text=text):
             raise CapabilityError("Browser clipboard copy was cancelled")
 
-    async def open_text_file(self):
+    async def open_text_file(self) -> TextFile | None:
         value = await self._rpc("open_text_file")
         if value is None:
             return None
+        if not _is_dict(value):
+            raise CapabilityError("Invalid UTF-8 browser file result")
+        name = value.get("name")
+        text = value.get("text")
         if (
-            not isinstance(value, dict)
-            or not isinstance(value.get("name"), str)
-            or not isinstance(value.get("text"), str)
-            or len(value["text"].encode("utf-8")) > MAX_TEXT_BYTES
+            not isinstance(name, str)
+            or not isinstance(text, str)
+            or len(text.encode("utf-8")) > MAX_TEXT_BYTES
         ):
             raise CapabilityError("Invalid UTF-8 browser file result")
-        return TextFile(value["name"], value["text"])
+        return TextFile(name, text)
 
-    async def save_text_file(self, text, suggested_name, location=None):
+    async def save_text_file(
+        self, text: str, suggested_name: str, location: str | None = None
+    ) -> TextFile | None:
         if not isinstance(text, str) or len(text.encode("utf-8")) > MAX_TEXT_BYTES:
             raise ValueError("Text files must be at most 8 MiB")
         name = (
@@ -784,7 +889,7 @@ class LiveSVGHost(SVGRenderer, NativeServices):
         result = await self._rpc("save_text_file", text=text, name=name)
         return TextFile(result if isinstance(result, str) else name, text) if result else None
 
-    async def open_url(self, url):
+    async def open_url(self, url: str) -> None:
         if (
             not isinstance(url, str)
             or urlsplit(url).scheme.lower() not in {"https", "http", "mailto"}
@@ -795,24 +900,28 @@ class LiveSVGHost(SVGRenderer, NativeServices):
             raise CapabilityError("Opening the URL was cancelled")
 
 
-    def export_svg(self, path=None, *, _token: str | None = None):
+    def export_svg(
+        self, path: str | Path | None = None, *, _token: str | None = None
+    ) -> str:
         with self._condition:
             if _token is not None and _token != self._token:
                 raise CapabilityError("web session has ended")
             return super().export_svg(path)
 
-    def export_html(self, path=None, *, _token: str | None = None):
+    def export_html(
+        self, path: str | Path | None = None, *, _token: str | None = None
+    ) -> str:
         with self._condition:
             if _token is not None and _token != self._token:
                 raise CapabilityError("web session has ended")
             return super().export_html(path)
 
-    def close(self):
+    def close(self) -> None:
         with self._condition:
             self._closed = True
             for loop, future in self._pending.values():
 
-                def finish(future=future):
+                def finish(future: asyncio.Future[object] = future) -> None:
                     if not future.done():
                         future.set_exception(
                             CapabilityError("The web host is closed")

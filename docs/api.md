@@ -59,11 +59,14 @@ Module waits return immediately when already idle; they do not wait for future
 openings after that point. Opening waits for the first content frame or an
 actual startup error; slow construction does not expire under the ordinary UI
 dispatch timeout. `close()` requests closure; `destroy()` disposes
-the control tree. Closing handlers can veto a normal close. Property writes and
-methods route to the managed UI owner, which serves queued requests before each
-frame; user event callbacks run there. Property reads from another thread return
-the latest committed value immediately. Use these public interfaces from workers
-and avoid mutating private fields.
+the control tree. Closing handlers can veto a normal close. `await close_async()`
+returns whether the shared close decision accepted closure. A closing handler
+must return normally to accept closure or call `event.cancel()` to veto it;
+awaiting its own `close_async()` raises `LifecycleError` instead of deadlocking.
+Property writes and methods route to the managed UI owner, which serves queued
+requests before each frame; user event callbacks run there. Property reads from
+another thread return the latest committed value immediately. Use these public
+interfaces from workers and avoid mutating private fields.
 
 `SubWindow` provides in-app dialogs on every backend. Separate native windows
 use separate host processes. OS-owned modality between those processes is not
@@ -189,9 +192,15 @@ container factories, for example `Container(layout="stack")` and
 `parent.panel(layout="stack")`. Custom properties can declare
 `mode: Literal["compact", "wide"] = prop(default="compact")`; import `Literal`
 from `typing`. The annotation supplies runtime validation and editor choices
-without a separate `choices=` list. Existing primitive annotations with
-`prop(choices=...)` remain supported. Run `python tools/check_typing.py` with the
-development dependencies installed to verify the public consumer fixtures.
+without a separate `choices=` list. Optional and tuple properties retain nested
+choices, for example `Literal["compact", "wide"] | None` or
+`tuple[Literal["left", "right"], ...]`, including through JSON persistence.
+Only property declarations need resolvable runtime annotations; private state
+can refer to types imported solely for type checking. Existing primitive
+annotations with `prop(choices=...)` remain supported.
+Run `python tools/check_typing.py` with the
+development dependencies installed to typecheck the library, the examples, and
+the public consumer fixtures.
 
 <!-- recipe: panel-factory -->
 ```python
@@ -577,7 +586,7 @@ class Meter(Control):
         width, height = host.measure(self.caption, 16)
         return width + 24, max(32, height + 16)
 
-    def paint(self, painter):
+    def paint(self, painter, /):
         painter.rect(Rect(0, 0, self.bounds.width * min(1, self.value),
                           self.bounds.height), "#127c6a", radius=8)
         painter.text(self.caption, 12, 8, color="#ffffff", size=16,
@@ -585,7 +594,11 @@ class Meter(Control):
 ```
 
 Changing `caption` invalidates this meter's preferred size and painting;
-changing `value` only repaints. The complete
+changing `value` only repaints. `measure`, `paint`, and `handle_input` take
+`Host`, `Painter`, and `Input`. A property hook still receives every field as
+`object`; after matching the name, `expect_number`, `expect_text`, and
+`expect_flag` from `pysual.schema` narrow it. The schema has already rejected
+a value of the wrong kind. The complete
 [custom control example](../examples/custom_control.py) connects the meter to a
 slider.
 

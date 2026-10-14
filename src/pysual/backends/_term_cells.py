@@ -9,6 +9,7 @@ grapheme boundaries use the separately pinned Unicode 17.0 data.
 """
 
 from bisect import bisect_right
+from collections.abc import Iterator
 from dataclasses import dataclass
 from functools import lru_cache
 from itertools import pairwise
@@ -17,15 +18,25 @@ from typing import TYPE_CHECKING
 
 from ..geometry import Rect
 from ..graphemes import boundaries
-from ..host import CapabilityError
 from .._terminal_data import COMBINING, CONTROL, FLAGS, STARTS, SURROGATE, WIDE
 from ._term_images import ImageCache, image_cells, luminance_glyph
 
 if TYPE_CHECKING:
-    from ..theme import Style
+    from ..theme import ResolvedStyle, Style
 
 RGB = tuple[int, int, int]
 RGBA = tuple[int, int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class Cell:
+    """One screen position; width zero belongs to the preceding wide glyph."""
+
+    text: str = " "
+    foreground: RGB = (255, 255, 255)
+    background: RGB = (0, 0, 0)
+    width: int = 1
+    underline: bool = False
 
 
 @dataclass(eq=False)
@@ -38,22 +49,11 @@ class _CellSurface:
     rows: int
     clip: tuple[int, int, int, int]
     revision: int
-    cells: list
+    cells: list[Cell]
     ink: bytearray
-    backdrop: list
+    backdrop: list[Cell]
     backdrop_ink: bytearray
     released: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class Cell:
-    """One screen position; width zero belongs to the preceding wide glyph."""
-
-    text: str = " "
-    foreground: RGB = (255, 255, 255)
-    background: RGB = (0, 0, 0)
-    width: int = 1
-    underline: bool = False
 
 
 @lru_cache(maxsize=512)
@@ -103,7 +103,7 @@ def safe_text(text: str) -> str:
     U+0000 is removed, as it is for native display text, so the characters
     after it stay visible. Other controls are dropped only for terminals.
     """
-    result = []
+    result: list[str] = []
     for character in text:
         flags = _character_flags(character)
         if flags & SURROGATE:
@@ -117,7 +117,7 @@ def safe_text(text: str) -> str:
 def _cluster_cell(cluster: str) -> tuple[str, int]:
     # A malicious combining sequence must not make one stored cell unbounded.
     cluster = cluster[:64]
-    bases = [
+    bases: list[str] = [
         character
         for character in cluster
         if not _character_flags(character) & COMBINING
@@ -144,7 +144,7 @@ def _cluster_cell(cluster: str) -> tuple[str, int]:
     return cluster, 2 if wide else 1
 
 
-def text_cells(text: str):
+def text_cells(text: str) -> Iterator[tuple[str, int]]:
     """Yield sanitized graphemes and widths, with newline/tab sentinels."""
     cleaned = safe_text(text)
     offsets = boundaries(cleaned)
@@ -200,14 +200,22 @@ class CellRenderer:
             raise ValueError("Cell counts must be integers")
         self.cell_width, self.cell_height = float(cell_width), float(cell_height)
         self.monochrome = monochrome
-        self._images = ImageCache()
+        self._images: ImageCache = ImageCache()
         self.resource_revision = 0
         self._background: RGB = (0, 0, 0)
         self._origin_col = 0
         self._origin_row = 0
-        self._target = None
-        self._surfaces: set = set()
-        self._saved_surface = None
+        self._target: _CellSurface | None = None
+        self._surfaces: set[_CellSurface] = set()
+        self._saved_surface: tuple[
+            list[Cell],
+            bytearray,
+            int,
+            int,
+            tuple[int, int, int, int],
+            int,
+            int,
+        ] | None = None
         self.resize(columns * cell_width, rows * cell_height)
 
     def resize(self, width: float, height: float, scale: float = 1) -> None:
@@ -422,8 +430,15 @@ class CellRenderer:
             self._border(box, _color(border), radius=radius)
 
     def _border(
-        self, box, first, last=None, *, axis="vertical", radius: float = 0, compact=False
-    ):
+        self,
+        box: tuple[int, int, int, int],
+        first: RGBA,
+        last: RGBA | None = None,
+        *,
+        axis: str = "vertical",
+        radius: float = 0,
+        compact: bool = False,
+    ) -> None:
         """Paint each perimeter cell once; overlaid outlines are not junctions."""
         left, top, right, bottom = self._bounds(box)
         x1, y1, x2, y2 = box[0], box[1], box[2] - 1, box[3] - 1
@@ -431,7 +446,7 @@ class CellRenderer:
             return
         corners = "╭╮╰╯" if radius > 0 else "┌┐└┘"
 
-        def put(x, y, glyph):
+        def put(x: int, y: int, glyph: str) -> None:
             amount = (
                 (x - x1) / max(1, x2 - x1)
                 if axis == "horizontal"
@@ -466,7 +481,14 @@ class CellRenderer:
             for x, y, glyph in zip((x1, x2, x1, x2), (y1, y1, y2, y2), corners):
                 put(x, y, glyph)
 
-    def marker(self, rect: Rect, style: "Style", *, shape="square", checked=False):
+    def marker(
+        self,
+        rect: Rect,
+        style: "Style | ResolvedStyle",
+        *,
+        shape: str = "square",
+        checked: bool = False,
+    ) -> bool:
         """Lower an explicit control marker to one cell, independently of old ink."""
         if shape not in ("square", "circle"):
             raise ValueError("Marker shape must be square or circle")
@@ -498,7 +520,7 @@ class CellRenderer:
             self._put(column, row, glyph, 1, color, text_ink=True)
         return True
 
-    def styled_rect(self, rect: Rect, style: "Style") -> bool:
+    def styled_rect(self, rect: Rect, style: "Style | ResolvedStyle") -> bool:
         """Resolve a themed surface once, at the terminal's actual resolution.
 
         Pixel halos, bevels, scanlines and inner borders cannot occupy separate
@@ -641,7 +663,7 @@ class CellRenderer:
         self._put(column, row, glyph, 1, color)
 
     def focus_ring(
-        self, rect: Rect, color: str, radius: float = 0, *, monochrome=False
+        self, rect: Rect, color: str, radius: float = 0, *, monochrome: bool = False
     ) -> None:
         box = self._box(rect)
         self._border(box, _color(color), radius=radius, compact=True)
@@ -793,7 +815,13 @@ class CellRenderer:
         return True
 
     def image(
-        self, source: str, rect: Rect, *, tint: str = "#ffffff", fit: str = "stretch", _edges=None
+        self,
+        source: str,
+        rect: Rect,
+        *,
+        tint: str = "#ffffff",
+        fit: str = "stretch",
+        _edges: tuple[int, int, int, int] | None = None,
     ) -> None:
         bounds = self._bounds(self._box(rect))
         if bounds[0] >= bounds[2] or bounds[1] >= bounds[3]:
@@ -844,11 +872,18 @@ class CellRenderer:
             self._clip = previous
 
     def image_nine(
-        self, source: str, rect: Rect, edges, *, tint: str = "#ffffff"
+        self,
+        source: str,
+        rect: Rect,
+        edges: tuple[int, int, int, int],
+        *,
+        tint: str = "#ffffff",
     ) -> None:
         self.image(source, rect, tint=tint, _edges=edges)
 
-    def _surface_bounds(self, rect: Rect):
+    def _surface_bounds(
+        self, rect: Rect
+    ) -> tuple[int, int, int, int, tuple[int, int, int, int]]:
         left, top, right, bottom = self._box(rect)
         left, top = max(0, min(self.columns, left)), max(0, min(self.rows, top))
         right, bottom = max(left, min(self.columns, right)), max(top, min(self.rows, bottom))

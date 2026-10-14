@@ -1,9 +1,10 @@
 """One transient, app-owned control subtree; no native popup implementation."""
 
-from typing import ClassVar
+from typing import Any, ClassVar
 from .controls import Container, Control
 from .errors import LifecycleError
 from .schema import Dirty, prop
+from .painting import Painter
 
 
 class Popup(Container):
@@ -12,18 +13,20 @@ class Popup(Container):
     visible: bool = prop(default=False, affects=Dirty.MEASURE | Dirty.HIT_TEST)
     _overlay: ClassVar[bool] = True
 
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
-        self._session = None
+        # Live Runtime. Its attributes are still unannotated, so naming that
+        # class here would mark every session access unknown.
+        self._session: Any = None
         self._owner: Control | None = None
-        self._previous_focus = None
-        self._point = None
+        self._previous_focus: Control | None = None
+        self._point: tuple[float, float] | None = None
 
     @property
     def is_open(self) -> bool:
         return self._session is not None
 
-    def contains(self, control) -> bool:
+    def contains(self, control: Control | None) -> bool:
         while control is not None:
             if control is self:
                 return True
@@ -62,7 +65,7 @@ class Popup(Container):
         runtime.router.set_focus(None)
         runtime.router._tab()
 
-    def reposition(self):
+    def reposition(self) -> None:
         runtime = self._session
         if runtime is None:
             return
@@ -80,13 +83,13 @@ class Popup(Container):
         self.left = max(area.x, min(x, area.right - width)) - area.x
         self.top = max(area.y, min(y, area.bottom - height)) - area.y
 
-    def _layout_size(self, width, height):
+    def _layout_size(self, width: float, height: float) -> tuple[float, float]:
         if self._session is not None:
             area = self._session.app.content_bounds(self._session.app.bounds)
             return min(area.width, width), min(area.height, height)
         return width, height
 
-    def reconcile(self):
+    def reconcile(self) -> None:
         if self._session is None:
             return
         assert self._owner is not None
@@ -102,7 +105,7 @@ class Popup(Container):
         ):
             self.dismiss()
 
-    def paint(self, painter, /):
+    def paint(self, painter: Painter, /) -> None:
         painter.body()
 
     def dismiss(self, *, restore_focus: bool = True) -> None:

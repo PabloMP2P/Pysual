@@ -1,22 +1,32 @@
 """Shared viewport metrics, scrollbar drawing and pointer gestures."""
 
+from __future__ import annotations
+
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from .geometry import Rect
+from .host import Input
+
+if TYPE_CHECKING:
+    from .painting import Painter
 
 SCROLLBAR_SIZE = 12
 
 
-def clamp_scroll(offset, total, viewport):
+def clamp_scroll(offset: float, total: float, viewport: float) -> float:
     return max(0, min(offset, max(0, total - viewport)))
 
 
-def can_scroll(offset, limit, delta):
+def can_scroll(offset: float, limit: float, delta: float) -> bool:
     """Accept fractions while there is overflow in the requested direction."""
     return (delta < 0 and offset > 0) or (delta > 0 and offset < limit)
 
 
-def thumb_metrics(length, total, viewport, offset, minimum=20):
+def thumb_metrics(
+    length: float, total: float, viewport: float, offset: float, minimum: float = 20,
+) -> tuple[float, float] | None:
     """Return (track-relative start, size), or None when scrolling is unnecessary."""
     if length <= 0 or total <= viewport or viewport <= 0:
         return None
@@ -26,8 +36,14 @@ def thumb_metrics(length, total, viewport, offset, minimum=20):
 
 
 def scroll_from_thumb(
-    point, track_start, track_length, thumb_length, grab_offset, total, viewport
-):
+    point: float,
+    track_start: float,
+    track_length: float,
+    thumb_length: float,
+    grab_offset: float,
+    total: float,
+    viewport: float,
+) -> float:
     """Map an absolute pointer position to a bounded content offset."""
     travel = track_length - thumb_length
     if travel <= 0:
@@ -39,7 +55,7 @@ def scroll_from_thumb(
     )
 
 
-def typeahead_prefix(prefix, last_at, key, now):
+def typeahead_prefix(prefix: str, last_at: float, key: str, now: float) -> tuple[str, str]:
     """Keep a short search prefix; repeated letters cycle matches."""
     stored = (prefix if now - last_at < 0.75 else "") + key.casefold()
     return stored, key.casefold() if len(set(stored)) == 1 else stored
@@ -54,12 +70,14 @@ class Scrollbar:
     viewport: float
     offset: float
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[int | Rect]:
         # Keep the existing ScrollArea geometry inspection shape.
         return iter((self.axis, self.track, self.thumb))
 
 
-def scrollbar(track, total, viewport, offset, axis=1):
+def scrollbar(
+    track: Rect, total: float, viewport: float, offset: float, axis: int = 1,
+) -> Scrollbar | None:
     metrics = thumb_metrics(track.width if axis == 0 else track.height,
                             total, viewport, offset)
     if metrics is None or track.width <= 0 or track.height <= 0:
@@ -70,7 +88,11 @@ def scrollbar(track, total, viewport, offset, axis=1):
     return Scrollbar(axis, track, thumb, total, viewport, offset)
 
 
-def handle_scrollbars(event, bars, drag):
+def handle_scrollbars(
+    event: Input,
+    bars: Iterable[Scrollbar],
+    drag: tuple[int, int, float] | None,
+) -> tuple[bool, tuple[int, int, float] | None, dict[int, float]]:
     """Return handled, (pointer, axis, grab) capture, and changed axis offsets.
 
     Tracks page once on primary press; thumbs retain the original grab offset.
@@ -110,7 +132,7 @@ def handle_scrollbars(event, bars, drag):
     return False, drag, {}
 
 
-def paint_scrollbars(painter, bars):
+def paint_scrollbars(painter: Painter, bars: Iterable[Scrollbar]) -> None:
     """Paint the same themed track and thumb in each control's local coordinates."""
     for bar in bars:
         for box, part in ((bar.track, "track"), (bar.thumb, "thumb")):

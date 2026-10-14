@@ -1,33 +1,48 @@
 """A reusable range field with synchronous child coordination and public events."""
 
-from typing import ClassVar
+from typing import ClassVar, Literal
 
-from pysual import App, ChangeEvent, Container, Event, Label, NumericInput, Slider, prop
+from pysual import (
+    App, ChangeEvent, Container, Dirty, Event, Label, NumericInput, Slider, prop,
+)
+from pysual.schema import Field, expect_number, expect_text
 
 
-class _RangeValue:
-    """Coordinate child values before queued application handlers run."""
+def _reject_child_value(control: Slider | NumericInput, name: str, value: object) -> None:
+    """Reject a child edit before that child commits or emits a change."""
+    owner = control._parent
+    if name == "value" and isinstance(owner, RangeField) and not owner._syncing:
+        owner._validate_candidate({"value": value})
 
-    def _validate_live_update(self, name, value):
+
+def _publish_child_value(control: Slider | NumericInput, field: Field, value: object) -> None:
+    owner = control._parent
+    if field.name == "value" and isinstance(owner, RangeField) and not owner._syncing:
+        owner._accept_value(expect_number(value), control._origin)
+
+
+class _RangeSlider(Slider):
+    """Coordinate with the owning range before queued handlers run."""
+
+    def _validate_live_update(self, name: str, value: object) -> None:
         super()._validate_live_update(name, value)
-        owner = self._parent
-        if name == "value" and isinstance(owner, RangeField) and not owner._syncing:
-            # Reject the edit before the child commits or emits a change.
-            owner._validate_candidate({"value": value})
+        _reject_child_value(self, name, value)
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         super()._changed(field, old, value)
-        owner = self._parent
-        if field.name == "value" and isinstance(owner, RangeField) and not owner._syncing:
-            owner._accept_value(value, self._origin)
+        _publish_child_value(self, field, value)
 
 
-class _RangeSlider(_RangeValue, Slider):
-    pass
+class _RangeNumber(NumericInput):
+    """Coordinate with the owning range before queued handlers run."""
 
+    def _validate_live_update(self, name: str, value: object) -> None:
+        super()._validate_live_update(name, value)
+        _reject_child_value(self, name, value)
 
-class _RangeNumber(_RangeValue, NumericInput):
-    pass
+    def _changed(self, field: Field, old: object, value: object) -> None:
+        super()._changed(field, old, value)
+        _publish_child_value(self, field, value)
 
 
 class RangeField(Container):
@@ -36,9 +51,15 @@ class RangeField(Container):
     caption: str = prop(default="Level")
     value: float = prop(default=0.0, minimum=0, changed="changed")
     changed: ClassVar[Event[ChangeEvent[float]]] = Event(ChangeEvent)
+    layout: Literal["absolute", "stack", "grid", "flow", "dock"] = prop(
+        default="stack", affects=Dirty.MEASURE,
+    )
+    direction: Literal["vertical", "horizontal"] = prop(
+        default="horizontal", affects=Dirty.MEASURE,
+    )
 
-    def __init__(self, **properties):
-        super().__init__(**{"layout": "stack", "direction": "horizontal", **properties})
+    def _initialize(self) -> None:
+        super()._initialize()
         self._syncing = False
         # Each RangeField owns its children, so instances can repeat the same
         # child names without sharing controls or coordination state.
@@ -47,15 +68,16 @@ class RangeField(Container):
         self.number = _RangeNumber(value=self.value, minimum=0, maximum=100,
                                    decimals=0, width=150)
 
-    def _validate_update(self, name, value):
+    def _validate_update(self, name: str, value: object) -> None:
         super()._validate_update(name, value)
-        if name == "value" and value > 100:
+        if name == "value" and expect_number(value) > 100:
             raise ValueError("RangeField value must be between 0 and 100")
 
-    def _changed(self, field, old, value):
+    def _changed(self, field: Field, old: object, value: object) -> None:
         if field.name == "caption":
-            self.heading.text = value
+            self.heading.text = expect_text(value)
         elif field.name == "value":
+            value = expect_number(value)
             self._syncing = True
             try:
                 self.update_children({self.track: {"value": value},
@@ -64,7 +86,9 @@ class RangeField(Container):
                 self._syncing = False
         super()._changed(field, old, value)
 
-    def _accept_value(self, value, origin):
+    def _accept_value(
+        self, value: int | float, origin: Literal["user", "program", "system"]
+    ) -> None:
         previous = self._origin
         self._origin = origin
         try:
@@ -95,7 +119,7 @@ class Demo(App):
 
 
 if __name__ == "__main__":
-    from pysual import autoconfig
+    from pysual import autoconfig as autoconfig
     from argparse import ArgumentParser
 
     ArgumentParser(description=__doc__).parse_args()

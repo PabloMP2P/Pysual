@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, fields, is_dataclass, replace
 from difflib import get_close_matches
 from enum import IntFlag, auto
 from functools import lru_cache
 from math import isfinite
+import sys
 from types import MappingProxyType, UnionType
 from typing import (
     Any,
@@ -15,13 +16,19 @@ from typing import (
     Literal,
     Mapping,
     Union,
+    TypeVar,
+    cast,
     dataclass_transform,
     get_args,
     get_origin,
     get_type_hints,
 )
 
+if sys.version_info >= (3, 14):
+    from annotationlib import Format, get_annotations
+
 from .errors import LifecycleError, SchemaError
+from ._value_bag import _ValueBag, _replaced_bag
 from ._engine import (
     call,
     check_origin,
@@ -47,7 +54,11 @@ _RECORD_NAMES = frozenset(
 )
 
 
-def _persist_record(cls):
+_Record = TypeVar("_Record", bound=type)
+_Self = TypeVar("_Self", bound="SchemaObject")
+
+
+def _persist_record(cls: _Record) -> _Record:
     """Opt in only the five built-in data records; JSON never loads a class."""
     if f"{cls.__module__}.{cls.__qualname__}" not in _RECORD_NAMES:
         raise SchemaError("Only built-in control data has a record codec")
@@ -56,22 +67,22 @@ def _persist_record(cls):
 
 
 @lru_cache(maxsize=5)
-def _record_annotations(cls):
+def _record_annotations(cls: type) -> dict[str, Any]:
     # Resolve recursive TreeNode annotations after its module has been loaded.
     return get_type_hints(cls)
 
 
-def _has_record(annotation):
+def _has_record(annotation: Any) -> bool:
     return annotation in _PERSISTENT_RECORDS or any(
         _has_record(arg) for arg in get_args(annotation) if arg is not Ellipsis
     )
 
 
-def _record_data(value, annotation, *, decode):
+def _record_data(value: Any, annotation: Any, *, decode: bool) -> Any:
     """Bounded, schema-directed JSON records with ordinary constructor validation."""
     visited = 0
 
-    def convert(value, annotation, depth=0):
+    def convert(value: Any, annotation: Any, depth: int = 0) -> Any:
         nonlocal visited
         if depth > 24 or visited >= _MAX_RECORD_VALUES:
             raise ValueError(
@@ -92,23 +103,27 @@ def _record_data(value, annotation, *, decode):
         if origin is tuple:
             if not isinstance(value, list if decode else tuple):
                 raise TypeError("Control data collections must be JSON arrays")
+            sequence = cast(Sequence[Any], value)
             repeated = len(args) == 2 and args[1] is Ellipsis
-            if not repeated and len(value) != len(args):
+            if not repeated and len(sequence) != len(args):
                 raise ValueError("Control data tuple has the wrong number of values")
             items = [
                 convert(item, args[0] if repeated else args[index], depth + 1)
-                for index, item in enumerate(value)
+                for index, item in enumerate(sequence)
             ]
             return tuple(items) if decode else items
         if annotation in _PERSISTENT_RECORDS:
             annotations = _record_annotations(annotation)
             if decode:
-                if not isinstance(value, dict) or value.keys() - annotations.keys():
+                if not isinstance(value, dict):
+                    raise ValueError(f"Expected {annotation.__name__} fields only")
+                record = cast(dict[Any, Any], value)
+                if record.keys() - annotations.keys():
                     raise ValueError(f"Expected {annotation.__name__} fields only")
                 return annotation(
                     **{
                         name: convert(item, annotations[name], depth + 1)
-                        for name, item in value.items()
+                        for name, item in record.items()
                     }
                 )
             if type(value) is not annotation:
@@ -144,8 +159,126 @@ _VISUAL_MASK = int(Dirty.MEASURE | Dirty.ARRANGE | Dirty.PAINT)
 _HIT_MASK = int(Dirty.HIT_TEST)
 
 
-def _mask(affects) -> int:
+def _mask(affects: Dirty | int) -> int:
     return int(affects)
+
+
+def _dynamic_properties(properties: Mapping[str, Any]) -> Any:
+    """Forward a property bag into a constructor the schema validates at runtime.
+
+    Static constructors list every field. A dict built from ``_values`` or from
+    ``**properties: object`` cannot name those fields ahead of time, so this
+    returns ``Any``. Names are checked here; the constructor checks values.
+    """
+    if any(not isinstance(name, str) for name in properties):
+        raise TypeError("Property names must be strings")
+    return properties
+
+
+def expect_flag(value: object) -> bool:
+    """Return a schema bool.
+
+    Other truthy values are rejected. On the public property path the schema
+    has already checked the field; a hook uses this so the checker sees ``bool``.
+    """
+    if not isinstance(value, bool):
+        raise TypeError("Expected a bool")
+    return value
+
+
+def expect_number(value: object) -> int | float:
+    """Return a schema number.
+
+    Integers are accepted for float fields. ``bool`` is not a number. On the
+    public property path the schema has already checked the field; a hook uses
+    this so the checker sees ``int | float``.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("Expected a number")
+    return value
+
+
+def expect_text(value: object) -> str:
+    """Return schema text.
+
+    On the public property path the schema has already checked the field; a
+    hook uses this so the checker sees ``str``.
+    """
+    if not isinstance(value, str):
+        raise TypeError("Expected text")
+    return value
+
+
+class _Pending:
+    """Committed properties plus one uncommitted replacement.
+
+    The view reads the existing bag and overlays the field under test. It does
+    not copy the bag: construction validates every field, and a copy per field
+    dominated scene build.
+    """
+
+    __slots__ = ("_base", "_name", "_replacement")
+
+    def __init__(self, values: Mapping[str, object], name: str, value: object) -> None:
+        self._base = values
+        self._name = name
+        self._replacement = value
+
+    def _get(self, name: str) -> object:
+        if name == self._name:
+            return self._replacement
+        return self._base[name]
+
+    def number(self, name: str) -> int | float:
+        return expect_number(self._get(name))
+
+    def optional_number(self, name: str) -> int | float | None:
+        value = self._get(name)
+        if value is None:
+            return None
+        return expect_number(value)
+
+    def text(self, name: str) -> str:
+        return expect_text(self._get(name))
+
+    def flag(self, name: str) -> bool:
+        return expect_flag(self._get(name))
+
+    def number_pair(self, name: str) -> tuple[int | float, int | float]:
+        value = self._get(name)
+        if not isinstance(value, tuple):
+            raise TypeError(f"{name} must be a pair of numbers")
+        pair = cast(tuple[object, ...], value)
+        if len(pair) != 2:
+            raise TypeError(f"{name} must be a pair of numbers")
+        return expect_number(pair[0]), expect_number(pair[1])
+
+    def texts(self, name: str) -> tuple[str, ...]:
+        value = self._get(name)
+        if not isinstance(value, tuple):
+            raise TypeError(f"{name} must be a tuple of text")
+        items = cast(tuple[object, ...], value)
+        if any(not isinstance(item, str) for item in items):
+            raise TypeError(f"{name} must be a tuple of text")
+        return cast(tuple[str, ...], items)
+
+
+_T = TypeVar("_T")
+
+
+def _records(value: object, kind: type[_T]) -> tuple[_T, ...]:
+    if not isinstance(value, tuple):
+        raise TypeError(f"Expected {kind.__name__} records")
+    items = cast(tuple[object, ...], value)
+    if any(not isinstance(item, kind) for item in items):
+        raise TypeError(f"Expected {kind.__name__} records")
+    return cast(tuple[_T, ...], items)
+
+
+def _sequence(value: object) -> tuple[object, ...]:
+    if not isinstance(value, tuple):
+        raise TypeError("Expected a tuple")
+    return cast(tuple[object, ...], value)
 
 
 def unknown_name(name: str, choices: Iterable[str]) -> str:
@@ -161,7 +294,7 @@ class Property:
     affects: Dirty = Dirty.PAINT
     minimum: float | None = None
     doc: str = ""
-    choices: tuple = ()
+    choices: tuple[Any, ...] = ()
     changed: str | None = None
     persist: bool = True
 
@@ -172,7 +305,7 @@ def prop(
     affects: Dirty = Dirty.PAINT,
     minimum: float | None = None,
     doc: str = "",
-    choices: tuple = (),
+    choices: tuple[Any, ...] = (),
     changed: str | None = None,
     persist: bool = True,
 ) -> Any:
@@ -187,11 +320,11 @@ def _init_argument(
     return default
 
 
-def _immutable(value):
+def _immutable(value: object) -> bool:
     if value is None or type(value) in (str, bool, int, float):
         return True
     if isinstance(value, tuple):
-        return all(_immutable(v) for v in value)
+        return all(_immutable(item) for item in cast(tuple[object, ...], value))
     if (
         is_dataclass(value)
         and not isinstance(value, type)
@@ -201,19 +334,23 @@ def _immutable(value):
     return False
 
 
-def valid_type(value, annotation):
+def valid_type(value: object, annotation: Any) -> bool:
     if type(value) is float and not isfinite(value):
         raise ValueError("Property numbers must be finite")
     origin, args = get_origin(annotation), get_args(annotation)
     if origin in (Union, UnionType):
         return any(valid_type(value, t) for t in args)
+    if origin is Literal:
+        # bool and int compare equal in Python, but describe distinct choices.
+        return any(type(value) is type(choice) and value == choice for choice in args)
     if origin is tuple:
         if not isinstance(value, tuple):
             return False
+        items = cast(tuple[object, ...], value)
         if len(args) == 2 and args[1] is Ellipsis:
-            return all(valid_type(v, args[0]) for v in value)
-        return len(args) == len(value) and all(
-            valid_type(v, t) for v, t in zip(value, args)
+            return all(valid_type(item, args[0]) for item in items)
+        return len(args) == len(items) and all(
+            valid_type(item, kind) for item, kind in zip(items, args)
         )
     if annotation in (str, bool, int, float, type(None)):
         return type(value) is annotation or (annotation is float and type(value) is int)
@@ -236,10 +373,15 @@ class Field:
 
     @property
     def serializable(self) -> bool:
-        def supported(annotation):
+        def supported(annotation: Any) -> bool:
             return (
                 annotation in _PERSISTENT_RECORDS
                 or annotation in (str, bool, int, float, type(None))
+                or (
+                    get_origin(annotation) is Literal
+                    and all(type(value) in (str, bool, int, type(None))
+                            for value in get_args(annotation))
+                )
                 or (
                     get_origin(annotation) in (tuple, Union, UnionType)
                     and all(t is Ellipsis or supported(t) for t in get_args(annotation))
@@ -248,7 +390,7 @@ class Field:
 
         return self.definition.persist and supported(self.annotation)
 
-    def encode(self, value):
+    def encode(self, value: object) -> object:
         """Encode only supported immutable JSON values, never arbitrary objects."""
         if not self.serializable:
             raise ValueError(f"{self.name} does not have a persistence codec")
@@ -258,12 +400,14 @@ class Field:
             return result
         self.validate(value)
 
-        def convert(v):
-            return [convert(x) for x in v] if isinstance(v, tuple) else v
+        def convert(item: object) -> object:
+            if not isinstance(item, tuple):
+                return item
+            return [convert(child) for child in cast(tuple[object, ...], item)]
 
         return convert(value)
 
-    def decode(self, value):
+    def decode(self, value: object) -> object:
         if not self.serializable:
             raise ValueError(f"{self.name} does not have a persistence codec")
         if _has_record(self.annotation):
@@ -271,8 +415,10 @@ class Field:
             self.validate(result)
             return result
 
-        def convert(v):
-            return tuple(convert(x) for x in v) if isinstance(v, list) else v
+        def convert(item: object) -> object:
+            if not isinstance(item, list):
+                return item
+            return tuple(convert(child) for child in cast(list[object], item))
 
         result = convert(value)
         self.validate(result)
@@ -291,45 +437,64 @@ class Field:
             and len(args) == 2
             and args[1] is Ellipsis
         ):
+            current = cast(tuple[object, ...], value)
+            prior = cast(tuple[object, ...], previous)
             valid = all(
-                (i < len(previous) and item is previous[i]) or valid_type(item, args[0])
-                for i, item in enumerate(value)
+                (i < len(prior) and item is prior[i]) or valid_type(item, args[0])
+                for i, item in enumerate(current)
             )
         else:
-            valid = valid_type(value, self.annotation)
+            valid = valid_type(cast(object, value), self.annotation)
+        subject = cast(object, value)
         if not valid:
             raise TypeError(
-                f"{self.name}: expected {self.annotation!r}, got {type(value).__name__}"
+                f"{self.name}: expected {self.annotation!r}, got {type(subject).__name__}"
             )
-        if self.definition.choices and value not in self.definition.choices:
+        if self.definition.choices and subject not in self.definition.choices:
             raise ValueError(f"{self.name}: expected one of {self.definition.choices}")
-        if self.definition.minimum is not None and value is not None:
-            if type(value) not in (int, float):
+        if self.definition.minimum is not None and subject is not None:
+            # bool is an int subclass; type() keeps it out of numeric fields.
+            if type(subject) is int or type(subject) is float:
+                if subject < self.definition.minimum:
+                    raise ValueError(
+                        f"{self.name}: value must be >= {self.definition.minimum}"
+                    )
+            else:
                 raise SchemaError(f"{self.name}: minimum requires a numeric property")
-            if value < self.definition.minimum:  # type: ignore[operator]
-                raise ValueError(
-                    f"{self.name}: value must be >= {self.definition.minimum}"
-                )
 
 
-def _declared_field(name, annotation, definition):
-    """Lower finite typing choices to the existing runtime schema contract.
-
-    Keeping primitive runtime annotations preserves persistence, inherited
-    declarations and the scalar access path. Literal is the sole choice list.
-    Legacy primitive annotations with explicit choices remain supported.
-    """
+def _literal_choices(annotation: Any) -> tuple[Any, ...]:
+    """Validate choice declarations even inside empty tuples or optional fields."""
     if get_origin(annotation) is Literal:
         choices = get_args(annotation)
-        kinds = tuple(dict.fromkeys(type(choice) for choice in choices))
+        kinds = {cast(type[Any], type(item)) for item in choices}
         if (
             not kinds
             or any(kind not in (str, int, bool, type(None)) for kind in kinds)
             or (bool in kinds and int in kinds)
         ):
             raise SchemaError("Literal properties require str, int, bool or None choices; do not mix bool and int")
+        return choices
+    for argument in get_args(annotation):
+        if argument is not Ellipsis:
+            _literal_choices(argument)
+    return ()
+
+
+def _declared_field(name: str, annotation: Any, definition: Property) -> Field:
+    """Lower top-level choices while retaining nested Literal constraints.
+
+    Keeping primitive runtime annotations preserves persistence, inherited
+    declarations and the scalar access path. Literal is the sole choice list.
+    Legacy primitive annotations with explicit choices remain supported.
+    """
+    choices = _literal_choices(annotation)
+    if choices:
         if definition.choices:
             raise SchemaError("Declare Literal choices in the annotation, not choices=")
+        kinds: tuple[type[Any], ...] = tuple(
+            dict.fromkeys(cast(type[Any], type(item)) for item in choices)
+        )
         annotation = kinds[0]
         for kind in kinds[1:]:
             annotation = annotation | kind
@@ -337,7 +502,7 @@ def _declared_field(name, annotation, definition):
     return Field(name, annotation, definition)
 
 
-def _plain_live(obj) -> bool:
+def _plain_live(obj: SchemaObject) -> bool:
     """Decide whether a worker thread may read a committed value directly.
 
     Property values are immutable and `_values` is only replaced or updated by
@@ -360,7 +525,7 @@ def _plain_live(obj) -> bool:
 
 
 class _Slot:
-    def __init__(self, field: Field):
+    def __init__(self, field: Field) -> None:
         self.field = field
 
     @ui_operation
@@ -395,6 +560,9 @@ class _Slot:
 )
 class SchemaObject:
     _schema: ClassVar[Mapping[str, Field]] = MappingProxyType({})
+    # Heterogeneous committed properties. The bag's stub types known keys, and
+    # reads use dict's own lookup rather than a cast on every access.
+    _values: _ValueBag
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
@@ -405,10 +573,28 @@ class SchemaObject:
                     raise SchemaError(f"Conflicting inherited field {name!r}")
                 fields[name] = field
         declarations = {k: v for k, v in vars(cls).items() if isinstance(v, Property)}
-        annotations = get_type_hints(cls)
-        for name, definition in declarations.items():
-            if name.startswith("_") or name not in cls.__annotations__:
+        if sys.version_info >= (3, 14):
+            # Native deferred annotations may contain names deliberately absent
+            # at runtime. Keep those as forward refs until fields are selected.
+            own_annotations = get_annotations(cls, format=Format.FORWARDREF)
+        else:
+            own_annotations = cls.__annotations__
+        for name in declarations:
+            if name.startswith("_") or name not in own_annotations:
                 raise SchemaError(f"Property {name!r} needs a public annotated name")
+        # Runtime schema resolution concerns only this class's declarations.
+        # Unrelated state annotations may refer to types that are not imported
+        # at runtime; inherited fields already carry resolved annotations.
+        annotations: dict[str, Any] = {}
+        if declarations:
+            declared = type("_PropertyAnnotations", (), {
+                "__module__": cls.__module__,
+                "__annotations__": {
+                    name: own_annotations[name] for name in declarations
+                },
+            })
+            annotations = get_type_hints(declared, localns=dict(vars(cls)))
+        for name, definition in declarations.items():
             if name not in fields and any(name in vars(b) for b in cls.__mro__[1:]):
                 raise SchemaError(f"Property {name!r} collides with a framework member")
             field = _declared_field(name, annotations[name], definition)
@@ -418,7 +604,7 @@ class SchemaObject:
             fields[name] = field
             setattr(cls, name, _Slot(field))
         for name in fields.keys() - declarations.keys():
-            if name in vars(cls) or name in vars(cls).get("__annotations__", {}):
+            if name in vars(cls) or name in own_annotations:
                 raise SchemaError(
                     f"Override {name!r} with prop(), not a plain attribute"
                 )
@@ -429,17 +615,16 @@ class SchemaObject:
         unknown = properties.keys() - self._schema.keys()
         if unknown:
             raise TypeError(unknown_name(sorted(unknown)[0], self._schema))
-        values = {
-            name: properties.get(name, field.definition.default)
-            for name, field in self._schema.items()
-        }
-        for name, value in values.items():
-            self._schema[name].validate(value)
-        self._values = values
+        bag = _ValueBag()
+        for name, field in self._schema.items():
+            value = properties.get(name, field.definition.default)
+            field.validate(value)
+            bag[name] = value
+        self._values = bag
         self._dirty = 0
         self._disposed = False
         self._initialize()
-        for name, value in values.items():
+        for name, value in bag.items():
             self._validate_live_update(name, value)
             self._validate_update(name, value)
 
@@ -449,11 +634,19 @@ class SchemaObject:
     def _prepare_update(self, values: Mapping[str, object]) -> Mapping[str, object]:
         return values
 
-    def _validation_copy(self, values: Mapping[str, object]):
+    def _pending(self, name: str, value: object) -> _Pending:
+        """Read every field as it would be after assigning ``name``.
+
+        The returned view is not committed. Use it from ``_validate_update``
+        when a check spans more than the field being assigned.
+        """
+        return _Pending(self._values, name, value)
+
+    def _validation_copy(self: _Self, values: Mapping[str, object]) -> _Self:
         """Build an unmounted candidate view for the existing validation hook."""
         candidate = object.__new__(type(self))
         candidate.__dict__.update(self.__dict__)
-        candidate._values = {**self._values, **values}
+        candidate._values = _replaced_bag(self._values, values)
         return candidate
 
     def _validate_candidate(self, values: Mapping[str, object]) -> None:
@@ -485,7 +678,7 @@ class SchemaObject:
         `_changed` sees the complete values and retains normal dirty/event rules.
         """
         self._check_live()
-        changes = []
+        changes: list[tuple[Field, object, object]] = []
         for name, value in values.items():
             field = self._schema[name]
             old = self._values[name]
@@ -494,7 +687,7 @@ class SchemaObject:
                 changes.append((field, old, value))
         if not changes:
             return
-        self._values = {**self._values, **values}
+        self._values = _replaced_bag(self._values, values)
         for field, old, value in changes:
             self._record_dirty(field.definition.affects)
             self._changed(field, old, value)
@@ -503,18 +696,20 @@ class SchemaObject:
         """Record committed property dirt before overridable notifications."""
         self._dirty = int(self._dirty) | _mask(affects)
 
-    def _validate_live_update(self, name, value) -> None:
-        """Check identity/lifecycle restrictions against the committed object.
+    def _validate_live_update(self, name: str, value: object) -> None:
+        """Check identity and lifecycle limits against the committed object.
 
-        Unlike `_validate_update`, this hook never runs on a batch candidate.
-        Keep coordinated value invariants in `_validate_update` instead.
+        Unlike ``_validate_update``, this hook never runs on a batch candidate.
+        Keep coordinated value invariants in ``_validate_update`` instead.
+        ``value`` is ``object`` because one hook receives every property.
+        Narrow it with ``isinstance`` before using it.
         """
         pass
 
-    def _validate_update(self, name, value) -> None:
+    def _validate_update(self, name: str, value: object) -> None:
         pass
 
-    def _changed(self, field, old, value) -> None:
+    def _changed(self, field: Field, old: object, value: object) -> None:
         pass
 
     def _check_live(self) -> None:

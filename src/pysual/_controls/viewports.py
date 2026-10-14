@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
-from typing import ClassVar
-from ..controls import Container
+from collections.abc import Callable
+from typing import ClassVar, cast
+from ..controls import Container, Control
 from ..geometry import Rect
 from ..schema import Dirty, prop
-from .._scrolling import can_scroll, scrollbar, handle_scrollbars, paint_scrollbars
+from .._scrolling import (
+    Scrollbar, can_scroll, scrollbar, handle_scrollbars, paint_scrollbars,
+)
+from ..host import Input
+from ..painting import Painter
 
 
 class ScrollArea(Container):
@@ -16,30 +21,34 @@ class ScrollArea(Container):
     style_parts: ClassVar[tuple[str, ...]] = ("body", "track", "thumb")
     _contained_style_parts: ClassVar[frozenset[str]] = frozenset(("track", "thumb"))
 
-    def _initialize(self):
+    def _initialize(self) -> None:
         super()._initialize()
-        self._scroll_limits = (0.0, 0.0)
-        self._scroll_axes = (False, False)
-        self._scroll_drag = None
+        self._scroll_limits: tuple[float, float] = (0.0, 0.0)
+        self._scroll_axes: tuple[bool, bool] = (False, False)
+        self._scroll_drag: tuple[int, int, float] | None = None
 
-    def _paint_layout_key(self):
+    def _paint_layout_key(self) -> tuple[tuple[float, float], tuple[bool, bool]]:
         # Descendant layout determines scrollbar visibility and thumb size.
         return self._scroll_limits, self._scroll_axes
 
-    def content_bounds(self, bounds):
+    def content_bounds(self, bounds: Rect) -> Rect:
         area = super().content_bounds(bounds)
         horizontal, vertical = self._scroll_axes
         return Rect(area.x, area.y, max(0, area.width - 12 * vertical),
                     max(0, area.height - 12 * horizontal))
 
-    def arrange_children(self, area, measure):
+    def arrange_children(
+        self, area: Rect, measure: Callable[[Control], tuple[float, float]]
+    ) -> dict[Control, Rect] | None:
         base = super().content_bounds(self._rect)
-        axes = (False, False)
-        boxes = {}
+        axes: tuple[bool, bool] = (False, False)
+        boxes: dict[Control, Rect] = {}
         for _ in range(3):
             self._scroll_axes = axes
             area = self.content_bounds(self._rect)
-            boxes = self._arrange_declared(area, measure)
+            # Container._arrange_declared is still unannotated.
+            declared = getattr(self, "_arrange_declared")
+            boxes = cast(dict[Control, Rect], declared(area, measure))
             right = max((box.right for box in boxes.values()), default=area.right)
             bottom = max((box.bottom for box in boxes.values()), default=area.bottom)
             self._scroll_limits = max(0, right - area.right), max(0, bottom - area.bottom)
@@ -52,10 +61,10 @@ class ScrollArea(Container):
         self.scroll_y = min(self.scroll_y, self._scroll_limits[1])
         return boxes
 
-    def _scrollbars(self):
+    def _scrollbars(self) -> list[Scrollbar]:
         area = self.content_bounds(self._rect)
         base = super().content_bounds(self._rect)
-        bars = []
+        bars: list[Scrollbar] = []
         for axis, limit in enumerate(self._scroll_limits):
             if limit <= 0:
                 continue
@@ -70,7 +79,7 @@ class ScrollArea(Container):
                 bars.append(bar)
         return bars
 
-    def paint(self, p, /):
+    def paint(self, p: Painter, /) -> None:
         super().paint(p)
         paint_scrollbars(p, self._scrollbars())
 
@@ -78,7 +87,7 @@ class ScrollArea(Container):
         """Minimally expose descendant bounds in this area's content viewport."""
         area = self.content_bounds(self._rect)
 
-        def offset(start, end, low, high):
+        def offset(start: float, end: float, low: float, high: float) -> float:
             if high <= low or (start <= low and end >= high):
                 return 0
             if start < low:
@@ -109,7 +118,7 @@ class ScrollArea(Container):
             bounds.height,
         )
 
-    def scroll_input(self, e, /) -> bool:
+    def scroll_input(self, e: Input, /) -> bool:
         axis = 0 if e.shift else 1
         offset = self.scroll_x if e.shift else self.scroll_y
         if not can_scroll(offset, self._scroll_limits[axis], e.delta):
@@ -117,7 +126,7 @@ class ScrollArea(Container):
         self.handle_input(e)
         return True
 
-    def handle_input(self, e, /):
+    def handle_input(self, e: Input, /) -> bool | None:
         handled, self._scroll_drag, values = handle_scrollbars(
             e, self._scrollbars(), self._scroll_drag)
         for axis, value in values.items():

@@ -11,7 +11,7 @@ from .events import callback_label, source_label
 from .geometry import Rect
 from .painting import resolve_style
 from .schema import Dirty
-from .theme import Style
+from .theme import Style, style_instance
 
 if TYPE_CHECKING:
     from .controls import Control
@@ -92,10 +92,13 @@ def inspect_control(control: Control) -> ControlSnapshot:
         control.bounds,
         control._clip,
         control._paint_clip,
-        tuple((part, resolve_style(control, part)) for part in control.style_parts),
+        tuple(
+            (part, style_instance(resolve_style(control, part)))
+            for part in control.style_parts
+        ),
         handlers,
         tasks,
-        control._dirty,
+        Dirty(int(control._dirty)),
         control._paint_revision,
         getattr(control, "layout", None),
         control.visible,
