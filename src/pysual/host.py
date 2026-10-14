@@ -10,7 +10,7 @@ from .errors import PysualError
 from .geometry import Rect
 
 if TYPE_CHECKING:
-    from .theme import ResolvedStyle
+    from .theme import ResolvedStyle, Style
 
 
 class CapabilityError(PysualError):
@@ -165,7 +165,7 @@ class StyledRectHost(Protocol):
     """
 
     def styled_rect(
-        self, rect: Rect, style: "ResolvedStyle", *, effect_clip: Rect | None = None,
+        self, rect: Rect, style: "Style | ResolvedStyle", *, effect_clip: Rect | None = None,
     ) -> bool: ...
 
 
@@ -182,7 +182,7 @@ class MarkerHost(Protocol):
     """
 
     def marker(
-        self, rect: Rect, style: "ResolvedStyle", *,
+        self, rect: Rect, style: "Style | ResolvedStyle", *,
         shape: Literal["square", "circle"], checked: bool,
         effect_clip: Rect | None = None,
     ) -> bool: ...

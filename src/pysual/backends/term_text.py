@@ -22,7 +22,7 @@ from ._term_io import TerminalTransport
 from ._term_session import TerminalSession
 
 if TYPE_CHECKING:
-    from ..theme import ResolvedStyle
+    from ..theme import ResolvedStyle, Style
 
 _ANSI16 = (
     (0, 0, 0),
@@ -347,13 +347,13 @@ class TermTextHost(TerminalSession):
             rect, first, last, axis, radius, border_width
         )
 
-    def styled_rect(self, rect: Rect, style: "ResolvedStyle") -> bool:
+    def styled_rect(self, rect: Rect, style: "Style | ResolvedStyle") -> bool:
         return self._renderer.styled_rect(rect, style)
 
     def marker(
         self,
         rect: Rect,
-        style: "ResolvedStyle",
+        style: "Style | ResolvedStyle",
         *,
         shape: str = "square",
         checked: bool = False,

@@ -22,7 +22,7 @@ from .._terminal_data import COMBINING, CONTROL, FLAGS, STARTS, SURROGATE, WIDE
 from ._term_images import ImageCache, image_cells, luminance_glyph
 
 if TYPE_CHECKING:
-    from ..theme import ResolvedStyle
+    from ..theme import ResolvedStyle, Style
 
 RGB = tuple[int, int, int]
 RGBA = tuple[int, int, int, int]
@@ -484,7 +484,7 @@ class CellRenderer:
     def marker(
         self,
         rect: Rect,
-        style: "ResolvedStyle",
+        style: "Style | ResolvedStyle",
         *,
         shape: str = "square",
         checked: bool = False,
@@ -520,7 +520,7 @@ class CellRenderer:
             self._put(column, row, glyph, 1, color, text_ink=True)
         return True
 
-    def styled_rect(self, rect: Rect, style: "ResolvedStyle") -> bool:
+    def styled_rect(self, rect: Rect, style: "Style | ResolvedStyle") -> bool:
         """Resolve a themed surface once, at the terminal's actual resolution.
 
         Pixel halos, bevels, scanlines and inner borders cannot occupy separate

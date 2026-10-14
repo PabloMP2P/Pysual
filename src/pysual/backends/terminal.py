@@ -5,7 +5,7 @@ from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from ..geometry import Rect
 from ..host import CapabilityError
@@ -14,6 +14,9 @@ from ._term_io import TerminalTransport
 from ._term_session import TerminalSession, install_signal_restoration
 from .native import NativeTermTextHost
 from .term_text import TermTextHost
+
+if TYPE_CHECKING:
+    from ..host import Input, TextFile, Viewport
 
 
 class _NativeTerminal(Protocol):
@@ -79,6 +82,55 @@ class TerminalHost:
     backend = "terminal"
     text_row_height = 16
 
+    # These members are forwarded by __getattr__, not implemented by the wrapper.
+    # In particular, surface operations must remain absent on a native renderer
+    # that does not advertise render_surfaces. Keep declarations type-only so
+    # static consumers know the Host contract without changing capability probes.
+    if TYPE_CHECKING:
+        size: tuple[float, float]
+        viewport: Viewport
+
+        def poll(self) -> list[Input]: ...
+        def set_title(self, title: str) -> None: ...
+        def set_size(self, width: float, height: float) -> None: ...
+        def begin(self, background: str) -> None: ...
+        def rect(
+            self, rect: Rect, fill: str, radius: float = 0,
+            border: str = "", border_width: float = 1,
+        ) -> None: ...
+        def text(
+            self, text: str, x: float, y: float, color: str, size: float,
+            mono: bool = False,
+        ) -> None: ...
+        def measure(
+            self, text: str, size: float, mono: bool = False,
+        ) -> tuple[float, float]: ...
+        def line(
+            self, x1: float, y1: float, x2: float, y2: float,
+            color: str, width: float = 1,
+        ) -> None: ...
+        def image(
+            self, source: str, rect: Rect, *, tint: str = "#ffffff",
+            fit: Literal["stretch", "contain", "cover"] = "stretch",
+            _edges: tuple[int, int, int, int] | None = None,
+        ) -> None: ...
+        def surface_create(self, rect: Rect) -> object: ...
+        def surface_begin(self, surface: object) -> None: ...
+        def surface_end(self) -> None: ...
+        def surface_blit(self, surface: object) -> None: ...
+        def surface_release(self, surface: object) -> None: ...
+        def present(self) -> None: ...
+        def text_input(self, rect: Rect | None) -> None: ...
+        async def clipboard_read(self) -> str: ...
+        async def clipboard_write(self, text: str) -> None: ...
+        async def open_text_file(self) -> TextFile | None: ...
+        async def save_text_file(
+            self, text: str, suggested_name: str, location: str | None,
+        ) -> TextFile | None: ...
+        async def read_session(self, key: str) -> str | None: ...
+        async def write_session(self, key: str, text: str | None) -> None: ...
+        async def open_url(self, url: str) -> None: ...
+
     def __init__(
         self,
         *,
@@ -115,11 +167,13 @@ class TerminalHost:
         self._opened = False
         self._closed = False
 
-    def __getattr__(self, name: str) -> object:
+    def __getattr__(self, name: str) -> Any:
+        # Renderer-specific extensions remain dynamic, as on _SingleSurfaceHost.
+        # The declarations above keep the shared core API precisely checked.
         host = cast("dict[str, object]", self.__dict__).get("_host")
         if host is None:
             raise AttributeError(name)
-        return cast(object, getattr(host, name))
+        return getattr(host, name)
 
     @property
     def capabilities(self) -> frozenset[str]:
@@ -148,18 +202,6 @@ class TerminalHost:
         if host is None:
             raise AttributeError("clip")
         host.clip(rect)
-
-    def surface_blit(self, surface: object) -> None:
-        host = self._host
-        if isinstance(host, TermTextHost):
-            host.surface_blit(surface)
-            return
-        if host is None:
-            raise AttributeError("surface_blit")
-        method = getattr(host, "surface_blit", None)
-        if not callable(method):
-            raise AttributeError("surface_blit")
-        cast(Callable[[object], object], method)(surface)
 
     def set_wake_callback(self, callback: Callable[[], None] | None) -> None:
         self._wake = callback

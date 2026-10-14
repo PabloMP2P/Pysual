@@ -862,8 +862,13 @@ def arrange(root: Control, host: Host) -> None:
                 )
             place(x, b, children_clip, children_effect_clip)
 
-    viewport = Rect(0, 0, *host.size)
-    place(root, viewport, viewport, viewport)
+    try:
+        viewport = Rect(0, 0, *host.size)
+        place(root, viewport, viewport, viewport)
+    finally:
+        # The function recurses through its own closure cell. Clear that cell
+        # or this layout pass stays reachable until cyclic collection.
+        del place
     runtime = getattr(root._root(), "_runtime", None)
     router = getattr(runtime, "router", None)
     if router is not None:

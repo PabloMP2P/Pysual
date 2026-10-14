@@ -723,13 +723,15 @@ class Painter:
         return bool(icon.icon(name, self.bounds.x + x, self.bounds.y + y, size, color))
 
     def marker(
-        self, rect: Rect, style: ResolvedStyle, *,
+        self, rect: Rect, style: Style | ResolvedStyle, *,
         shape: Literal["square", "circle"] = "square", checked: bool = False,
     ) -> None:
         """Draw a choice indicator or thumb with an explicit shape and state.
 
         Cell hosts can use one glyph. Other hosts draw the themed surface plus a
         check or inner dot. Ordinary surfaces never imply marker semantics.
+        Partial styles are accepted; checked markers inherit the current text
+        color when their foreground is omitted.
         """
         if shape not in ("square", "circle"):
             raise ValueError("Marker shape must be square or circle")
@@ -737,10 +739,11 @@ class Painter:
             raise TypeError("Marker checked state must be a bool")
         if rect.width <= 0 or rect.height <= 0:
             return
-        face = style_instance(style)
-        if checked and face.foreground is None:
-            face = replace(face, foreground=self._text_style().foreground)
-        style = as_resolved(face)
+        face = style if isinstance(style, Style) else style_instance(style)
+        foreground = face.foreground
+        if checked and foreground is None:
+            foreground = self._text_style().foreground
+            face = replace(face, foreground=foreground)
         marker = optional_host(self.host, "marker")
         if marker is not None:
             absolute = Rect(
@@ -751,30 +754,29 @@ class Painter:
             clip = self._effect_clip if getattr(self.host, "native_retained", False) else None
             drawn = (
                 marker.marker(
-                    absolute, style, shape=shape, checked=checked, effect_clip=clip
+                    absolute, face, shape=shape, checked=checked, effect_clip=clip
                 )
                 if clip is not None
-                else marker.marker(absolute, style, shape=shape, checked=checked)
+                else marker.marker(absolute, face, shape=shape, checked=checked)
             )
             if drawn:
                 return
         diameter = min(rect.width, rect.height)
         self.surface(
             rect,
-            as_resolved(replace(style_instance(style), radius=diameter / 2))
-            if shape == "circle"
-            else style,
+            replace(face, radius=diameter / 2) if shape == "circle" else face,
         )
         if checked:
+            assert foreground is not None
             if shape == "square":
                 self.icon(
                     "check", rect.x + (rect.width - diameter) / 2,
                     rect.y + (rect.height - diameter) / 2,
-                    size=diameter, color=style.foreground,
+                    size=diameter, color=foreground,
                 )
             else:
                 self.rect(
-                    rect.inset(diameter * 0.3), style.foreground, radius=diameter * 0.2
+                    rect.inset(diameter * 0.3), foreground, radius=diameter * 0.2
                 )
 
     def focus_ring(self, color: str, radius: float = 0) -> None:
@@ -902,7 +904,7 @@ class Painter:
             self.host, absolute, first, last, axis, radius, border_width, self._clip
         )
 
-    def surface(self, rect: Rect, style: ResolvedStyle) -> None:
+    def surface(self, rect: Rect, style: Style | ResolvedStyle) -> None:
         """Paint a typed surface inside rect; also available to custom controls.
 
         Shadows and glow halos use declared effect bounds, clipped by the parent;
@@ -1292,7 +1294,12 @@ class RetainedPaintTree:
                     visit(child, inherited_changed)
             record.end_index = len(order)
 
-        visit(root)
+        try:
+            visit(root)
+        finally:
+            # The function recurses through its own closure cell. Clear that
+            # cell or this scratch tree stays reachable until cyclic collection.
+            del visit
         removed = [record.identity for control, record in previous.items() if control not in records]
         changed = order != self._order
         self._records, self._control_order, self._order, self._uncached_custom = records, controls, order, uncached
@@ -1543,7 +1550,12 @@ def _paint_tree(
             host.clip(c._clip)
             host.rect(c._rect.inset(2), "", 0, theme.tokens.accent, 3)
 
-    visit(root)
+    try:
+        visit(root)
+    finally:
+        # The function recurses through its own closure cell. Clear that cell
+        # or the paint traversal stays reachable until cyclic collection.
+        del visit
     if cache is not None:
         cache.finish_frame()
     host.clip(None)

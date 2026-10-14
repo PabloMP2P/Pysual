@@ -74,7 +74,9 @@ def delayed_helper(tmp_path, monkeypatch):
                 op = json.loads(exact(length))['op']
                 if op == 'frame' and args.mode == 'exit_frame':
                     raise SystemExit(8)
-                if op in ('open', 'measure', 'frame', 'slow_update'):
+                if op == 'slow_update':
+                    time.sleep(1.0)  # Far past the 30 ms post-startup deadline.
+                elif op in ('open', 'measure', 'frame'):
                     time.sleep(0.08)
                 if op == 'open' and args.mode == 'reject_open':
                     body = {'ok': False, 'error': 'startup refused'}
@@ -97,6 +99,19 @@ def delayed_helper(tmp_path, monkeypatch):
 
     start.ready_file = ready_file
     return start
+
+
+def test_reply_wait_ignores_a_wakeup_that_does_not_set_the_event():
+    client = NativeClient(executable=Path(sys.executable), timeout=0.05)
+    pending = {'event': threading.Event()}
+
+    def spurious(timeout=None):
+        return True
+
+    pending['event'].wait = spurious
+    started = time.monotonic()
+    assert client._await_reply(pending, 0.05) is False
+    assert time.monotonic() - started >= 0.04
 
 
 def test_slow_connection_open_measure_and_first_frame_complete(delayed_helper):

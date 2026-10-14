@@ -48,6 +48,35 @@ class TerminalSelectionTests(unittest.TestCase):
         self.assertEqual(host.renderer, "python")
         self.assertIsNone(host.fallback_reason)
 
+    def test_forwarded_members_follow_the_selected_renderer(self):
+        surfaces = (
+            "surface_create", "surface_begin", "surface_end", "surface_blit",
+            "surface_release",
+        )
+        host = terminal(renderer="python", hidden=True)
+        for name in ("size", "viewport", "begin", "rect", "present", "poll", *surfaces):
+            with self.subTest(state="unopened", member=name):
+                self.assertFalse(hasattr(host, name))
+        self.open(host)
+        for name in surfaces:
+            with self.subTest(state="python", member=name):
+                self.assertTrue(callable(getattr(host, name)))
+        self.assertIn("render_surfaces", host.capabilities)
+        self.assertFalse(hasattr(host, "native_stats"))
+        self.assertFalse(hasattr(host, "measure_many"))
+
+        # Use the real native adapter without opening a helper process. Its
+        # optional API differs from the Python renderer even on headless hosts.
+        native = terminal(renderer="c", hidden=True)
+        with patch("pysual.backends.native.NativeTermTextHost.open"):
+            self.open(native)
+        self.assertTrue(callable(native.native_stats))
+        self.assertTrue(callable(native.measure_many))
+        self.assertNotIn("render_surfaces", native.capabilities)
+        for name in surfaces:
+            with self.subTest(state="native", member=name):
+                self.assertFalse(hasattr(native, name))
+
     def test_auto_falls_back_when_helper_is_missing_and_explains_why(self):
         missing = Path(__file__).resolve().parent / "absent" / uuid4().hex
         host = self.open(terminal(renderer="auto", hidden=True, executable=missing))

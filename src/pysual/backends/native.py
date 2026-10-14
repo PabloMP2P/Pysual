@@ -59,7 +59,7 @@ def _rect(rect: Rect | None) -> list[float] | None:
     return None if rect is None else [rect.x, rect.y, rect.width, rect.height]
 
 
-def _style(style: ResolvedStyle) -> dict[str, object]:
+def _style(style: Style | ResolvedStyle) -> dict[str, object]:
     # Style validates immutable scalars, so only the wire mapping needs a copy.
     # Narrow once. Casting every field would run on each recorded face.
     if not isinstance(style, Style):
@@ -504,7 +504,7 @@ class NativeHost(NativeServices):
         return True
 
     def styled_rect(
-        self, rect: Rect, style: ResolvedStyle, *, effect_clip: Rect | None = None
+        self, rect: Rect, style: Style | ResolvedStyle, *, effect_clip: Rect | None = None
     ) -> bool:
         self._commands.append(["styled_rect", _rect(rect), _style(style), _rect(effect_clip)])
         return True
@@ -512,7 +512,7 @@ class NativeHost(NativeServices):
     def marker(
         self,
         rect: Rect,
-        style: ResolvedStyle,
+        style: Style | ResolvedStyle,
         *,
         shape: Literal["square", "circle"],
         checked: bool,
