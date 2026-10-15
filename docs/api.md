@@ -326,6 +326,12 @@ and `origin`. Programmatic calls default to `origin="program"`; a committed
 editor action uses `"user"`. The column's `editable` flag controls the user
 editor, not application updates. Invalid data leaves the current dataset intact.
 
+Updating another cell with `set_cell()` keeps an open editor's draft and focus.
+Changing the edited cell cancels its draft. Program/system updates preserve
+manual scrolling unless sorting moves the selected row; user edits to the
+selected row reveal its selected cell. An open editor follows its row when
+sorting moves it.
+
 Numeric editors accept plain numbers and the column's copied decimal or percentage
 presentation, including its prefix, suffix, and comma or underscore grouping with
 an empty format specification or an `f`/`F`/`%` format. For example, a column using

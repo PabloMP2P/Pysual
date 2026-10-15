@@ -58,6 +58,32 @@ class GridDataTests(unittest.TestCase):
         self.assertEqual(grid.selected_column, 0)
         self.assertEqual(grid._scroll_x, 0)
 
+    def test_cell_refresh_preserves_manual_scroll_unless_it_is_a_user_edit(self):
+        app, host = App(width=500, height=300), RecordingHost()
+        self.addCleanup(app.destroy)
+        grid = app.data_grid(
+            columns=columns(),
+            rows=tuple(GridRow(str(i), (str(i), i, True)) for i in range(100)),
+            selected_key="0", width=300, height=200,
+        )
+        arrange(app, host)
+        paint_tree(app, host)
+        for sort_key in (None, "number"):
+            grid.sort_key = sort_key
+            for origin in ("program", "system", "user"):
+                with self.subTest(sort_key=sort_key, origin=origin):
+                    grid.handle_input(Input("wheel", delta=10))
+                    grid.handle_input(Input("wheel", delta=3, shift=True))
+                    before = grid._scroll, grid._scroll_x
+                    self.assertGreater(before[0], 0)
+                    self.assertGreater(before[1], 0)
+                    grid.set_cell("0", "number", grid.rows[0].cells[1] - 1, origin=origin)
+                    paint_tree(app, host)
+                    self.assertEqual(
+                        (grid._scroll, grid._scroll_x),
+                        (0, 0) if origin == "user" else before,
+                    )
+
     def test_build_time_data_does_not_scroll_away_the_first_column(self):
         app, host = App(width=500, height=300), RecordingHost()
         try:
@@ -444,6 +470,122 @@ class GridRuntimeTests(AsyncUIOwnerTestCase):
 
     async def key(self, key):
         await self.inputs(Input("key_down", key=key))
+
+    async def test_unrelated_cell_updates_preserve_each_editor_and_commit_latest_row(self):
+        grid = self.app.grid
+        original_rows = grid.rows
+        for index, draft, expected, other_column, other_value in (
+            (0, "User draft", "User draft", "number", 200),
+            (1, "123", 123, "flag", False),
+            (2, 1, False, "name", "Refreshed name"),
+        ):
+            with self.subTest(column=index):
+                grid.rows = original_rows
+                grid.selected_column = index
+                old_value = grid.rows[0].cells[index]
+                grid.begin_edit()
+                await self.inputs()
+                popup = self.runtime.popup
+                editor = popup.children[0]
+                if index == 2:
+                    editor.selected_index = draft
+                else:
+                    editor.text = draft
+                grid.set_cell("1", "name", f"Other row {index}")
+                grid.set_cell("0", other_column, other_value)
+                await self.inputs()
+                self.assertIs(self.runtime.popup, popup)
+                self.assertEqual(editor.selected_index if index == 2 else editor.text, draft)
+                self.assertTrue(editor.focused)
+                self.assertEqual((grid.selected_key, grid.selected_column), ("0", index))
+                await self.key("Enter")
+                self.assertIsNone(self.runtime.popup)
+                self.assertEqual(grid.rows[0].cells[index], expected)
+                other_index = next(i for i, c in enumerate(grid.columns) if c.key == other_column)
+                self.assertEqual(grid.rows[0].cells[other_index], other_value)
+                self.assertEqual(grid.rows[1].cells[0], f"Other row {index}")
+                self.assertEqual(self.edits[-1],
+                                 ("0", grid.columns[index].key, old_value, expected, "user"))
+
+    async def test_actual_cell_change_cancels_draft_but_unchanged_value_keeps_it(self):
+        grid = self.app.grid
+        grid.focus()
+        grid.begin_edit()
+        await self.inputs()
+        popup = self.runtime.popup
+        popup.children[0].text = "Stale draft"
+        grid.set_cell("0", "name", "Row 0")
+        self.assertIs(self.runtime.popup, popup)
+        grid.set_cell("0", "name", "External replacement")
+        await self.inputs()
+        self.assertIsNone(self.runtime.popup)
+        self.assertTrue(popup._disposed)
+        self.assertEqual(grid.rows[0].cells[0], "External replacement")
+        self.assertTrue(grid.focused)
+
+    async def test_preserved_editor_follows_sorted_row_movement(self):
+        grid = self.app.grid
+        grid.update(sort_key="number", selected_key="3")
+        grid.begin_edit()
+        await self.inputs()
+        popup = self.runtime.popup
+        editor = popup.children[0]
+        editor.text = "Sorted draft"
+        for row_key, number in (("2", 10), ("3", 101)):
+            with self.subTest(changed_row=row_key):
+                before = grid._positions["3"]
+                grid.set_cell(row_key, "number", number)
+                await self.inputs()
+                position = grid._positions["3"]
+                self.assertNotEqual(position, before)
+                self.assertIs(self.runtime.popup, popup)
+                self.assertEqual(editor.text, "Sorted draft")
+                self.assertTrue(editor.focused)
+                self.assertLessEqual(grid._scroll, position)
+                self.assertLess(position, grid._scroll + grid._page_rows())
+                self.assertEqual(popup.bounds.y, grid.bounds.y + grid._header_height()
+                                 + (position - grid._scroll) * grid._row_height())
+        await self.key("Enter")
+        self.assertEqual(grid.selected_row.cells, ("Sorted draft", 101, False))
+
+    async def test_custom_validator_preserves_draft_and_rejected_update_state(self):
+        class NonnegativeGrid(DataGrid):
+            def _validate_update(self, name, value):
+                super()._validate_update(name, value)
+                if name == "rows" and any(row.cells[1] < 0 for row in value):
+                    raise ValueError("negative row")
+
+        self.app.grid.destroy()
+        grid = NonnegativeGrid(
+            parent=self.app, columns=columns(),
+            rows=(GridRow("a", ("A", 1, True)), GridRow("b", ("B", 2, False))),
+            selected_key="a", sort_key="number", width=300, height=250,
+        )
+        edits = []
+        grid.edited.connect(edits.append)
+        await self.inputs()
+        grid.begin_edit()
+        await self.inputs()
+        popup = self.runtime.popup
+        editor = popup.children[0]
+        editor.text = "Validated draft"
+        before = (grid.rows, dict(grid._by_key), list(grid._order),
+                  dict(grid._positions), grid._scroll, grid._scroll_x)
+        with self.assertRaisesRegex(ValueError, "negative row"):
+            grid.set_cell("b", "number", -1)
+        await self.inputs()
+        self.assertEqual((grid.rows, grid._by_key, grid._order, grid._positions,
+                          grid._scroll, grid._scroll_x), before)
+        self.assertIs(self.runtime.popup, popup)
+        self.assertEqual(editor.text, "Validated draft")
+        self.assertTrue(editor.focused)
+        self.assertEqual(edits, [])
+        grid.set_cell("a", "number", 3)
+        await self.inputs()
+        self.assertIs(self.runtime.popup, popup)
+        self.assertEqual(editor.text, "Validated draft")
+        await self.key("Enter")
+        self.assertEqual(grid.selected_row.cells, ("Validated draft", 3, True))
 
     async def test_cell_editor_follows_window_resize_and_preserves_pending_edit(self):
         grid = self.app.grid

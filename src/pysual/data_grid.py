@@ -356,7 +356,9 @@ class DataGrid(Control):
         self._resize_columns: tuple[GridColumn, ...] | None = None
         self._applying_data = False
         self._pending_order: tuple[dict[str, GridRow], list[GridRow], dict[str, int]] | None = None
-        self._pending_cell: tuple[GridRow, list[GridRow] | None, dict[str, int] | None] | None = None
+        self._pending_cell: tuple[
+            GridRow, int, list[GridRow] | None, dict[str, int] | None, bool
+        ] | None = None
         self._last_click: tuple[str | None, str, str, float, float, float] | None = None
         self._popup: _CellPopup | None = None
         self._rebuild()
@@ -468,8 +470,10 @@ class DataGrid(Control):
 
     def _changed(self, field: Field, old: object, value: object) -> None:
         if field.name == "rows" and self._pending_cell is not None:
-            replacement, order, positions = self._pending_cell
+            replacement, column, order, positions, user_edit = self._pending_cell
             self._pending_cell = None
+            selected = self.selected_key
+            previous_position = self._positions.get(selected) if selected is not None else None
             self._by_key[replacement.key] = replacement
             if order is None:
                 self._order[self._positions[replacement.key]] = replacement
@@ -478,9 +482,18 @@ class DataGrid(Control):
                 self._order, self._positions = order, positions
             self._last_click = None
             self._resize = self._resize_columns = None
-            self._close_editor()
-            if self.selected_key == replacement.key:
+            # Selection changes already close the editor, so an open popup
+            # always targets the selected cell. Other cells can refresh safely.
+            if selected == replacement.key and self.selected_column == column:
+                self._close_editor()
+            if selected is not None and (
+                self._positions[selected] != previous_position
+                or (user_edit and selected == replacement.key)
+            ):
                 self._reveal()
+                if self._popup is not None and self._popup.is_open:
+                    # Rows only dirty paint; request layout for a moved editor.
+                    self._popup.reposition()
             super()._changed(field, old, value)
             return
         if field.name in (
@@ -952,6 +965,8 @@ class DataGrid(Control):
 
         The immutable public rows tuple is published immediately (O(n)). Local
         edits validate only the replacement unless row hooks are customized.
+        Unrelated edits retain the open editor. Program/system updates retain
+        the viewport unless sorting moves the selected row; user edits reveal it.
         """
         self._check_live()
         row = self._by_key[row_key]
@@ -1003,7 +1018,7 @@ class DataGrid(Control):
                 reverse=self.sort_descending,
             )
             positions = {item.key: i for i, item in enumerate(order)}
-        self._pending_cell = replacement, order, positions
+        self._pending_cell = replacement, index, order, positions, origin == "user"
         try:
             if customized:
                 self._apply_validated({"rows": candidate})
