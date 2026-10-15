@@ -142,6 +142,23 @@ def prepare_native_request(op: str, fields: object) -> dict[str, _Json]:
     return sanitized
 
 
+def _serialize_native_request(op: str, fields: dict[str, object]) -> bytes:
+    """Skip the recursive NUL policy walk when JSON proves it unnecessary."""
+    try:
+        payload = json.dumps({'op': op, **fields}, ensure_ascii=False,
+                             allow_nan=False, separators=(',', ':')).encode('utf-8')
+    except (TypeError, ValueError):
+        # Preserve the policy error that preparation would raise before encoding.
+        payload = None
+    # JSON always escapes actual NUL. A literal escape can also reach this slow
+    # path, where the existing policy distinguishes it from the actual character.
+    if payload is None or b'\\u0000' in payload:
+        prepared = prepare_native_request(op, fields)
+        payload = json.dumps({'op': op, **prepared}, ensure_ascii=False,
+                             allow_nan=False, separators=(',', ':')).encode('utf-8')
+    return payload
+
+
 def _read_handshake(sock: socket.socket, check_startup: Callable[[], None]) -> bytes:
     # Poll actual cancellation/process failure without imposing an elapsed
     # deadline on a live helper, including a partially received handshake.
@@ -479,16 +496,14 @@ class NativeClient:
         """
         if not isinstance(op, str):
             raise TypeError('op must be a string')
-        prepared = prepare_native_request(op, kwargs)
-        payload = json.dumps({'op': op, **prepared}, ensure_ascii=False,
-                             allow_nan=False, separators=(',', ':')).encode('utf-8')
+        payload = _serialize_native_request(op, kwargs)
         if len(payload) > MAX_PAYLOAD:
             raise ValueError('Request exceeds the 16 MiB protocol limit')
         if self._process is None:
             if op != 'open':
                 raise NativeHostError('Open the native host first')
-            self._start(terminal=prepared.get('backend') == 'terminal' and not
-                        (prepared.get('hidden') or prepared.get('headless')))
+            self._start(terminal=kwargs.get('backend') == 'terminal' and not
+                        (kwargs.get('hidden') or kwargs.get('headless')))
         try:
             # The first content frame can legitimately take longer than an
             # ordinary request. EOF, process exit and explicit errors still fail

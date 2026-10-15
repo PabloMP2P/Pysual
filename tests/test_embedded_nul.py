@@ -11,11 +11,13 @@ import os
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 from uuid import uuid4
 
 from pysual import CapabilityError, Rect
 from pysual.backends._native_client import (
-    NativeClient, NativeHostError, display_text, prepare_native_request,
+    NativeClient, NativeHostError, _serialize_native_request,
+    display_text, prepare_native_request,
 )
 from pysual.backends._term_cells import CellRenderer, safe_text
 from pysual.backends.native import NativeHost
@@ -83,6 +85,61 @@ class EmbeddedNulPolicyTests(unittest.TestCase):
                     prepare_native_request(op, fields)
         with self.assertRaisesRegex(ValueError, _NUL):
             prepare_native_request("clipboard_\0write", {"text": "AB"})
+
+    def test_ordinary_request_serializes_without_a_recursive_policy_walk(self):
+        client = NativeClient()
+        fields = dict(backend="terminal", hidden=True, title="café",
+                      extra={"values": [1, 2.5, False, None, "λ"]})
+        with patch.object(client, "_start") as start, \
+                patch.object(client, "_request", return_value={}) as send, \
+                patch("pysual.backends._native_client._contains_embedded_nul",
+                      side_effect=AssertionError("ordinary request walked twice")):
+            client.request("open", **fields)
+        start.assert_called_once_with(terminal=False)
+        self.assertEqual(send.call_args.args[0], 9)
+        self.assertEqual(json.loads(send.call_args.args[1]), dict(op="open", **fields))
+        client.close()
+
+    def test_encoded_display_nuls_and_literal_escapes_keep_the_existing_policy(self):
+        cases = (
+            ("open", {"title": "A\0B", "backend": "terminal", "hidden": True}),
+            ("measure", {"text": "café\0λ", "size": 16}),
+            ("measure_many", {"texts": ["A\0B", "AB", r"A\u0000B"]}),
+            ("set_title", {"title": "A\0B"}),
+            ("frame", {"commands": [("text", "A\0B", 0, 0, "#fff", 16, False)]}),
+            ("patch", {"upsert": [{"id": "label", "commands": [
+                ["text", "A\0B", 0, 0, "#fff", 16, False]]}]}),
+            ("clipboard_write", {"text": r"A\u0000B"}),
+            ("capture", {"path": r"C:\user\u0000.bmp"}),
+        )
+        for op, fields in cases:
+            with self.subTest(op=op, fields=fields):
+                expected = json.dumps(
+                    dict(op=op, **prepare_native_request(op, fields)),
+                    ensure_ascii=False, allow_nan=False, separators=(",", ":"),
+                ).encode("utf-8")
+                self.assertEqual(_serialize_native_request(op, fields), expected)
+
+    def test_serialization_preserves_rejection_before_startup_and_error_precedence(self):
+        client = NativeClient()
+        cases = (
+            ("open", {"font_dir": "A\0B"}),
+            ("clipboard_\0write", {"text": "AB"}),
+            ("measure", {"extra": [{"bad\0key": 1}]}),
+            ("clipboard_write", {"text": "A\0B", "bad": object()}),
+            ("clipboard_write", {"text": "A\0B", "number": float("nan")}),
+        )
+        with patch.object(client, "_start") as start, patch.object(client, "_request") as send:
+            for op, fields in cases:
+                with self.subTest(op=op), self.assertRaisesRegex(ValueError, _NUL):
+                    client.request(op, **fields)
+            with self.assertRaisesRegex(ValueError, "Out of range float"):
+                client.request("measure", text="A\0B", size=float("nan"))
+            with self.assertRaisesRegex(TypeError, "not JSON serializable"):
+                client.request("measure", text="A\0B", bad=object())
+            start.assert_not_called()
+            send.assert_not_called()
+        client.close()
 
     def test_adapter_records_display_text_and_does_not_send_rejected_services(self):
         class Recorder:
