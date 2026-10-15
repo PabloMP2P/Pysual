@@ -1297,18 +1297,18 @@ class Container(Control, FactoryTypes):
                 )
             candidates: list[tuple[str, object]] = []
             if value._name is None:
-                # Resolve pairs, never split user method names on underscores.
-                methods = {
-                    f"{n}_on_{e}"
-                    for n, c in self._bindings.items()
-                    for e in c._event_definitions()
-                }
-                methods.update(
-                    f"{type(self).__name__}_on_{e}" for e in self._event_definitions()
-                )
-                incoming = {f"{name}_on_{e}" for e in value._event_definitions()}
-                if methods & incoming:
-                    raise BindingError("Ambiguous control/event handler names")
+                # Resolve incoming pairs against existing prefixes, including
+                # overlapping separators in control and event names.
+                for event_name in value._event_definitions():
+                    method = f"{name}_on_{event_name}"
+                    split = method.find("_on_")
+                    while split >= 0:
+                        prefix, suffix = method[:split], method[split + 4:]
+                        target = (self if prefix == type(self).__name__
+                                  else self._bindings.get(prefix))
+                        if target is not None and suffix in target._event_definitions():
+                            raise BindingError("Ambiguous control/event handler names")
+                        split = method.find("_on_", split + 1)
                 candidates = value._handler_candidates(self, name)
             # Validate the complete binding before any attachment hook can act
             # on siblings. Existing parents are never changed by assignment.
