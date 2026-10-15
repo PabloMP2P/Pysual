@@ -35,6 +35,8 @@ class _SearchIcon(Label):
 
 
 class _SearchEntry(TextBox):
+    style_fallbacks: ClassVar[tuple[str, ...]] = ("SearchField",)
+
     def paint(self, painter: Painter, /) -> None:
         # The owner supplies one continuous field surface. Keep TextBox's
         # selection, caret, composition and horizontal scrolling machinery.
@@ -105,6 +107,9 @@ class SearchField(Container):
     ``changed`` reports one semantic text change. ``submitted`` fires on Enter;
     read ``text`` for the query. ``focus()`` targets the owned TextBox. Read-only
     fields permit selection and submission, but prevent typing and clearing.
+
+    Text styling follows the field. Direct entry overrides remain in effect
+    until the same typography property is changed on the field.
     """
 
     style_excludes: ClassVar[tuple[str, ...]] = ("Container",)
@@ -141,7 +146,8 @@ class SearchField(Container):
         self.search_icon = _SearchIcon(width=32)
         self.entry = _SearchEntry(
             text=self.text, placeholder=self.placeholder, read_only=self.read_only,
-            flex=1,
+            font_size=self.font_size, font_family=self.font_family,
+            foreground=self.foreground, flex=1,
         )
         self.clear_button = _ClearButton(
             icon="close", tooltip="Clear search", width=36,
@@ -158,6 +164,8 @@ class SearchField(Container):
             self.focus()
 
     def _changed(self, field: Field, old: object, value: object) -> None:
+        if field.name in ("font_size", "font_family", "foreground"):
+            setattr(self.entry, field.name, value)
         if field.name in ("text", "placeholder", "read_only"):
             self._syncing = True
             origin = self.entry._origin

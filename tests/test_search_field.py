@@ -5,7 +5,7 @@ import asyncio
 from _ui_testcase import AsyncUIOwnerTestCase, UIOwnerTestCase
 from test_library import RecordingHost, eventually
 
-from pysual import App, Container
+from pysual import App, Container, Style, TextBox, Theme
 from pysual.fields import SearchField
 from pysual.host import Input
 from pysual.runtime import Runtime
@@ -324,5 +324,111 @@ class SearchFieldPaintTests(UIOwnerTestCase):
                     outer, ordinary = resolve_style(field), resolve_style(entry)
                     for attribute in ("fill", "radius", "border", "border_width", "bevel"):
                         self.assertEqual(getattr(outer, attribute), getattr(ordinary, attribute))
+                    for attribute in ("font_size", "font_family", "foreground"):
+                        self.assertEqual(getattr(resolve_style(field.entry), attribute),
+                                         getattr(ordinary, attribute))
             finally:
                 app.destroy()
+
+
+class TypographyHost(RecordingHost):
+    def begin(self, color):
+        super().begin(color)
+        self.faces, self.selections, self.carets = [], [], []
+
+    def text(self, text, x, y, color, size, mono=False):
+        self.faces.append((text, color, size, mono))
+        super().text(text, x, y, color, size, mono)
+
+    def measure(self, text, size, mono=False):
+        return len(text) * size * (0.6 if mono else 0.4), size * 1.2
+
+    def rect(self, rect, fill, *args, **kwargs):
+        self.selections.append((rect, fill))
+
+    def caret(self, x, y, height, color):
+        self.carets.append((x, y, height))
+        return True
+
+
+class SearchFieldTypographyTests(UIOwnerTestCase):
+    def setUp(self):
+        self.app, self.host = App(), TypographyHost()
+        self.addCleanup(self.app.destroy)
+
+    def paint(self):
+        arrange(self.app, self.host)
+        paint_tree(self.app, self.host)
+
+    def test_direct_typography_construction_update_and_reset_reach_query(self):
+        values = dict(font_size=28, font_family="mono", foreground="#ff0000")
+        field = SearchField(parent=self.app, text="Query", width=400, **values)
+        ordinary = TextBox(parent=self.app, text="Reference", top=100, **values)
+        for update, expected in (
+            ({}, ("#ff0000", 28, True)),
+            (dict(font_size=19, font_family="ui", foreground="#00ff00"),
+             ("#00ff00", 19, False)),
+            (dict(font_size=None, font_family=None, foreground=None),
+             (self.app.theme.tokens.foreground, self.app.theme.tokens.font_size, False)),
+        ):
+            with self.subTest(update=update):
+                field.update(**update)
+                ordinary.update(**update)
+                self.paint()
+                self.assertIn(("Query", *expected), self.host.faces)
+                self.assertIn(("Reference", *expected), self.host.faces)
+
+    def test_search_theme_typography_and_explicit_entry_overrides(self):
+        field = SearchField(parent=self.app, text="Query", width=400)
+        for target, size, family in ((self.app, 24, "mono"), (field, 18, "ui")):
+            theme = (Theme().styled(TextBox, Style(font_size=13))
+                     .styled(SearchField, Style(font_size=size,
+                         font_family=family, foreground="#123456")))
+            if target is self.app:
+                self.app.theme = theme
+            else:
+                field.theme_override = theme
+            self.paint()
+            self.assertIn(("Query", "#123456", size, family == "mono"), self.host.faces)
+            field.text = ""
+            self.paint()
+            self.assertIn(("Search", self.app.theme.tokens.muted, size, family == "mono"),
+                          self.host.faces)
+            field.text = "Query"
+        field.theme_override = None
+        field.entry.update(font_size=17, font_family="mono", foreground="#abcdef")
+        field.update(text="Changed", read_only=True)
+        self.app.theme = Theme().styled(SearchField, Style(font_size=30))
+        self.paint()
+        self.assertIn(("Changed", "#abcdef", 17, True), self.host.faces)
+        # An explicit change on the owner replaces only that entry property.
+        field.font_size = 22
+        self.paint()
+        self.assertIn(("Changed", "#abcdef", 22, True), self.host.faces)
+
+    def test_styled_long_query_selection_caret_and_scroll_share_metrics(self):
+        self.app.theme = Theme().styled(SearchField, Style(font_size=28, font_family="mono"))
+        field = SearchField(parent=self.app, text="abcdefghij" * 10, width=300, height=70)
+        runtime = Runtime(self.app, self.host)
+        self.app._runtime = runtime
+        self.addCleanup(setattr, self.app, "_runtime", None)
+        self.paint()
+        field.focus()
+        field.entry.select(2, 5)
+        self.paint()
+        selected = [rect for rect, color in self.host.selections
+                    if color == self.app.theme.tokens.selection]
+        self.assertEqual(len(selected), 1)
+        self.assertAlmostEqual(selected[0].width, self.host.measure("cde", 28, True)[0])
+        self.assertAlmostEqual(self.host.carets[0][0], selected[0].right)
+        self.assertAlmostEqual(self.host.carets[0][2], 28 * 1.4)
+        field.entry.select(len(field.text), len(field.text))
+        for size in (28, 14):
+            field.font_size = size
+            self.paint()
+            self.assertGreater(field.entry._scroll_x, 0)
+            self.assertAlmostEqual(field.entry._document_width(),
+                                   self.host.measure(field.text, size, True)[0])
+            x, _, height = self.host.carets[0]
+            self.assertTrue(field.entry.bounds.x <= x < field.entry.bounds.right)
+            self.assertAlmostEqual(height, size * 1.4)
