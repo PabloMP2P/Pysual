@@ -1873,7 +1873,7 @@ static int same_cell(Cell a, Cell b, int mono) {
     return a.width == b.width && a.underline == b.underline && !strcmp(a.text, b.text) &&
            (mono || (same_color(a.fg, b.fg) && same_color(a.bg, b.bg)));
 }
-static int palette_index(Color c, int count) {
+static int palette_index_scan(Color c, int count) {
     static const unsigned char base[16][3] = {{0, 0, 0},       {128, 0, 0},   {0, 128, 0},   {128, 128, 0},
                                               {0, 0, 128},     {128, 0, 128}, {0, 128, 128}, {192, 192, 192},
                                               {128, 128, 128}, {255, 0, 0},   {0, 255, 0},   {255, 255, 0},
@@ -1900,6 +1900,23 @@ static int palette_index(Color c, int count) {
         }
     }
     return best;
+}
+static int palette_index(Color c, int count) {
+    /* Separate palettes; exact RGB keys make collisions ordinary cache misses.
+       Native rendering owns these bounded tables on its single host thread. */
+    static uint32_t keys[2][1024];
+    static unsigned char values[2][1024];
+    unsigned mode = count == 16 ? 0 : 1;
+    uint32_t key = ((uint32_t)c.r << 16) | ((uint32_t)c.g << 8) | (uint32_t)c.b;
+    unsigned slot = (unsigned)((key * 2654435761u) >> 22);
+    int result;
+    key++; /* Reserve zero for an empty slot, including when the RGB is black. */
+    if (keys[mode][slot] == key)
+        return values[mode][slot];
+    result = palette_index_scan(c, count);
+    keys[mode][slot] = key;
+    values[mode][slot] = (unsigned char)result;
+    return result;
 }
 static void sgr(Buffer *out, Color fg, Color bg, int mode) {
     char temp[100];
