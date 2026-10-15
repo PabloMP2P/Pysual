@@ -104,6 +104,10 @@ class Popup(Container):
             or self._owner._clip.height <= 0
         ):
             self.dismiss()
+            return
+        theme = self._owner.effective_theme
+        if self.theme_override != theme:
+            self.theme_override = theme
 
     def paint(self, painter: Painter, /) -> None:
         painter.body()

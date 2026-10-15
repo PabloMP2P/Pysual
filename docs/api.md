@@ -447,6 +447,8 @@ A `Popup` is a transient subtree owned by the running app. Create fresh content
 and call `show(anchor)` from a handler; it returns immediately. The popup is
 placed below its anchor, or above when needed, and kept inside the app area.
 `show(anchor, at=(x, y))` instead uses an app-logical point.
+An open popup follows its anchor's effective theme when the app theme or
+an ancestor theme override changes, preserving its current input and selection.
 
 ```python
 from pysual import App, Button, Label, Popup
