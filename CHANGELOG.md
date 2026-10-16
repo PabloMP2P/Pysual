@@ -8,7 +8,7 @@ Other platforms receive the pure-Python wheel, with the Python terminal and web
 backends. A `v*` tag that matches `__version__` builds those wheels, checks
 them outside the build SDK, and publishes the GitHub Release and the PyPI files.
 
-Linux wheels require glibc 2.34 or newer. X11, Wayland, OpenGL, and GLib stay
+Linux wheels require glibc 2.28 or newer. X11, Wayland, OpenGL, and GLib stay
 on the recipient's machine.
 
 ## 0.1.1 — 2026-10-09

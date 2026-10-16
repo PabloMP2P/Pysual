@@ -147,14 +147,14 @@ def test_release_workflow_matches_the_pypi_publisher():
     assert "id-token: write" in workflow
     assert "pypa/gh-action-pypi-publish@release/v1" in workflow
     assert "softprops/action-gh-release@v2" in workflow
-    assert "quay.io/pypa/manylinux_2_34_x86_64" in workflow
+    assert "quay.io/pypa/manylinux_2_28_x86_64" in workflow
     assert ".github/scripts/build_portable_linux_wheel.sh" in workflow
     assert ".github/scripts/build_pinned_sdl.sh" in workflow
     for name in ("build_pinned_sdl.sh", "build_portable_linux_wheel.sh"):
         script = (ROOT / ".github/scripts" / name).read_text(encoding="utf-8")
         assert script.startswith("#!/usr/bin/env bash\n")
     linux = (ROOT / ".github/scripts/build_portable_linux_wheel.sh").read_text(encoding="utf-8")
-    assert "manylinux_2_34_x86_64" in linux
+    assert "manylinux_2_28_x86_64" in linux
     assert "build_pinned_sdl.sh" in linux
 
 

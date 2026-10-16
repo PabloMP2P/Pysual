@@ -269,8 +269,7 @@ git push origin vX.Y.Z
 
 The release workflow builds the pure wheel and source archive, a Windows x64
 wheel, an Apple Silicon wheel with SDL copied into it, and a Linux x64 wheel
-repaired for `manylinux_2_34` (glibc 2.34 or newer, such as Ubuntu 22.04,
-Debian 12, and RHEL 9). It checks each native wheel with the build SDK removed
+repaired for `manylinux_2_28` (glibc 2.28 or newer). It checks each native wheel with the build SDK removed
 from the loader path, attaches the files to the GitHub Release, and uploads
 them to PyPI. PyPI trusts `.github/workflows/release.yml` through the GitHub
 environment named `pypi`. X11, Wayland, OpenGL, and GLib stay on the

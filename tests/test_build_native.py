@@ -179,7 +179,8 @@ def test_windows_build_publishes_notices_and_terminal_rebuild_removes_them(tmp_p
 def test_posix_build_keeps_platform_dependency_boundaries(tmp_path, monkeypatch, platform, terminal_only):
     monkeypatch.setattr(native, "ROOT", tmp_path)
     monkeypatch.setattr(native, "sys", SimpleNamespace(platform=platform))
-    monkeypatch.setattr(native, "os", SimpleNamespace(name="posix", replace=os.replace))
+    monkeypatch.setattr(native, "os", SimpleNamespace(
+        name="posix", replace=os.replace, environ={"CFLAGS": "-march=x86-64"}))
     monkeypatch.setattr(native.platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(native, "compiler_environment", lambda _compiler: ("cc", {}))
     monkeypatch.setattr(native, "pkg_config_flags", lambda: ["-lSDL3", "-lSDL3_ttf", "-lSDL3_image"])
@@ -201,5 +202,7 @@ def test_posix_build_keeps_platform_dependency_boundaries(tmp_path, monkeypatch,
     assert ("-DPYSUAL_WITH_WINDOW" in command) is (not terminal_only)
     origin = "@loader_path" if platform == "darwin" else "$ORIGIN"
     assert (f"-Wl,-rpath,{origin}" in command) is (not terminal_only)
+    assert "-march=x86-64" in command
+    assert ("-Wl,-headerpad_max_install_names" in command) is (platform == "darwin")
     source = "window_stub.c" if terminal_only else "sdl_renderer.c"
     assert str(tmp_path / "native" / source) in command

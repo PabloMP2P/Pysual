@@ -124,6 +124,14 @@ def _runtime_path_flags(libraries):
     return flags
 
 
+def _cflags():
+    """Forward CFLAGS, including a release build's portable -march setting."""
+    environ = getattr(os, "environ", None)
+    if not environ:
+        return []
+    return shlex.split(environ.get("CFLAGS", ""))
+
+
 def _copy_gnu_runtime(compiler, executable):
     """Carry direct MinGW runtime dependencies into the native package directory."""
     directory = Path(compiler).resolve().parent
@@ -219,9 +227,12 @@ def main(argv=None):
                        *[f"/D{d}" for d in definitions], *[f"/I{p}" for p in includes],
                        *map(str, sources), f"/Fe:{executable}", "/link", *libraries]
         else:
-            command = [compiler, "-std=c11", "-O2", "-Wall", "-Wextra",
+            command = [compiler, "-std=c11", "-O2", "-Wall", "-Wextra", *_cflags(),
                        *[f"-D{d}" for d in definitions], *[f"-I{p}" for p in includes],
                        *map(str, sources), "-o", str(executable), *libraries]
+            if sys.platform == "darwin":
+                # Leave room for delocate to rewrite library ids to @loader_path.
+                command.append("-Wl,-headerpad_max_install_names")
             if os.name == "nt":
                 command.append("-static-libgcc")
         subprocess.run(command, cwd=stage, env=env, check=True)
