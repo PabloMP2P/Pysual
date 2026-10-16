@@ -143,6 +143,8 @@ jobs:
             -w /io \
             quay.io/pypa/manylinux_2_28_x86_64 \
             /io/.github/scripts/build_portable_linux_wheel.sh
+      - name: Restore ownership of container build outputs
+        run: sudo chown -R "$(id -u):$(id -g)" .build dist wheelhouse
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
