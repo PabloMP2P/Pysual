@@ -139,6 +139,15 @@ first. `present` and `capture` still wait until that frame has been drawn. A
 transport timeout closes the session because the caller cannot infer whether an
 operation committed.
 
+The host flushes queued input to Python before drawing, so a blocking present
+does not add a VSync wait when the socket can accept those bytes. That flush
+obeys the same backpressure and output byte budget as other sends. When a poll
+fills the 256-event budget, the host services IPC and polls again before
+sleeping, because SDL has already removed those events from the OS queue. An
+open Windows window waits for socket activity and OS messages together. Terminal
+hosts, and window hosts without that message wait, use select with a 10 ms
+maximum so device polling stays bounded.
+
 `NativeHost.native_stats()` distinguishes native presentations, scene updates,
 command work, cache hits and resource usage. Terminal statistics also separate
 cell compositions, encoded ANSI bytes, completed writes and pending output.

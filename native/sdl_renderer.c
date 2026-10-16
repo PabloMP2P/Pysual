@@ -138,6 +138,7 @@ struct PXRenderer {
     char failed_images[128][80];
     uint64_t failed_used[128];
     cJSON *resource_events;
+    int poll_budget_exhausted;
     int has_sprites, animation_pending, animation_settled, reduce_motion, vsync, clip_enabled;
     SDL_Rect clip;
     char error[512];
@@ -3289,6 +3290,7 @@ cJSON *px_renderer_poll(PXRenderer *r) {
     int count = 0;
     if (!r)
         return events;
+    r->poll_budget_exhausted = 0;
     if (r->resource_events) {
         cJSON_Delete(events);
         events = r->resource_events;
@@ -3424,7 +3426,11 @@ cJSON *px_renderer_poll(PXRenderer *r) {
         /* Close is an input request. Only Python's accepted close/EOF ends the host. */
         cJSON_AddItemToArray(events, j);
     }
+    r->poll_budget_exhausted = count > 256;
     return events;
+}
+int px_renderer_poll_pending(PXRenderer *r) {
+    return r && r->poll_budget_exhausted;
 }
 cJSON *px_renderer_call(PXRenderer *r, const cJSON *request, char *error, int error_size) {
     const char *op = string(get(request, "op"), "");

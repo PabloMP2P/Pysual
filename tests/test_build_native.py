@@ -121,7 +121,9 @@ def test_windows_build_publishes_notices_and_terminal_rebuild_removes_them(tmp_p
     monkeypatch.setattr(native.platform, "machine", lambda: "AMD64")
     monkeypatch.setattr(native, "compiler_environment", lambda _compiler: ("cl", {}))
 
+    calls = []
     def compile(command, **kwargs):
+        calls.append(command)
         executable = next(arg[4:] for arg in command if arg.startswith("/Fe:"))
         Path(executable).write_bytes(b"compiled host placeholder")
 
@@ -135,6 +137,10 @@ def test_windows_build_publishes_notices_and_terminal_rebuild_removes_them(tmp_p
         (root / "LICENSE.txt").write_text("SDK notice", encoding="utf-8")
         arguments.extend((option, str(root)))
     assert native.main(arguments) == 0
+    assert "User32.lib" in calls[-1]
+    assert "Ws2_32.lib" in calls[-1]
+    assert str(tmp_path / "native/sdl_renderer.c") in calls[-1]
+    assert str(tmp_path / "native/window_stub.c") not in calls[-1]
     output = tmp_path / "src/pysual/bin"
     manifest = json.loads((source / "native/notices/manifest.json").read_text(encoding="utf-8"))
     marker = json.loads((output / "native-build.json").read_text(encoding="utf-8"))
@@ -151,7 +157,41 @@ def test_windows_build_publishes_notices_and_terminal_rebuild_removes_them(tmp_p
 
     # Reusing the output directory must remove the preceding full build's files.
     assert native.main(["--terminal-only"]) == 0
+    assert "User32.lib" not in calls[-1]
+    assert "Ws2_32.lib" in calls[-1]
+    assert str(tmp_path / "native/window_stub.c") in calls[-1]
+    assert str(tmp_path / "native/sdl_renderer.c") not in calls[-1]
+    assert not any("PYSUAL_WITH_WINDOW" in arg for arg in calls[-1])
     assert set(path.name for path in output.iterdir()) == {
         "pysual-host.exe", "cJSON-LICENSE.txt", "native-build.json",
     }
     assert not json.loads((output / "native-build.json").read_text(encoding="utf-8"))["window"]
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+@pytest.mark.parametrize("terminal_only", [False, True])
+def test_posix_build_keeps_platform_dependency_boundaries(tmp_path, monkeypatch, platform, terminal_only):
+    monkeypatch.setattr(native, "ROOT", tmp_path)
+    monkeypatch.setattr(native, "sys", SimpleNamespace(platform=platform))
+    monkeypatch.setattr(native, "os", SimpleNamespace(name="posix", replace=os.replace))
+    monkeypatch.setattr(native.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(native, "compiler_environment", lambda _compiler: ("cc", {}))
+    monkeypatch.setattr(native, "pkg_config_flags", lambda: ["-lSDL3", "-lSDL3_ttf", "-lSDL3_image"])
+    license_path = tmp_path / "native/vendor/cJSON.LICENSE"
+    license_path.parent.mkdir(parents=True)
+    license_path.write_text("license", encoding="utf-8")
+    calls = []
+
+    def compile(command, **kwargs):
+        calls.append(command)
+        Path(command[command.index("-o") + 1]).write_bytes(b"compiled host placeholder")
+
+    monkeypatch.setattr(native.subprocess, "run", compile)
+    assert native.main(["--terminal-only"] if terminal_only else []) == 0
+    command, = calls
+    assert "-lm" in command and "-pthread" in command
+    assert not any("user32" in arg.lower() or "ws2_32" in arg.lower() for arg in command)
+    assert ("-lSDL3" in command) is (not terminal_only)
+    assert ("-DPYSUAL_WITH_WINDOW" in command) is (not terminal_only)
+    source = "window_stub.c" if terminal_only else "sdl_renderer.c"
+    assert str(tmp_path / "native" / source) in command

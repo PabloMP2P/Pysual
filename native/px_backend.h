@@ -22,6 +22,8 @@ uint64_t px_renderer_last_segment_tests(PXRenderer *r);
 int px_renderer_draw(PXRenderer *r, char *error, int error_size);
 int px_renderer_present(PXRenderer *r, char *error, int error_size);
 cJSON *px_renderer_poll(PXRenderer *r);
+/* The last poll reached its event budget; service IPC and poll again before sleeping. */
+int px_renderer_poll_pending(PXRenderer *r);
 cJSON *px_renderer_info(PXRenderer *r);
 /* Request has op measure/set_title/set_size/text_input/clipboard_read/write/
    capture/configure/reload_image. Return result JSON (incl JSON null), NULL + error failure. */

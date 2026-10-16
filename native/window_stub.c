@@ -16,6 +16,7 @@ uint64_t px_renderer_last_segment_tests(PXRenderer *r) { (void)r;return 0; }
 int px_renderer_draw(PXRenderer *r,char *e,int n) { (void)r;return unavailable(e,n); }
 int px_renderer_present(PXRenderer *r,char *e,int n) { (void)r;return unavailable(e,n); }
 cJSON *px_renderer_poll(PXRenderer *r) { (void)r;return cJSON_CreateArray(); }
+int px_renderer_poll_pending(PXRenderer *r) { (void)r;return 0; }
 cJSON *px_renderer_info(PXRenderer *r) { (void)r;return cJSON_CreateObject(); }
 cJSON *px_renderer_call(PXRenderer *r,const cJSON *j,char *e,int n) { (void)r;(void)j;unavailable(e,n);return NULL; }
 int px_renderer_animating(PXRenderer *r) { (void)r;return 0; }

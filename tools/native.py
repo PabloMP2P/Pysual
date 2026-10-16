@@ -193,6 +193,8 @@ def main(argv=None):
             libraries = pkg_config_flags()
     if os.name == "nt":
         libraries.append("Ws2_32.lib" if msvc else "-lws2_32")
+        if not args.terminal_only:
+            libraries.append("User32.lib" if msvc else "-luser32")
     else:
         libraries += ["-lm", "-pthread"]
     output = args.output.resolve()

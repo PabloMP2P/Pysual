@@ -45,6 +45,10 @@ static void stop_signal(int signal_number) {
 #endif
 typedef struct {
     PxSocket socket;
+#if defined(_WIN32) && defined(PYSUAL_WITH_WINDOW)
+    WSAEVENT network_event;
+    int network_event_attempted, socket_write_blocked;
+#endif
     PXRenderer *renderer;
     PTBackend *terminal;
     unsigned char *input, *output;
@@ -503,10 +507,16 @@ failed:
 
 static void flush_output(Host *h) {
     size_t budget = IO_BUDGET;
+#if defined(_WIN32) && defined(PYSUAL_WITH_WINDOW)
+    h->socket_write_blocked = 0;
+#endif
     while (h->output_size && budget) {
         size_t amount = h->output_size < budget ? h->output_size : budget;
         int sent = (int)send(h->socket, (const char *)h->output + h->output_start, (int)amount, 0);
         if (sent < 0) {
+#if defined(_WIN32) && defined(PYSUAL_WITH_WINDOW)
+            h->socket_write_blocked = WSAGetLastError() == WSAEWOULDBLOCK;
+#endif
             if (!would_block())
                 h->disconnected = 1;
             return;
@@ -591,16 +601,80 @@ static double frame_delay(Host *h) {
     return fmax(0, h->last_frame + interval - now_seconds());
 }
 
+#if defined(_WIN32) && defined(PYSUAL_WITH_WINDOW)
+static void initialize_message_wait(Host *h) {
+    if (h->network_event_attempted)
+        return;
+    h->network_event_attempted = 1;
+    h->network_event = WSACreateEvent();
+    if (h->network_event == WSA_INVALID_EVENT)
+        return;
+    if (WSAEventSelect(h->socket, h->network_event, FD_READ | FD_WRITE | FD_CLOSE) == SOCKET_ERROR) {
+        WSACloseEvent(h->network_event);
+        h->network_event = WSA_INVALID_EVENT;
+    }
+}
+
+static void disable_message_wait(Host *h) {
+    /* Cancel the association before closing its event. On failure, cleanup
+       closes the socket first so no live socket keeps a stale event handle. */
+    if (WSAEventSelect(h->socket, NULL, 0) == SOCKET_ERROR) {
+        h->disconnected = 1;
+        return;
+    }
+    WSACloseEvent(h->network_event);
+    h->network_event = WSA_INVALID_EVENT;
+}
+
+static int wait_for_windows_input(Host *h, double delay) {
+    DWORD result;
+    WSANETWORKEVENTS events;
+    initialize_message_wait(h);
+    if (h->network_event == WSA_INVALID_EVENT)
+        return 0;
+    /* FD_WRITE signals recovery from WSAEWOULDBLOCK, not every writable socket.
+       Output left only because of our byte budget must continue without waiting. */
+    if (delay <= 0 || (h->output_size && !h->socket_write_blocked))
+        return 1;
+    /* MsgWait's timeout is whole milliseconds, so a shorter deadline uses select. */
+    if (delay < 0.001)
+        return 0;
+    result = MsgWaitForMultipleObjectsEx(1, &h->network_event, (DWORD)(delay * 1000), QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+    if (result == WAIT_OBJECT_0) {
+        /* Atomically consume/reset only a signaled event. The next recv/send
+           re-enables notifications; FD_CLOSE must not discard buffered input. */
+        if (WSAEnumNetworkEvents(h->socket, h->network_event, &events) == SOCKET_ERROR) {
+            disable_message_wait(h);
+            return h->disconnected;
+        }
+    } else if (result != WAIT_OBJECT_0 + 1 && result != WAIT_TIMEOUT) {
+        disable_message_wait(h);
+        return h->disconnected;
+    }
+    return 1;
+}
+#endif
+
 static void wait_for_io(Host *h) {
     fd_set reading, writing;
     struct timeval timeout;
+    /* Polled SDL devices signal neither the socket nor a window message. */
     double delay = 0.01;
     int result;
     int can_read = !h->closing && h->output_size <= COMMAND_WATERMARK && h->input_size < INPUT_CAP;
+    /* SDL has already moved a full poll budget into its queue, so neither a
+       window message nor the display fd will wake us. Service IPC first. */
+    if (!h->closing && h->renderer && px_renderer_poll_pending(h->renderer))
+        return;
     if (pending_input(h))
         delay = 0;
     else if (wants_frame(h))
         delay = fmin(delay, frame_delay(h));
+#if defined(_WIN32) && defined(PYSUAL_WITH_WINDOW)
+    /* Terminal, pre-open, close-drain, and a failed event setup use select. */
+    if (!h->closing && h->renderer && wait_for_windows_input(h, delay))
+        return;
+#endif
     timeout.tv_sec = 0;
     timeout.tv_usec = (long)(delay * 1e6);
     FD_ZERO(&reading);
@@ -629,6 +703,9 @@ int main(int argc, char **argv) {
 #endif
     memset(&h, 0, sizeof(h));
     h.socket = PX_BAD_SOCKET;
+#if defined(_WIN32) && defined(PYSUAL_WITH_WINDOW)
+    h.network_event = WSA_INVALID_EVENT;
+#endif
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--port") && i + 1 < argc) {
             char *end;
@@ -678,6 +755,7 @@ int main(int argc, char **argv) {
         flush_output(&h);
         if (h.initialized && !h.closing) {
             cJSON *events = h.terminal ? pt_poll(h.terminal) : px_renderer_poll(h.renderer), *event;
+            int have_events = events && events->child;
             cJSON_ArrayForEach(event, events) {
                 if (!strcmp(str(event, "kind"), "suspend"))
                     h.suspended = 1;
@@ -690,8 +768,11 @@ int main(int argc, char **argv) {
                 }
             }
             cJSON_Delete(events);
+            /* Deliver input before a potentially blocking VSync present. */
+            if (have_events)
+                flush_output(&h);
         }
-        if (wants_frame(&h) && frame_delay(&h) <= 0 && !draw(&h, error, sizeof(error)))
+        if (!h.disconnected && wants_frame(&h) && frame_delay(&h) <= 0 && !draw(&h, error, sizeof(error)))
             begin_close(&h, "native_error", error);
         if (!h.disconnected)
             wait_for_io(&h);
@@ -706,6 +787,10 @@ cleanup:
     if (h.terminal)
         pt_close(h.terminal);
     close_socket(h.socket);
+#if defined(_WIN32) && defined(PYSUAL_WITH_WINDOW)
+    if (h.network_event != WSA_INVALID_EVENT)
+        WSACloseEvent(h.network_event);
+#endif
     free(h.input);
     free(h.output);
 #ifdef _WIN32
