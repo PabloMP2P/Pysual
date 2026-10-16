@@ -215,8 +215,9 @@ the native wheel universal; unreadable native metadata stops the package build.
 The native compiler defaults to macOS 11.0 for arm64 and 10.15 for x86_64.
 `MACOSX_DEPLOYMENT_TARGET` overrides that default. For macOS 11 and newer it must
 name a whole-major target, such as `14.0`; wheel compatibility tags cannot express
-minor or patch deployment requirements on those systems. Linked SDL libraries
-may have a newer requirement and remain external dependencies of library wheels.
+minor or patch deployment requirements on those systems. A local macOS or
+Linux wheel remains linked to the SDL shared libraries on the build machine.
+The release workflow copies those libraries into the published wheel.
 
 `python -m pysual package --wheel` or `--sdist` selects one distribution type.
 The command invokes the standard Python packaging frontend. You can also
@@ -227,10 +228,11 @@ A bare `python -m build` builds its wheel from the source distribution, which
 excludes generated native files, so that wheel is pure Python even if the
 checkout contains a built host.
 
-Unlike executable freezing, wheel building does not discover additional system
-libraries. Linux/macOS wheels linked to system SDL require those libraries on
-the recipient's machine unless separately bundled and repaired for distribution.
-The automated workflow tests the pure library, then real native rendering and
+Unlike executable freezing, a local wheel build does not discover additional
+system libraries. Linux and macOS wheels produced by `python -m pysual package --wheel`
+use the SDL shared libraries found on that machine. The release workflow bundles
+those libraries and checks the result with the build SDK removed from the loader
+path. The test workflow checks the pure library, then real native rendering and
 the independent terminal build across Windows, Linux and macOS. A configured
 workflow is not a substitute for inspecting the results of the release run.
 
@@ -252,8 +254,27 @@ artifact exercised by the installation probe. CI retains the pure wheel and
 source archive once, and each tested native wheel with its compact probe
 results, for 14 days. Artifact names include commit, platform, and Python
 version. Pure artifacts are uploaded before the native build, so the exact
-validated files remain available even if a later stage fails. These artifacts
-are build outputs, not automatically published releases.
+validated files remain available even if a later stage fails. These test
+artifacts are build outputs. Publishing is a separate tag workflow.
+
+## Publish a release
+
+Set `__version__` in `src/pysual/__init__.py`, commit that change, and push a
+tag whose name is `v` plus that version:
+
+```sh
+git tag vX.Y.Z
+git push origin vX.Y.Z
+```
+
+The release workflow builds the pure wheel and source archive, a Windows x64
+wheel, an Apple Silicon wheel with SDL copied into it, and a Linux x64 wheel
+repaired for `manylinux_2_34` (glibc 2.34 or newer, such as Ubuntu 22.04,
+Debian 12, and RHEL 9). It checks each native wheel with the build SDK removed
+from the loader path, attaches the files to the GitHub Release, and uploads
+them to PyPI. PyPI trusts `.github/workflows/release.yml` through the GitHub
+environment named `pypi`. X11, Wayland, OpenGL, and GLib stay on the
+recipient's machine.
 
 For the standalone browser check, install Chromium once and run:
 

@@ -6,7 +6,21 @@ Assign controls, change their properties, and name event handlers. The same
 application runs in a native window, a terminal, or an SVG browser interface.
 Python 3.11+. MIT licensed. Early development; APIs may change.
 
-See the [0.1.1 release notes](https://github.com/PabloMP2P/Pysual/blob/main/CHANGELOG.md) for fixes and supported scope.
+See the [0.1.2 release notes](https://github.com/PabloMP2P/Pysual/blob/main/CHANGELOG.md) for fixes and supported scope.
+
+## Install
+
+A published release installs with pip. Python 3.11 or newer:
+
+```sh
+python -m pip install pysual
+```
+
+Windows x64, Linux x64, and Apple Silicon wheels include the native window host
+and the SDL libraries it needs. Other platforms receive the pure-Python wheel,
+whose Python terminal and web backends are ready to use. Building a window host
+for another platform is described in
+[building](https://github.com/PabloMP2P/Pysual/blob/main/docs/building.md).
 
 ## Start in a browser
 

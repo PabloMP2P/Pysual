@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.2 — 2026-10-16
+
+Published releases install with `pip install pysual`. Windows x64, Linux x64,
+and Apple Silicon wheels include the native window host and its SDL libraries.
+Other platforms receive the pure-Python wheel, with the Python terminal and web
+backends. A `v*` tag that matches `__version__` builds those wheels, checks
+them outside the build SDK, and publishes the GitHub Release and the PyPI files.
+
+Linux wheels require glibc 2.34 or newer. X11, Wayland, OpenGL, and GLib stay
+on the recipient's machine.
+
 ## 0.1.1 — 2026-10-09
 
 First public release of Pysual, a Python 3.11+ UI library for native windows,

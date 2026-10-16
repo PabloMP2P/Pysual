@@ -1,0 +1,225 @@
+name: Release
+
+# PyPI trusts this filename and the GitHub environment below. The pending
+# publisher is registered as workflow release.yml and environment pypi.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require the tag to match the package version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          grep -F -x "__version__ = \"${version}\"" src/pysual/__init__.py
+
+  pure:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the pure wheel and source archive
+        run: |
+          python -m pip install 'build>=1.2'
+          python -m build --sdist --wheel
+      - name: Check the pure wheel outside the checkout
+        run: python tools/check_wheel.py --kind pure
+      - name: Collect distributions
+        run: |
+          mkdir -p release
+          cp dist/*.whl dist/*.tar.gz release/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-pure
+          path: release/*
+          if-no-files-found: error
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the native wheel
+        run: |
+          python -m pip install -e '.[build]'
+          python -m pysual native
+          python -m pysual package --wheel
+      - name: Check the installed wheel
+        run: python tools/check_wheel.py --kind native
+      - name: Collect the wheel
+        shell: bash
+        run: |
+          mkdir -p release
+          cp dist/*.whl release/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: release/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: diagnostics-windows
+          path: |
+            release/
+            .build/wheel-probes/
+          if-no-files-found: ignore
+
+  macos:
+    needs: version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Match the wheel to this runner's macOS version
+        run: |
+          major="$(sw_vers -productVersion | cut -d. -f1)"
+          echo "MACOSX_DEPLOYMENT_TARGET=${major}.0" >> "$GITHUB_ENV"
+      - name: Install native prerequisites
+        run: brew install pkg-config freetype harfbuzz libpng jpeg-turbo cmake
+      - name: Build pinned SDL libraries
+        run: bash .github/scripts/build_pinned_sdl.sh
+      - name: Build the native wheel
+        run: |
+          python -m pip install -e '.[build]'
+          python -m pysual native
+          python -m pysual package --wheel
+      - name: Copy SDL libraries into the wheel
+        run: |
+          python -m pip install 'delocate>=0.12'
+          mkdir -p release
+          delocate-wheel --verbose -w release dist/*.whl
+      - name: Reject a wheel that still points at the build machine
+        run: |
+          staged="$(mktemp -d)"
+          unzip -q release/*.whl -d "$staged"
+          host="$(find "$staged" -type f -name pysual-host)"
+          otool -L "$host"
+          if otool -L "$host" | grep -E '/opt/homebrew|\.build/sdk'; then
+            echo "Native host still references libraries from the build machine" >&2
+            exit 1
+          fi
+      - name: Check the installed wheel without the build SDK on the loader path
+        run: |
+          unset DYLD_LIBRARY_PATH LD_LIBRARY_PATH PKG_CONFIG_PATH
+          python tools/check_wheel.py --kind native --wheel release/*.whl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: release/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: diagnostics-macos
+          path: |
+            release/
+            .build/wheel-probes/
+          if-no-files-found: ignore
+
+  linux:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the manylinux wheel
+        run: |
+          docker run --rm --entrypoint bash \
+            -v "${{ github.workspace }}:/io" \
+            -w /io \
+            quay.io/pypa/manylinux_2_34_x86_64 \
+            /io/.github/scripts/build_portable_linux_wheel.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Collect the repaired wheel
+        run: |
+          mkdir -p release
+          cp wheelhouse/*.whl release/
+      - name: Install desktop libraries and reject an incomplete wheel
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev libxtst-dev libwayland-dev libxkbcommon-dev libdrm-dev libgbm-dev libgl1-mesa-dev libgl1-mesa-dri
+          staged="$(mktemp -d)"
+          unzip -q release/*.whl -d "$staged"
+          host="$(find "$staged" -type f -name pysual-host -print -quit)"
+          ldd "$host"
+          if ldd "$host" | grep -E 'not found|\.build/sdk'; then
+            echo "Native host is missing a library or still points at the build SDK" >&2
+            exit 1
+          fi
+      - name: Check the installed wheel without the build SDK on the loader path
+        run: |
+          unset LD_LIBRARY_PATH DYLD_LIBRARY_PATH PKG_CONFIG_PATH
+          SDL_VIDEO_DRIVER=x11 LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a python tools/check_wheel.py --kind native --wheel release/*.whl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: release/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: diagnostics-linux
+          path: |
+            release/
+            wheelhouse/
+            .build/wheel-probes/
+          if-no-files-found: ignore
+
+  publish:
+    needs: [pure, windows, macos, linux]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      actions: read
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: downloaded
+      - name: Collect the release files
+        run: |
+          mkdir -p dist
+          find downloaded -type f \( -name '*.whl' -o -name '*.tar.gz' \) -exec cp -t dist {} +
+          find dist -type f -print
+          python - <<'PY'
+          from pathlib import Path
+          names = sorted(path.name for path in Path("dist").iterdir() if path.is_file())
+          print("\n".join(names))
+          assert sum(name.endswith("-none-any.whl") for name in names) == 1
+          assert sum(name.endswith(".tar.gz") for name in names) == 1
+          assert sum("win_amd64" in name for name in names) == 1
+          assert sum("manylinux" in name and "x86_64" in name for name in names) == 1
+          assert sum("macosx" in name and "arm64" in name for name in names) == 1
+          assert not any(name.endswith("-linux_x86_64.whl") for name in names)
+          assert len(names) == 5, names
+          PY
+      - name: Publish the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          attestations: true
+          skip-existing: true

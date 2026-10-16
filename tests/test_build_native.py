@@ -43,6 +43,12 @@ def test_native_rejects_partial_roots_before_compiler_lookup(monkeypatch):
         native.main(["--sdl-root", "/somewhere"])
 
 
+def test_runtime_path_records_origin_and_link_directories():
+    flags = native._runtime_path_flags(["-I/usr/include", "-L/opt/sdl/lib", "-lSDL3", "-L"])
+    origin = "@loader_path" if native.sys.platform == "darwin" else "$ORIGIN"
+    assert flags == [f"-Wl,-rpath,{origin}", "-Wl,-rpath,/opt/sdl/lib"]
+
+
 def test_pkgconfig_accepts_distribution_aliases(monkeypatch):
     seen = []
     class Result:
@@ -193,5 +199,7 @@ def test_posix_build_keeps_platform_dependency_boundaries(tmp_path, monkeypatch,
     assert not any("user32" in arg.lower() or "ws2_32" in arg.lower() for arg in command)
     assert ("-lSDL3" in command) is (not terminal_only)
     assert ("-DPYSUAL_WITH_WINDOW" in command) is (not terminal_only)
+    origin = "@loader_path" if platform == "darwin" else "$ORIGIN"
+    assert (f"-Wl,-rpath,{origin}" in command) is (not terminal_only)
     source = "window_stub.c" if terminal_only else "sdl_renderer.c"
     assert str(tmp_path / "native" / source) in command

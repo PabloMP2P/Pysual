@@ -116,6 +116,14 @@ def pkg_config_flags():
     return shlex.split(subprocess.check_output(["pkg-config", "--cflags", "--libs", *packages], text=True))
 
 
+def _runtime_path_flags(libraries):
+    """Record where the dynamic loader can find the SDL libraries just linked."""
+    origin = "@loader_path" if sys.platform == "darwin" else "$ORIGIN"
+    flags = [f"-Wl,-rpath,{origin}"]
+    flags.extend(f"-Wl,-rpath,{item[2:]}" for item in libraries if item.startswith("-L") and len(item) > 2)
+    return flags
+
+
 def _copy_gnu_runtime(compiler, executable):
     """Carry direct MinGW runtime dependencies into the native package directory."""
     directory = Path(compiler).resolve().parent
@@ -197,6 +205,8 @@ def main(argv=None):
             libraries.append("User32.lib" if msvc else "-luser32")
     else:
         libraries += ["-lm", "-pthread"]
+        if not args.terminal_only:
+            libraries.extend(_runtime_path_flags(list(libraries)))
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     scratch = ROOT / ".build/native"
