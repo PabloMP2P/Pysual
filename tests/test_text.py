@@ -1,12 +1,17 @@
 """Unicode conformance, document normalization and long-line interaction."""
 
+import copy
+import pickle
+from threading import Lock
+
+from _ui_testcase import UIOwnerTestCase
 from pathlib import Path
 import unittest
-from pysual import App, Button, Style, TextBox, light
+from pysual import App, Button, Style, TextBox, dark, light
 from pysual.graphemes import boundaries, is_boundary, next_boundary, previous_boundary
 from pysual.host import Input
 from pysual.layout import arrange
-from pysual.painting import paint_tree
+from pysual.painting import Painter, paint_tree
 from pysual.runtime import Runtime
 from test_library import RecordingHost
 
@@ -140,6 +145,55 @@ class TextTests(unittest.TestCase):
         self.assertLess(sum(map(len, host.texts)), 100)
         text.handle_input(Input("key_down", key="ArrowLeft"))
         self.assertEqual(text.selection_range, (999999, 999999))
+
+
+class TextCopyingTests(UIOwnerTestCase):
+    def restorers(self):
+        return [("deepcopy", copy.deepcopy), *(
+            (f"pickle {protocol}", lambda original, protocol=protocol:
+             pickle.loads(pickle.dumps(original, protocol=protocol)))
+            for protocol in range(pickle.HIGHEST_PROTOCOL + 1)
+        )]
+
+    def test_editor_copy_keeps_document_history_without_backend_metric_caches(self):
+        editor = TextBox(text="Before\n" + "AV To " * 30, multiline=True,
+                         width=200, height=100)
+        self.addCleanup(editor.destroy)
+        editor.select(0, 6)
+        editor.replace_selection("After")
+        host = RecordingHost()
+        host.size = (200, 100)
+        host.connection_lock = Lock()
+        arrange(editor, host)
+        editor.paint(Painter(host, editor.bounds, dark(), editor))
+        editor.handle_input(Input("key_down", key="ArrowDown"))
+        self.assertIs(editor._preferred_column[0][0], host)
+        host.texts.clear()
+        editor.paint(Painter(host, editor.bounds, dark(), editor))
+        editor._pointer_columns(None, "AV To", 15, host, 16, False)
+        self.assertIs(editor._measure_host, host)
+        self.assertIs(editor._hit_host, host)
+        before = (editor.text, editor.selection_range, editor._scroll,
+                  editor._scroll_x, copy.deepcopy(editor._undo))
+        for name, restore in self.restorers():
+            with self.subTest(restoration=name):
+                clone = restore(editor)
+                self.addCleanup(clone.destroy)
+                self.assertEqual((clone.text, clone.selection_range, clone._scroll,
+                                  clone._scroll_x, clone._undo), before)
+                self.assertIsNone(clone._measure_host)
+                self.assertIsNone(clone._hit_host)
+                target = RecordingHost()
+                target.size = host.size
+                arrange(clone, target)
+                clone.paint(Painter(target, clone.bounds, dark(), clone))
+                self.assertEqual(target.texts, host.texts)
+                self.assertIs(clone._measure_host, target)
+                self.assertIs(editor._measure_host, host)
+                clone.undo()
+                self.assertTrue(clone.text.startswith("Before\n"))
+                self.assertTrue(editor.text.startswith("After\n"))
+                self.assertEqual(editor._undo, before[-1])
 
 
 if __name__ == "__main__":

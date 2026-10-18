@@ -176,7 +176,8 @@ class Engine:
         return self._loop
 
     def is_ui_thread(self) -> bool:
-        return self._ident == threading.get_ident()
+        ident = self._ident
+        return ident is not None and ident == threading.get_ident()
 
     def _serve(self) -> None:
         try:
@@ -194,6 +195,8 @@ class Engine:
             self._reject_pending()
             self._loop.close()
             self._ident = None  # A later OS thread may reuse the numeric ID.
+            if _instance is self:
+                _set_ui_ident(None)
 
     def _admit(
         self, function: Callable[[], Any], *, asynchronous: bool = False
@@ -538,14 +541,27 @@ def get_engine() -> Engine:
                 from ._config import freeze
 
                 _ = freeze()
-                _instance = Engine()
+                engine = Engine()
+                # Only the process UI owner publishes the module fast path.
+                # Independent engines keep their own dispatch identity.
+                _set_ui_ident(engine.call(threading.get_ident))
+                _instance = engine
     return _instance
 
 
+_ui_ident: int | None = None
+
+
+def _set_ui_ident(ident: int | None) -> None:
+    global _ui_ident
+    _ui_ident = ident
+
+
 def is_ui_thread() -> bool:
-    return sys.platform == "emscripten" or (
-        _instance is not None and _instance.is_ui_thread()
-    )
+    if sys.platform == "emscripten":
+        return True
+    ident = _ui_ident
+    return ident is not None and ident == threading.get_ident()
 
 
 def check_ui_thread() -> None:

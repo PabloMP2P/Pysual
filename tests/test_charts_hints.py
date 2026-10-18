@@ -1,24 +1,206 @@
 """Bounded chart rendering and noninteractive hint lifetimes."""
 
 import asyncio
+import copy
+import pickle
+from threading import Lock
 import unittest
-from _ui_testcase import AsyncUIOwnerTestCase
+from _ui_testcase import AsyncUIOwnerTestCase, UIOwnerTestCase
 from dataclasses import FrozenInstanceError
 from decimal import Inexact, Overflow, Underflow, localcontext
 from math import isfinite
 from unittest.mock import patch
+from weakref import ref
 
 from test_library import RecordingHost, eventually
 
-from pysual import App, ChartSeries, LineChart
+from pysual import App, ChartSeries, LineChart, Rect, dark
+from pysual._text_layout import TextLayoutCache
 from pysual.charts import ChartSlice, DonutChart
 from pysual.host import Input
 from pysual.layout import arrange
-from pysual.painting import paint_tree
+from pysual.painting import Painter, paint_tree
 from pysual.runtime import Runtime
 
 
+class MetricCacheHost(RecordingHost):
+    """Opt into the same stable metrics contract as the built-in hosts."""
+
+    def __init__(self):
+        super().__init__()
+        self._text_layout_cache = TextLayoutCache()
+        self.resource_revision = 0
+
+
 class ChartTests(unittest.TestCase):
+    def test_axis_cache_tracks_host_identity_and_reuses_unchanged_metrics(self):
+        from pysual import charts
+
+        class WideHost(MetricCacheHost):
+            def measure(self, text, size, mono=False):
+                width, height = super().measure(text, size, mono)
+                return width * 4, height
+
+        app = App()
+        self.addCleanup(app.destroy)
+        chart = LineChart(parent=app, show_legend=False,
+            series=(ChartSeries("s", "S", ((0, 10000), (10, 10001))),))
+        ordinary, wide = MetricCacheHost(), WideHost()
+        box = Rect(0, 0, 560, 300)
+        with patch.object(charts, "_axis_labels", wraps=charts._axis_labels) as labels:
+            chart.paint(Painter(ordinary, box, app.theme, chart))
+            self.assertEqual(labels.call_count, 2)
+            ordinary.texts.clear()
+            chart.paint(Painter(ordinary, box, app.theme, chart))
+            self.assertEqual(labels.call_count, 2)
+            chart.paint(Painter(wide, box, app.theme, chart))
+            self.assertEqual(labels.call_count, 4)
+        self.assertEqual(ordinary.texts[:5],
+                         ["10000", "10000.25", "10000.5", "10000.75", "10001"])
+        self.assertEqual(wide.texts[:5], ["0", "0.25", "0.5", "0.75", "1"])
+        self.assertIn("+10000", wide.texts)
+
+    def test_custom_host_metrics_are_remeasured_after_repaint(self):
+        class DynamicHost(RecordingHost):
+            factor = 1
+
+            def measure(self, text, size, mono=False):
+                width, height = super().measure(text, size, mono)
+                return width * self.factor, height
+
+        for properties in ({}, {"cache_measure": False, "cache_paint": False}):
+            with self.subTest(properties=properties):
+                chart = LineChart(show_legend=False, **properties,
+                    series=(ChartSeries("s", "S", ((0, 10000), (10, 10001))),))
+                self.addCleanup(chart.destroy)
+                host, box = DynamicHost(), Rect(0, 0, 560, 300)
+                chart.paint(Painter(host, box, dark(), chart))
+                self.assertEqual(host.texts[:5],
+                                 ["10000", "10000.25", "10000.5", "10000.75", "10001"])
+                host.factor = 4
+                host.texts.clear()
+                chart.invalidate()
+                chart.paint(Painter(host, box, dark(), chart))
+                self.assertEqual(host.texts[:5], ["0", "0.25", "0.5", "0.75", "1"])
+                self.assertIn("+10000", host.texts)
+                self.assertIsNone(chart._axis_layout)
+
+    def test_axis_cache_tracks_opted_in_host_resource_revision(self):
+        from pysual import charts
+
+        class DynamicHost(MetricCacheHost):
+            factor = 1
+
+            def measure(self, text, size, mono=False):
+                width, height = super().measure(text, size, mono)
+                return width * self.factor, height
+
+        chart = LineChart(show_legend=False,
+            series=(ChartSeries("s", "S", ((0, 10000), (10, 10001))),))
+        self.addCleanup(chart.destroy)
+        host, box = DynamicHost(), Rect(0, 0, 560, 300)
+        with patch.object(charts, "_axis_labels", wraps=charts._axis_labels) as labels:
+            chart.paint(Painter(host, box, dark(), chart))
+            chart.paint(Painter(host, box, dark(), chart))
+            self.assertEqual(labels.call_count, 2)
+            host.factor = 4
+            host.resource_revision += 1
+            host.texts.clear()
+            chart.invalidate()
+            chart.paint(Painter(host, box, dark(), chart))
+            self.assertEqual(labels.call_count, 4)
+            self.assertEqual(host.texts[:5], ["0", "0.25", "0.5", "0.75", "1"])
+            self.assertIn("+10000", host.texts)
+            chart.paint(Painter(host, box, dark(), chart))
+            self.assertEqual(labels.call_count, 4)
+
+    def test_axis_cache_can_be_disabled_and_reenabled(self):
+        from pysual import charts
+
+        chart = LineChart(show_legend=False,
+            series=(ChartSeries("s", "S", ((0, 10000), (10, 10001))),))
+        self.addCleanup(chart.destroy)
+        host, box = MetricCacheHost(), Rect(0, 0, 560, 300)
+        with patch.object(charts, "_axis_labels", wraps=charts._axis_labels) as labels:
+            chart.paint(Painter(host, box, dark(), chart))
+            expected = list(host.texts)
+            self.assertIsNotNone(chart._axis_layout)
+            chart.cache_measure = False
+            for _ in range(2):
+                host.texts.clear()
+                chart.paint(Painter(host, box, dark(), chart))
+                self.assertEqual(host.texts, expected)
+                self.assertIsNone(chart._axis_layout)
+            self.assertEqual(labels.call_count, 6)
+            chart.cache_measure = True
+            chart.paint(Painter(host, box, dark(), chart))
+            chart.paint(Painter(host, box, dark(), chart))
+            self.assertEqual(labels.call_count, 8)
+            self.assertIsNotNone(chart._axis_layout)
+
+    def test_direct_axis_cache_tracks_fixed_rows_without_arranging(self):
+        from pysual import charts
+
+        class RowHost(MetricCacheHost):
+            text_row_height = 16
+
+            def measure(self, text, size, mono=False):
+                width, height = super().measure(text, size, mono)
+                return width * self.text_row_height / 16, height
+
+        chart = LineChart(show_legend=False,
+            series=(ChartSeries("s", "S", ((0, 10000), (10, 10001))),))
+        self.addCleanup(chart.destroy)
+        host, box = RowHost(), Rect(0, 0, 560, 300)
+        points = chart._points
+        with patch.object(charts, "_axis_labels", wraps=charts._axis_labels) as labels:
+            chart.paint(Painter(host, box, dark(), chart))
+            self.assertEqual(host.texts[:5],
+                             ["10000", "10000.25", "10000.5", "10000.75", "10001"])
+            chart.paint(Painter(host, box, dark(), chart))
+            self.assertEqual(labels.call_count, 2)
+            host.texts.clear()
+            host.text_row_height = 64
+            chart.paint(Painter(host, box, dark(), chart))
+            self.assertEqual(labels.call_count, 4)
+            self.assertEqual(host.texts[:5], ["0", "0.25", "0.5", "0.75", "1"])
+            self.assertIn("+10000", host.texts)
+            chart.paint(Painter(host, box, dark(), chart))
+            self.assertEqual(labels.call_count, 4)
+        self.assertIs(chart._points, points)
+
+    def test_direct_axis_cache_does_not_keep_its_host_alive(self):
+        chart = LineChart(show_legend=False,
+            series=(ChartSeries("s", "S", ((0, 10000), (10, 10001))),))
+        self.addCleanup(chart.destroy)
+        host = MetricCacheHost()
+        host_ref = ref(host)
+        chart.paint(Painter(host, Rect(0, 0, 560, 300), dark(), chart))
+        self.assertIsNotNone(chart._axis_layout)
+        del host
+        self.assertIsNone(host_ref())
+
+    def test_direct_chart_accepts_a_host_without_weak_reference_support(self):
+        class SlotHost:
+            __slots__ = ("target",)
+
+            def __init__(self):
+                self.target = MetricCacheHost()
+
+            def __getattr__(self, name):
+                return getattr(self.target, name)
+
+        chart = LineChart(show_legend=False,
+            series=(ChartSeries("s", "S", ((0, 10000), (10, 10001))),))
+        self.addCleanup(chart.destroy)
+        host = SlotHost()
+        for _ in range(2):
+            host.target.texts.clear()
+            chart.paint(Painter(host, Rect(0, 0, 560, 300), dark(), chart))
+            self.assertEqual(host.target.texts[:5],
+                             ["10000", "10000.25", "10000.5", "10000.75", "10001"])
+            self.assertIsNone(chart._axis_layout)
+
     def test_donut_center_text_is_complete_or_absent_in_a_short_chart(self):
         app, host = App(), RecordingHost()
         self.addCleanup(app.destroy)
@@ -452,3 +634,96 @@ class HintTests(AsyncUIOwnerTestCase):
         finally:
             runtime._stop.set()
             await task
+
+
+class ChartCopyingTests(UIOwnerTestCase):
+    def restorers(self):
+        return [("deepcopy", copy.deepcopy), *(
+            (f"pickle {protocol}", lambda original, protocol=protocol:
+             pickle.loads(pickle.dumps(original, protocol=protocol)))
+            for protocol in range(pickle.HIGHEST_PROTOCOL + 1)
+        )]
+
+    def test_directly_painted_detached_chart_copies_without_its_backend_cache(self):
+        original = LineChart(show_legend=False,
+            series=(ChartSeries("s", "S", ((0, 10000), (10, 10001))),))
+        self.addCleanup(original.destroy)
+        host = MetricCacheHost()
+        host.connection_lock = Lock()  # A real NativeHost also owns locks.
+        box = Rect(0, 0, 560, 300)
+        original.paint(Painter(host, box, dark(), original))
+        cached = original._axis_layout
+        self.assertIsNotNone(cached)
+        points = original._points
+        for name, restore in self.restorers():
+            with self.subTest(restoration=name):
+                cloned = restore(original)
+                try:
+                    self.assertIsNone(cloned.parent)
+                    self.assertIsNone(cloned._axis_layout)
+                    self.assertEqual(cloned.series, original.series)
+                    self.assertEqual(cloned._points, points)
+                    target = MetricCacheHost()
+                    cloned.paint(Painter(target, box, dark(), cloned))
+                    self.assertEqual(target.texts, host.texts)
+                    self.assertIsNotNone(cloned._axis_layout)
+                    self.assertIs(original._axis_layout, cached)
+                    self.assertIs(original._points, points)
+                    cloned.series = (ChartSeries("other", "Other", ((0, 0), (10, 1))),)
+                    self.assertNotEqual(cloned.series, original.series)
+                finally:
+                    cloned.destroy()
+
+    def test_restored_chart_without_new_axis_cache_state_can_paint(self):
+        original = LineChart(show_legend=False,
+            series=(ChartSeries("s", "S", ((0, 10000), (10, 10001))),))
+        self.addCleanup(original.destroy)
+        # Public-dev charts predate this cache. Their pickled object state has
+        # no _axis_layout member and restoration does not call _initialize.
+        del original._axis_layout
+        restored = pickle.loads(pickle.dumps(original))
+        self.addCleanup(restored.destroy)
+        self.assertIsNone(restored._axis_layout)
+        host = RecordingHost()
+        restored.paint(Painter(host, Rect(0, 0, 560, 300), dark(), restored))
+        self.assertEqual(host.texts[:5],
+                         ["10000", "10000.25", "10000.5", "10000.75", "10001"])
+
+    def test_public_donut_state_recomputes_geometry_and_paints(self):
+        chart = DonutChart(slices=(ChartSlice("a", "A", 1),))
+        self.addCleanup(chart.destroy)
+        # Public dev kept these three derived values in its object dictionary.
+        state = dict(chart.__dict__)
+        del state["_donut_geometry"]
+        state.update(_fractions=(1.0,), _total_text="1", _arcs=[()])
+        chart.__dict__.clear()
+        chart.__setstate__(state)
+        self.assertIsNone(chart._donut_geometry)
+        self.assertNotIn("_arcs", chart.__dict__)
+        host, box = RecordingHost(), Rect(0, 0, 360, 340)
+        chart.paint(Painter(host, box, dark(), chart))
+        self.assertEqual(chart._fractions, (1.0,))
+        self.assertEqual(chart._painted_segments, 512)
+        self.assertIn("A", host.texts)
+        chart.slices = (ChartSlice("b", "B", 2), ChartSlice("c", "C", 2))
+        chart.paint(Painter(host, box, dark(), chart))
+        self.assertEqual(chart._fractions, (0.5, 0.5))
+        self.assertIn("B", host.texts)
+
+    def test_donut_copies_discard_geometry_and_rebuild_identical_output(self):
+        chart = DonutChart(slices=(ChartSlice("a", "A", 1), ChartSlice("b", "B", 3)))
+        self.addCleanup(chart.destroy)
+        host, box = RecordingHost(), Rect(0, 0, 360, 340)
+        chart.paint(Painter(host, box, dark(), chart))
+        geometry, arcs = chart._donut_geometry, chart._arcs
+        for name, restore in self.restorers():
+            with self.subTest(restoration=name):
+                clone = restore(chart)
+                self.addCleanup(clone.destroy)
+                self.assertIsNone(clone._donut_geometry)
+                target = RecordingHost()
+                clone.paint(Painter(target, box, dark(), clone))
+                self.assertEqual(target.texts, host.texts)
+                self.assertEqual(clone._arcs, arcs)
+                self.assertIsNot(clone._arcs, arcs)
+                self.assertIs(chart._donut_geometry, geometry)

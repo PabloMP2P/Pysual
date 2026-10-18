@@ -225,6 +225,7 @@ class Rating(Control):
     use intrinsic, font-scaled slots and clip when the available width shrinks.
     """
 
+    _paint_reuse = False
     cache_paint: bool = prop(default=True)
     value: int = prop(default=0, minimum=0, changed="changed")
     maximum: int = prop(default=5, minimum=1, affects=Dirty.MEASURE | Dirty.PAINT)

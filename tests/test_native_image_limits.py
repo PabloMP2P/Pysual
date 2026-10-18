@@ -3,6 +3,7 @@
 import base64
 from pathlib import Path
 import struct
+import tempfile
 import time
 import unittest
 from uuid import uuid4
@@ -39,7 +40,7 @@ def solid_png(width, height, bit_depth=8, color_type=6):
 @unittest.skipUnless(native_executable().is_file(), "Build the full native helper")
 class NativeImageLimits(unittest.TestCase):
     def setUp(self):
-        self.directory = ROOT / "work" / "native-image-limits" / uuid4().hex
+        self.directory = Path(tempfile.gettempdir()) / "pysual-tests" / "native-image-limits" / uuid4().hex
         self.directory.mkdir(parents=True)
         self.addCleanup(self.directory.rmdir)
         self.events = []

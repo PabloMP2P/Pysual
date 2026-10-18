@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 import time
 import unittest
 from uuid import uuid4
@@ -245,6 +246,13 @@ class NativeProtocolTests(unittest.TestCase):
         wide = self.client.request("measure", text="WWWW", size=16, mono=True)
         self.assertEqual(small[0], wide[0])
 
+    def test_large_multiline_measurement_does_not_overflow_pixel_height(self):
+        line_height = self.client.request("measure", text="", size=2048)[1]
+        lines = 1_000_001
+        measured = self.client.request("measure", text="\n" * (lines - 1), size=2048)
+        self.assertEqual(measured, [0, line_height * lines])
+        self.assertGreater(measured[1], 2 ** 31)
+
     def test_native_animation_repaints_without_python_updates(self):
         commands = [["begin", "#101010"], ["animated_rect", [0, 10, 40, 40], "#00ffaa", 8, "", 0,
                      {"property": "x", "from": 0, "to": 200, "duration": .2, "loop": True, "yoyo": True}]]
@@ -450,7 +458,7 @@ class NativeTerminalPatchProtocolTests(unittest.TestCase):
 @unittest.skipUnless(EXE.is_file(), "Build the standalone C host first")
 class NativeImageReloadTests(unittest.TestCase):
     def test_reload_refreshes_shared_sources_and_retries_failures_without_resubmission(self):
-        directory = PACKAGE.parents[1] / "work" / "image-reload-tests" / uuid4().hex
+        directory = Path(tempfile.gettempdir()) / "pysual-tests" / "image-reload-tests" / uuid4().hex
         directory.mkdir(parents=True)
         source, other, capture = (directory / name for name in ("preview.png", "other.png", "frame.png"))
         self.addCleanup(directory.rmdir)

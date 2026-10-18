@@ -163,7 +163,9 @@ class Runtime:
                 if self._pending_size.get(axis) == acknowledged[axis]:
                     self._pending_size.pop(axis, None)
             if axis not in self._pending_size:
-                self.app._values[axis] = actual
+                stored = self.app._values[axis]
+                if stored != actual or type(stored) is not type(actual):
+                    self.app._values[axis] = actual
         if previous != self.viewport:
             if previous.scale != self.viewport.scale:
                 self.render_cache.clear()
@@ -522,7 +524,10 @@ class Runtime:
                     if owner.popup is not None:
                         owner.popup.dismiss(restore_focus=False)
                     owner.invalidate()
-                app._values["width"], app._values["height"] = self.host.size
+                width, height = self.host.size
+                if (app._values["width"] != width or type(app._values["width"]) is not type(width)
+                        or app._values["height"] != height or type(app._values["height"]) is not type(height)):
+                    app._values["width"], app._values["height"] = width, height
                 self._sync_viewport()
                 app._attach_dispatcher(self.dispatcher)
                 self._paint_frame()

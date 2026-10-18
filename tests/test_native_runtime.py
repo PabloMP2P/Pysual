@@ -64,6 +64,23 @@ def until(predicate):
 
 @unittest.skipUnless(native_executable().is_file(), "Build the native helper")
 class NativeRuntimeTests(unittest.TestCase):
+    def test_native_repaint_replays_unchanged_on_demand_scene(self):
+        app = App(width=160, height=96, reduce_motion=True, redraw_interval=None)
+        Label(parent=app, text="Unchanged")
+        host = NativeHost(hidden=True, vsync=False)
+        try:
+            app.run(backend=host)
+            # Ensure the initial asynchronous commit has reached presentation.
+            until(lambda: host.native_stats()["frames"] > 0)
+            before = host.native_stats()
+            host._on_event({"kind": "repaint"})
+            until(lambda: host.native_stats()["frames"] > before["frames"])
+            self.assertEqual(host.native_stats()["scene_updates"], before["scene_updates"])
+        finally:
+            app.close()
+            app.wait(timeout=5)
+            app.destroy()
+
     def test_long_proportional_unicode_and_password_lines_open_and_scroll(self):
         for value, properties in (("a" * 2000, {}), ("a" * 20000, {}),
                                   ("é" * 2000, {"monospace": True}),

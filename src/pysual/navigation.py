@@ -36,6 +36,7 @@ def _caption(p: Painter, text: str, area: Rect, style: ResolvedStyle) -> None:
 class _PartControl(Control):
     """One gesture owner; concrete controls retain selection and validation."""
 
+    _paint_reuse = False
     cache_paint: bool = prop(default=True)
     focusable: bool = prop(default=True, affects=Dirty.HIT_TEST)
 

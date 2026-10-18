@@ -13,6 +13,9 @@ from typing import cast
 from unicodedata import normalize
 
 
+MEASURE_CACHE_TEXT_LIMIT = 4096
+
+
 @lru_cache(maxsize=2)
 def font_bytes(mono: bool = False) -> bytes:
     return (
@@ -163,7 +166,7 @@ def measure(text: str, size: float, mono: bool = False) -> tuple[float, float]:
         raise ValueError("Font size must be finite and between 0 and 2048 pixels")
     return (
         _measure_cached(text, size, mono)
-        if len(text) <= 4096
+        if len(text) <= MEASURE_CACHE_TEXT_LIMIT
         else _measure(text, size, mono)
     )
 

@@ -1,8 +1,10 @@
 """Application-relative resources remain independent of the helper's cwd."""
 
 import asyncio
+import contextlib
 import os
 from pathlib import Path
+import tempfile
 import unittest
 from uuid import uuid4
 
@@ -15,9 +17,6 @@ from pysual.backends.native import NativeHost
 from pysual.image_resources import image_source
 from pysual.runtime import Runtime
 from test_native_window import bmp_pixels
-
-ROOT = Path(__file__).resolve().parents[1]
-
 
 class NativeResourceCommands(unittest.TestCase):
     def test_uri_sources_are_preserved_and_local_paths_are_rebased(self):
@@ -43,7 +42,7 @@ class NativeResourceCommands(unittest.TestCase):
 @unittest.skipUnless(native_executable().is_file(), "Build the native helper")
 class NativeImageReloadRuntime(AsyncUIOwnerTestCase):
     async def test_reload_refreshes_shared_cached_controls_and_missing_file(self):
-        directory = ROOT / "work" / "reload-runtime" / uuid4().hex
+        directory = Path(tempfile.gettempdir()) / "pysual-tests" / "reload-runtime" / uuid4().hex
         directory.mkdir(parents=True)
         asset, missing, output = (directory / name for name in ("preview.png", "missing.png", "frame.bmp"))
         red = encode_png(1, 1, bytes((255, 0, 0, 255)))
@@ -143,7 +142,7 @@ class NativeResourceRendering(unittest.TestCase):
         self.assertEqual(decoded_sizes[0], decoded_sizes[1])
 
     def test_decoded_storage_budget_rejection_preserves_the_committed_scene(self):
-        directory = ROOT / "work" / "resource-budget" / uuid4().hex
+        directory = Path(tempfile.gettempdir()) / "pysual-tests" / "resource-budget" / uuid4().hex
         directory.mkdir(parents=True)
         output = directory / "frame.bmp"
         self.addCleanup(directory.rmdir)
@@ -177,7 +176,7 @@ class NativeResourceRendering(unittest.TestCase):
                 host.close()
 
     def test_relative_absolute_and_data_images_render_in_both_native_backends(self):
-        directory = ROOT / "work" / "relative-images" / uuid4().hex
+        directory = Path(tempfile.gettempdir()) / "pysual-tests" / "relative-images" / uuid4().hex
         directory.mkdir(parents=True)
         asset, output = directory / "red.png", directory / "frame.bmp"
         self.addCleanup(directory.rmdir)
@@ -185,6 +184,7 @@ class NativeResourceRendering(unittest.TestCase):
         self.addCleanup(asset.unlink, missing_ok=True)
         data = encode_png(3, 3, bytes((255, 0, 0, 255)) * 9)
         asset.write_bytes(data)
+        self.enterContext(contextlib.chdir(directory))
         sources = (os.path.relpath(asset), str(asset), image_source(data))
         for backend in ("window", "terminal"):
             host = (NativeHost(hidden=True, vsync=False) if backend == "window"

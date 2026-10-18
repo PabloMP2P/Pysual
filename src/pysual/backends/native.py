@@ -16,6 +16,7 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Any, Literal, NotRequired, Protocol, TypedDict, cast
 
+from .._text_layout import TextLayoutCache
 from ..geometry import Rect
 from ..host import CapabilityError, Input, MAX_TEXT_BYTES, Viewport
 from ..theme import ResolvedStyle, Style
@@ -59,12 +60,15 @@ def _rect(rect: Rect | None) -> list[float] | None:
     return None if rect is None else [rect.x, rect.y, rect.width, rect.height]
 
 
+_STYLE_NAMES = tuple(field.name for field in fields(Style))
+
+
 def _style(style: Style | ResolvedStyle) -> dict[str, object]:
     # Style validates immutable scalars, so only the wire mapping needs a copy.
     # Narrow once. Casting every field would run on each recorded face.
     if not isinstance(style, Style):
         raise TypeError("Resolved style must be a Style")
-    return {field.name: getattr(style, field.name) for field in fields(style)}
+    return {name: getattr(style, name) for name in _STYLE_NAMES}
 
 
 def _image_source(source: str) -> str:
@@ -130,9 +134,11 @@ class NativeHost(NativeServices):
         self._commands: list[object] = []
         self._scene_background: str | None = None
         self._scene_pending: _ScenePending | None = None
+        self._repaint_pending = False
         self._segment: _Segment | None = None
         self._metrics: OrderedDict[_MetricKey, tuple[_Metric, int]] = OrderedDict()
         self._metric_bytes = 0
+        self._text_layout_cache = TextLayoutCache()
         self._settings: dict[str, _Setting] = {}
         self._transition_seconds = 0.0
         self._title: str | None = None
@@ -272,6 +278,7 @@ class NativeHost(NativeServices):
             self.resource_revision += 1
             self._metrics.clear()
             self._metric_bytes = 0
+            self._text_layout_cache.clear()
 
     def poll(self) -> list[Input]:
         with self._event_lock:
@@ -294,6 +301,10 @@ class NativeHost(NativeServices):
                 data["viewport"] = _viewport(data["viewport"], self.size)
             if data["kind"] == "error" and not data.get("text"):
                 data["text"] = str(raw.get("error", "Native host failed"))
+            if data["kind"] in ("repaint", "resume"):
+                # The OS can require presentation without changing the scene.
+                # Consume this on the UI owner, alongside the runtime's event.
+                self._repaint_pending = True
             events.append(Input(**cast(Any, data)))
         return events
 
@@ -351,6 +362,7 @@ class NativeHost(NativeServices):
     def begin(self, background: str) -> None:
         self._scene_pending = None
         self._commands = []
+        self._segment = None
         self._commands.append(["begin", background])
 
     def begin_scene(self, background: str) -> None:
@@ -418,6 +430,8 @@ class NativeHost(NativeServices):
         previous = self._metrics.pop(key, None)
         if previous is not None:
             self._metric_bytes -= previous[1]
+            if previous[0] != result:
+                self._text_layout_cache.clear()
         while self._metrics and (
             len(self._metrics) >= 16384 or self._metric_bytes + cost > 16 * 1024 * 1024
         ):
@@ -622,11 +636,12 @@ class NativeHost(NativeServices):
                     or "order" in pending or "background" in pending):
                 self._request("patch", **pending, transition_seconds=self._transition_seconds)
                 self._scene_background = pending.get("background", self._scene_background)
-            else:
-                # Runtime repaints share the native cap; deliberate low-level
-                # presents still complete immediately without a scene update.
+            elif not scheduled or self._repaint_pending:
+                # Ordinary unchanged updates need no IPC. Expose/resume events
+                # still present the retained scene, respecting the frame cap.
                 self._request("present", scheduled=scheduled)
             self._scene_pending = None
+        self._repaint_pending = False
         self._transition_seconds = 0.0
 
     def text_input(self, rect: Rect | None) -> None:
@@ -685,8 +700,10 @@ class NativeHost(NativeServices):
             self._opened = False
             self._commands.clear()
             self._scene_pending = self._segment = None
+            self._repaint_pending = False
             self._metrics.clear()
             self._metric_bytes = 0
+            self._text_layout_cache.clear()
 
 
 class NativeTermTextHost(NativeHost):

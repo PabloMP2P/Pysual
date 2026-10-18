@@ -25,6 +25,19 @@ from .menus import Menu, MenuBar
 from .popup import Popup
 from .tree import TreeView
 from ._registry import register_control
+from ._paint_state import install_builtin_painting
+
+# Private composition parts also belong to the framework's finite paint
+# catalog. They are not constructor/factory registrations exposed to users.
+from ._controls.choices import _Choices
+from .cards import _DisclosureHeader
+from .data_grid import _BooleanEditor, _CellEditor, _CellMessage
+from .dates import _CalendarEntry, _CalendarNavButton, _DayButton
+from .editing import _EditorMessage
+from .editors import _ColorChannel, _ColorEntry
+from .fields import _ClearButton, _SearchEntry, _SearchIcon
+from .hints import _Hint
+from .menus import _MenuRows
 
 
 @dataclass(frozen=True)
@@ -84,6 +97,13 @@ BUILTIN_CONTROLS = (
 
 
 def install_builtin_controls() -> None:
+    install_builtin_painting(Control, (
+        *(entry.control_type for entry in BUILTIN_CONTROLS),
+        _Choices, _DisclosureHeader, _BooleanEditor, _CellEditor, _CellMessage,
+        _CalendarEntry, _CalendarNavButton, _DayButton, _EditorMessage,
+        _ColorChannel, _ColorEntry, _ClearButton, _SearchEntry, _SearchIcon,
+        _Hint, _MenuRows,
+    ))
     for entry in BUILTIN_CONTROLS:
         register_control(
             entry.control_type, name=entry.name, authorable=entry.authorable,

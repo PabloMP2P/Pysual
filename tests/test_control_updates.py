@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 from _ui_testcase import UIOwnerTestCase
 from test_library import RecordingHost
+from test_render_cache import SurfaceHost
 
 from pysual import (
     Button,
@@ -16,18 +17,22 @@ from pysual import (
     Dropdown,
     GridColumn,
     GridRow,
+    Label,
     MenuBar,
     NumericInput,
     ProgressBar,
+    SearchField,
     Slider,
     TextBox,
     TreeNode,
     TreeView,
     get_theme,
     light,
+    dark,
 )
 from pysual.layout import arrange
-from pysual.painting import RetainedPaintTree, resolve_style
+from pysual.painting import Painter, RetainedPaintTree, resolve_style
+from pysual.render_cache import RenderCache
 from pysual.schema import Dirty
 
 
@@ -52,7 +57,9 @@ class ControlUpdateTests(UIOwnerTestCase):
         before = [c._paint_local_revision for c in (root, parent, *children)]
         revisions = [c._paint_revision for c in (root, parent, *children)]
         with patch.object(retained, "invalidate", wraps=retained.invalidate) as invalidated:
-            parent.update_children({c: {"text": "After"} for c in children})
+            parent.update_children(
+                {c: {"text": "After", "foreground": "#123456"} for c in children}
+            )
         self.assertEqual(router.invalidate.call_count, len(children))
         self.assertEqual(invalidated.call_count, len(children))
         self.assertEqual(retained._dirty, {root, *children})
@@ -62,7 +69,7 @@ class ControlUpdateTests(UIOwnerTestCase):
         )
         self.assertEqual(
             [c._paint_revision - old for c, old in zip((root, parent, *children), revisions)],
-            [1, 1, 1, 1, 1],
+            [3, 3, 1, 1, 1],
         )
         root._wake.assert_called_once_with()
 
@@ -83,10 +90,81 @@ class ControlUpdateTests(UIOwnerTestCase):
         child.update(text="After")
         self.assertEqual(notifications, ["foreground", "text"])
         self.assertEqual(child._paint_local_revision, local + 2)
-        self.assertEqual(root._paint_revision, subtree + 1)
+        self.assertEqual(root._paint_revision, subtree + 2)
         self.assertEqual((child.text, child.foreground), ("After", "#123456"))
 
-    def test_update_validates_cross_fields_and_invalidates_ancestors_once(self):
+    def test_custom_commit_accounting_remains_per_field_before_notifications(self):
+        recorded, observed = [], []
+
+        class AccountingLabel(Label):
+            def _record_change(self, field, old, value):
+                recorded.append(field.name)
+                super()._record_change(field, old, value)
+
+            def _changed(self, field, old, value):
+                observed.append(tuple(recorded))
+
+        child = self.keep(AccountingLabel())
+        child.update(text="After", foreground="#123456")
+        self.assertEqual(recorded, ["text", "foreground"])
+        self.assertEqual(observed, [("text", "foreground")] * 2)
+
+    def test_child_batch_refreshes_layout_between_reentrant_notifications(self):
+        host = RecordingHost()
+        root = self.keep(Container(width=300, height=180, layout="stack", spacing=0))
+        observed = []
+
+        class ObservingLabel(Label):
+            def _changed(self, field, old, value):
+                arrange(root, host)
+                observed.append(tuple(child.bounds.height for child in root.children))
+                if field.name == "text" and self is first:
+                    second.update(height=50)
+
+        first = ObservingLabel(parent=root, text="Before", height=20)
+        second = ObservingLabel(parent=root, text="Before", height=20)
+        arrange(root, host)
+        root.update_children({
+            first: {"text": "After", "height": 30},
+            second: {"text": "After", "height": 40},
+        })
+        self.assertEqual(observed, [(30, 20), (30, 50), (30, 50), (30, 40), (30, 40)])
+        self.assertEqual((first.height, second.height), (30, 40))
+
+    def test_failed_batch_hook_keeps_commit_valid_and_later_update_retryable(self):
+        host = RecordingHost()
+        root = self.keep(Container(width=300, height=180, layout="stack", spacing=0))
+
+        class FailingLabel(Label):
+            def _changed(self, field, old, value):
+                if getattr(self, "_fail", False):
+                    raise RuntimeError("notification failed")
+
+        first = FailingLabel(parent=root, text="Before", height=20)
+        second = Label(parent=root, text="Before", height=20)
+        arrange(root, host)
+        first._fail = True
+        updates = {
+            first: {"text": "After", "height": 30, "cache_measure": False},
+            second: {"text": "After", "height": 40},
+        }
+        with self.assertRaisesRegex(RuntimeError, "notification failed"):
+            root.update_children(updates)
+        arrange(root, host)
+        self.assertEqual((first.bounds.height, second.bounds.height), (30, 20))
+        self.assertEqual(root._measure_uncached, 1)
+        self.assertIsNone(root._batch_dirty)
+        self.assertIsNone(first._batch_dirty)
+        first._fail = False
+        root.update_children(updates)
+        arrange(root, host)
+        self.assertEqual((first.bounds.height, second.bounds.height), (30, 40))
+        first.update(cache_measure=True, height=50)
+        self.assertEqual(root._measure_uncached, 0)
+        arrange(root, host)
+        self.assertEqual(first.bounds.height, 50)
+
+    def test_update_validates_cross_fields_and_records_one_atomic_change(self):
         root = self.keep(Container())
         parent = Container(parent=root)
         button = Button(parent=parent, text="Before", min_width=10, max_width=20)
@@ -123,7 +201,7 @@ class ControlUpdateTests(UIOwnerTestCase):
                 (dict(control._values), control._paint_revision, control.dirty), before
             )
 
-    def test_container_batch_preflights_every_child_and_dirties_parent_once(self):
+    def test_container_batch_preflights_every_child_before_recording_changes(self):
         root = self.keep(Container())
         controls = [Button(parent=root, text="Before") for _ in range(500)]
         before = root._paint_revision
@@ -133,7 +211,7 @@ class ControlUpdateTests(UIOwnerTestCase):
                 for control in controls
             }
         )
-        self.assertEqual(root._paint_revision, before + 1)
+        self.assertEqual(root._paint_revision, before + len(controls))
         self.assertTrue(all(control.text == "After" for control in controls))
         previous = root._paint_revision
         with self.assertRaises((TypeError, ValueError)):
@@ -449,3 +527,95 @@ class ControlUpdateTests(UIOwnerTestCase):
         arrange(root, host)
         self.assertTrue(all(control.bounds.height == 23 for control in controls))
         self.assertEqual(root.dirty, Dirty.NONE)
+
+    def test_property_storage_advances_the_visual_epoch(self):
+        import gc
+
+        label = self.keep(Label(text="Hello"))
+        self.assertEqual(label._visual_epoch, 0)
+        self.assertNotIn(label, gc.get_referents(label._values))
+        label.text = "Hello"
+        self.assertEqual(label._visual_epoch, 0)
+        label.text = "Changed"
+        self.assertEqual(label._visual_epoch, 1)
+        stored = label._values["width"]
+        label._values["width"] = stored
+        self.assertEqual(label._visual_epoch, 1)
+        label.update(text="Batch", tooltip="Hint")
+        self.assertEqual(label._visual_epoch, 2)
+        label.update(text="Batch")
+        self.assertEqual(label._visual_epoch, 2)
+        with self.assertRaises(ValueError):
+            label.update(min_width=10, max_width=1)
+        self.assertEqual(label.text, "Batch")
+        self.assertEqual(label._visual_epoch, 2)
+
+        button = self.keep(Button(text="Go"))
+        self.assertEqual(button._visual_epoch, 0)
+        button.shortcut = "Ctrl+S"
+        self.assertEqual(button._visual_epoch, 1)
+
+        box = self.keep(TextBox(text="a\r\nb"))
+        self.assertEqual(box.text, "a b")
+        self.assertEqual(box._visual_epoch, 0)
+        field = self.keep(SearchField(text="a\nb"))
+        self.assertEqual(field.text, "a b")
+        self.assertEqual(field._visual_epoch, 0)
+
+        grid = self.keep(DataGrid(
+            columns=(GridColumn("name", "Name"),),
+            rows=(GridRow("a", ("Before",)),),
+        ))
+        epoch = grid._visual_epoch
+        grid.set_cell("a", "name", "Before")
+        self.assertEqual(grid._visual_epoch, epoch)
+        grid.set_cell("a", "name", "After")
+        self.assertEqual(grid._visual_epoch, epoch + 1)
+        grid.set_data(columns=grid.columns, rows=(GridRow("a", ("Later",)),))
+        self.assertEqual(grid._visual_epoch, epoch + 2)
+
+    def test_batch_notifications_observe_committed_surface_drawing(self):
+        class ObservedLabel(Label):
+            def _changed(self, field, old, value):
+                callback = getattr(self, "_callback", None)
+                if callback is not None:
+                    callback()
+                # Deliberately consume the notification. Core cache validity
+                # must already reflect every committed field before this hook.
+
+        class ReadingContainer(Container):
+            def paint(self, painter):
+                painter.text(self.children[0].text, 0, 0)
+
+        for own_body in (True, False):
+            with self.subTest(own_body=own_body):
+                child = ObservedLabel(text="Before", width=200, height=32)
+                if own_body:
+                    owner = child
+                else:
+                    owner = ReadingContainer(width=300, height=150, cache_paint=True)
+                    owner.add(child)
+                self.addCleanup(owner.destroy)
+                host = SurfaceHost()
+                host.size = (300, 150)
+                arrange(owner, host)
+                cache = RenderCache(host)
+                self.addCleanup(cache.clear)
+
+                def frame():
+                    cache.start_frame()
+                    cache.paint(owner, None, lambda: owner.paint(
+                        Painter(host, owner.bounds, dark(), owner)))
+                    cache.finish_frame()
+
+                frame()
+                frame()
+                self.assertEqual(cache.stats.entries, 1)
+                host.texts.clear()
+                child._callback = frame
+                if own_body:
+                    child.update(text="After", foreground="#123456")
+                    self.assertEqual(host.texts, ["After", "After"])
+                else:
+                    owner.update_children({child: {"text": "After"}})
+                    self.assertEqual(host.texts, ["After"])

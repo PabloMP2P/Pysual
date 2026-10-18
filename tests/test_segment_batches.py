@@ -11,17 +11,46 @@ from pysual.runtime import Runtime
 
 
 class SegmentBatchTests(unittest.TestCase):
-    def test_unchanged_runtime_scene_schedules_but_explicit_present_completes(self):
+    def test_unchanged_scene_skips_ipc_but_explicit_present_completes(self):
         host = NativeHost()
         host._request = Mock(return_value={})
         host._scene_background = "#000000"
         host.begin_scene("#000000")
         host.end_scene()
-        host._request.assert_called_once_with("present", scheduled=True)
+        host._request.assert_not_called()
         host._request.reset_mock()
         host.begin_scene("#000000")
         host.present()
         host._request.assert_called_once_with("present", scheduled=False)
+
+    def test_expose_and_resume_present_an_unchanged_scene_once(self):
+        for kind in ("repaint", "resume"):
+            with self.subTest(kind=kind):
+                host = NativeHost()
+                host._request = Mock(return_value={})
+                host._scene_background = "#000000"
+                host._on_event({"kind": kind})
+                self.assertEqual(host.poll()[0].kind, kind)
+                host.begin_scene("#000000")
+                host.end_scene()
+                host._request.assert_called_once_with("present", scheduled=True)
+                host._request.reset_mock()
+                host.begin_scene("#000000")
+                host.end_scene()
+                host._request.assert_not_called()
+
+    def test_changed_scene_satisfies_pending_expose_without_extra_present(self):
+        host = NativeHost()
+        host._request = Mock(return_value={})
+        host._on_event({"kind": "repaint"})
+        host.poll()
+        host.begin_scene("#123456")
+        host.end_scene()
+        self.assertEqual(host._request.call_args.args, ("patch",))
+        host._request.reset_mock()
+        host.begin_scene("#123456")
+        host.end_scene()
+        host._request.assert_not_called()
 
     def test_painter_offsets_batched_and_fallback_strokes_identically(self):
         segments = ((1, 2, 3, 4), (9, 8, 7, 6))

@@ -9,17 +9,22 @@ from dataclasses import dataclass, replace
 from functools import lru_cache
 from itertools import pairwise
 from math import ceil, erfc, hypot, sqrt
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 from weakref import WeakKeyDictionary
 
 from ._engine import critical_phase, ui_method
 from ._drawing import gradient_fallback, mix_colors as _mix
 from ._nine_slice import MIN_COMPACT_PIXELS, nine_slice
 from ._png import rgba_png_data_uri
+from ._text_layout import TextLayoutCache
+from ._paint_state import (
+    PaintInputs, custom_paint as _custom_paint,
+    paint_inputs, paint_measurements, painting_scope, take_prepared_paint,
+)
 from .geometry import Rect
 from .graphemes import floor_boundary
 from .icons import draw_icon
-from .host import CapabilityError, Host, image_fit_host, optional_host
+from .host import CapabilityError, Host, image_fit_host, optional_host, text_row_height
 from .schema import Dirty, _LAYOUT_MASK, _VISUAL_MASK, _mask
 from .theme import (
     ResolvedStyle,
@@ -390,6 +395,16 @@ def resolve_style(
     return _overridden(s, *overrides) if any(v is not None for v in overrides) else s
 
 
+def _text_cache(host: Host) -> TextLayoutCache | None:
+    """Reuse text work while the host metrics environment is unchanged."""
+    cache = getattr(host, "_text_layout_cache", None)
+    if not isinstance(cache, TextLayoutCache):
+        return None
+    cache.prepare((getattr(host, "resource_revision", 0),
+                   getattr(host, "render_scale", 1), text_row_height(host, 0.0)))
+    return cache
+
+
 class Painter:
     """Control-local drawing commands. Coordinates are logical pixels inside the control."""
 
@@ -410,6 +425,11 @@ class Painter:
         self._styles: dict[tuple[str, bool], ResolvedStyle] = {}
         self._clip = control._clip if control is not None else rect
         self._effect_clip = self._clip
+
+    def _prepared_paint(self) -> object | None:
+        """Take this body's completed preparation, if its inputs remain live."""
+        assert self.control is not None
+        return take_prepared_paint(self.control, self.host)
 
     def effect_bounds(self) -> Rect:
         assert self.control is not None
@@ -548,7 +568,21 @@ class Painter:
         font_family: Literal["ui", "mono"] | None = None,
     ) -> tuple[float, float]:
         size, font_family = self._type_size(size=size, mono=mono, font_family=font_family)
-        return self.host.measure(str(text), size, font_family == "mono")
+        shown = str(text)
+        mono_flag = font_family == "mono"
+        direct_limit = getattr(self.host, "_text_measure_cache_limit", 0)
+        if direct_limit > 0 and len(shown) <= direct_limit:
+            return self.host.measure(shown, size, mono_flag)
+        cache = _text_cache(self.host)
+        key = ("m", shown, size, mono_flag)
+        if cache is not None and len(shown) <= cache.MAX_TEXT:
+            found = cache.get(key)
+            if isinstance(found, tuple):
+                return cast(tuple[float, float], found)
+        result = self.host.measure(shown, size, mono_flag)
+        if cache is not None and len(shown) <= cache.MAX_TEXT:
+            cache.store(key, result)
+        return result
 
     def elide(
         self,
@@ -565,17 +599,66 @@ class Painter:
         if width <= 0:
             return ""
         mono_flag = font_family == "mono"
+        ordinary_measure = type(self).measure is _PAINTER_MEASURE and "measure" not in self.__dict__
+        direct_limit = getattr(self.host, "_text_measure_cache_limit", 0)
+        full_width = None
+        if ordinary_measure and direct_limit > 0 and len(text) <= direct_limit:
+            # SVG's bundled-font service already caches these full metrics.
+            # Fitting captions need neither another cache nor its environment.
+            full_width = self.host.measure(text, size, mono_flag)[0]
+            if full_width <= width:
+                return text
+        # Fitted results depend on the Painter's measurement contract. A
+        # custom measure may still use the raw metric service internally.
+        cache = _text_cache(self.host) if ordinary_measure else None
+        key = ("e", text, width, size, mono_flag)
+        if cache is not None and len(text) <= cache.MAX_TEXT:
+            # A full measurement proves that the caption fits at any wider
+            # width. Reuse it directly instead of storing a second entry for
+            # every fitting width and walking the measurement path again.
+            # Raw host metrics cannot replace an overridden Painter.measure.
+            metric_key = ("m", text, size, mono_flag)
+            if ordinary_measure and full_width is None:
+                metric = cache.get(metric_key)
+                if isinstance(metric, tuple):
+                    full_width = metric[0]
+                    if full_width <= width:
+                        return text
+            found = cache.get(key)
+            if isinstance(found, str):
+                return found
+            if ordinary_measure and full_width is None:
+                # The size, face and cache environment are already resolved.
+                # Avoid repeating that work through measure on a cold caption.
+                metric = self.host.measure(text, size, mono_flag)
+                cache.store(metric_key, metric)
+                full_width = metric[0]
+                if full_width <= width:
+                    return text
         measured = optional_host(self.host, "measure_many")
         if measured is not None:
-            return self._elide_many(text, width, size, mono_flag, measured.measure_many)
-        if self.host.measure(text, size, mono_flag)[0] <= width:
+            result = self._elide_many(
+                text, width, size, mono_flag, measured.measure_many, full_width,
+            )
+        else:
+            result = self._elide_single(text, width, size, mono_flag, full_width)
+        if cache is not None and result != text and len(text) <= cache.MAX_TEXT:
+            cache.store(key, result)
+        return result
+
+    def _elide_single(
+        self, text: str, width: float, size: float, mono: bool, full_width: float | None = None,
+    ) -> str:
+        if full_width is None:
+            full_width = self.measure(text, size=size, mono=mono, font_family="mono" if mono else "ui")[0]
+        if full_width <= width:
             return text
-        if self.host.measure("…", size, mono_flag)[0] > width:
+        if self.measure("…", size=size, mono=mono, font_family="mono" if mono else "ui")[0] > width:
             return ""
         low, high = 0, len(text)
         while low < high:
             middle = (low + high + 1) // 2
-            if self.host.measure(text[:middle] + "…", size, mono_flag)[0] <= width:
+            if self.measure(text[:middle] + "…", size=size, mono=mono, font_family="mono" if mono else "ui")[0] <= width:
                 low = middle
             else:
                 high = middle - 1
@@ -590,11 +673,14 @@ class Painter:
         size: float,
         mono: bool,
         many: Callable[[Iterable[str], float, bool], Iterable[tuple[float, float]]],
+        full_width: float | None = None,
     ) -> str:
         """Measure truncation candidates in one host round trip when possible."""
         if not text:
             return text
-        if self.host.measure(text, size, mono)[0] <= width:
+        if full_width is None:
+            full_width = self.measure(text, size=size, mono=mono, font_family="mono" if mono else "ui")[0]
+        if full_width <= width:
             return text
         # Batch short captions; longer captions need only the fitting interval.
         if len(text) <= 32:
@@ -632,7 +718,7 @@ class Painter:
         # of prefixes. Narrow them logarithmically before the final small batch.
         while upper - fitted > 32:
             middle = (fitted + upper) // 2
-            if self.host.measure(text[:middle] + "…", size, mono)[0] <= width:
+            if self.measure(text[:middle] + "…", size=size, mono=mono, font_family="mono" if mono else "ui")[0] <= width:
                 fitted = middle
             else:
                 upper = middle
@@ -1097,33 +1183,60 @@ class Painter:
             self.host.clip(self._clip)
 
 
-class _PaintKey(NamedTuple):
-    revision: int
-    bounds: Rect
-    clip: Rect
-    paint_clip: Rect
-    theme: Theme
-    enabled: bool
-    hover: bool
-    pressed: bool
-    focused: bool
-    layout: object
+_PAINTER_MEASURE = Painter.measure
 
 
 @dataclass
 class _PaintSegment:
     identity: str
-    key: _PaintKey | None = None
+    key: PaintInputs | None = None
     start_index: int = 0
     end_index: int = 0
 
 
-def _custom_paint(control: Control) -> bool:
-    """Inherited framework painters obey local invalidation independently."""
-    return any(
-        not getattr(getattr(type(control), hook), "__module__", "").startswith("pysual.")
-        for hook in ("paint", "paint_bounds")
-    )
+def _prefetch_caption_metrics(host: Host, controls: Sequence[Control]) -> None:
+    """Batch full captions actually needed by the pending built-in bodies.
+
+    Results go into the shared text service, not a private backend dictionary.
+    Elision requests its candidates only after this full caption overflows.
+    Hosts without the optional cache/batching interfaces keep demand measuring.
+    """
+    measured = optional_host(host, "measure_many")
+    cache = _text_cache(host)
+    if measured is None or cache is None or not controls:
+        return
+    groups: dict[tuple[float, bool], dict[str, tuple[object, ...]]] = {}
+    for control in controls:
+        for text, size, mono in paint_measurements(control):
+            if len(text) > cache.MAX_TEXT:
+                continue
+            key = ("m", text, size, mono)
+            if cache.get(key) is None:
+                groups.setdefault((size, mono), {})[text] = key
+    for (size, mono), pending in groups.items():
+        texts = list(pending)
+        start = 0
+        while start < len(texts):
+            end = start
+            batch_bytes = 128  # Reserve the measurement request envelope.
+            while end < len(texts) and end - start < 512:
+                # Like elision batches, budget for both UTF-8 and JSON control
+                # escapes. Eligible captions are individually below this limit.
+                cost = len(texts[end]) * 6 + 3
+                if end > start and batch_bytes + cost > _ELIDE_BATCH_BYTES:
+                    break
+                batch_bytes += cost
+                end += 1
+            batch = texts[start:end]
+            results = measured.measure_many(batch, size, mono)
+            for text, result in zip(batch, results, strict=True):
+                cache.store(pending[text], result)
+            start = end
+
+
+def _retains_segments(host: object) -> bool:
+    """True when an omitted segment stays on the host instead of being cleared."""
+    return "scene_patches" in getattr(host, "capabilities", ())
 
 
 class RetainedPaintTree:
@@ -1147,7 +1260,7 @@ class RetainedPaintTree:
         self._order: list[str] = []
         self._focus: Control | None = None
         self._drop_target: Control | None = None
-        self._environment: tuple[object, object] | None = None
+        self._environment: tuple[object, object, float] | None = None
         self._modality_order: tuple[Control, ...] = ()
         self._pending_remove: set[str] = set()
         self._metadata_dirty: set[Control] = set()
@@ -1203,23 +1316,14 @@ class RetainedPaintTree:
             identity = self._identities[control] = f"control:{self._next_identity}"
         return identity
 
-    def _key(self, control: Control, focus: Control | None) -> _PaintKey:
-        # A few framework containers paint geometry derived during layout even
-        # when their own rectangle/properties are unchanged (scrollbars and
-        # split dividers). Declare that dependency rather than treating every
-        # descendant edit as a body change on every ancestor.
-        layout_key = getattr(control, "_paint_layout_key", None)
-        return _PaintKey(
-            control._paint_local_revision,
-            control._rect,
-            control._clip,
-            control._paint_clip,
-            control._fast_theme(),
-            control._committed_enabled(),
-            control._hover,
-            control._pressed,
-            control is focus,
-            layout_key() if layout_key is not None else None,
+    def _key(self, control: Control, focus: Control | None) -> PaintInputs:
+        # Segments and surfaces share one completed dependency snapshot.
+        # Revision fallback is local here; a surface can depend on descendants.
+        record = self._records.get(control)
+        return paint_inputs(
+            control, self.host, focus, None, local=True,
+            reuse=_retains_segments(self.host),
+            previous=None if record is None else record.key,
         )
 
     def _reconcile_tree(
@@ -1230,8 +1334,8 @@ class RetainedPaintTree:
         affected: set[Control],
         *,
         full: bool = False,
-        prepared: dict[Control, _PaintKey] | None = None,
-    ) -> tuple[list[str], bool, dict[Control, _PaintKey]]:
+        prepared: dict[Control, PaintInputs] | None = None,
+    ) -> tuple[list[str], bool, dict[Control, PaintInputs]]:
         previous = self._records
         ranges = {control: (record.start_index, record.end_index)
                   for control, record in previous.items()}
@@ -1306,7 +1410,7 @@ class RetainedPaintTree:
         return removed, changed, prepared
 
     def _draw_body(
-        self, control: Control, record: _PaintSegment, focus: Control | None, key: _PaintKey
+        self, control: Control, record: _PaintSegment, focus: Control | None, key: PaintInputs
     ) -> None:
         host = self.host
         theme = key[4]
@@ -1373,6 +1477,7 @@ class RetainedPaintTree:
         environment = (
             getattr(host, "render_scale", 1),
             getattr(host, "resource_revision", 0),
+            text_row_height(host, 0.0),
         )
         if environment != self._environment:
             self.invalidate_all()
@@ -1387,7 +1492,7 @@ class RetainedPaintTree:
                 dirty.add(control)
         remove: list[str] = []
         order_changed = False
-        prepared: dict[Control, _PaintKey] = {}
+        prepared: dict[Control, PaintInputs] = {}
         if not reconcile:
             # Custom inherited policies may change private state and call the
             # ordinary invalidate() (PAINT only). Check already-dirty containers
@@ -1411,13 +1516,15 @@ class RetainedPaintTree:
         # cache_paint itself is a local drawing change. Refresh admission even
         # when unrelated topology changes reused this control's subtree.
         for control in dirty:
-            if control in self._records and not control._disposed and _custom_paint(control):
-                if control._values["cache_paint"]:
-                    self._uncached_custom.discard(control)
-                else:
-                    self._uncached_custom.add(control)
+            if control not in self._records or control._disposed:
+                continue
+            if control._values["cache_paint"]:
+                self._uncached_custom.discard(control)
+            elif _custom_paint(control):
+                self._uncached_custom.add(control)
         candidates = set(prepared) | dirty | self._uncached_custom
         getattr(host, "begin_scene")(root._fast_theme().tokens.background)
+        bodies: list[tuple[Control, _PaintSegment, PaintInputs]] = []
         for control in candidates:
             record = self._records.get(control)
             if record is None or control._disposed:
@@ -1427,7 +1534,10 @@ class RetainedPaintTree:
                 key = self._key(control, focus)
             if (force or record.key != key or control in self._uncached_custom
                     or control in dirty and _custom_paint(control)):
-                self._draw_body(control, record, focus, key)
+                bodies.append((control, record, key))
+        _prefetch_caption_metrics(host, [control for control, _record, _key in bodies])
+        for control, record, key in bodies:
+            self._draw_body(control, record, focus, key)
         if target not in self._records:
             target = None
         target_changed = target is not self._drop_target
@@ -1465,7 +1575,7 @@ def paint_tree(
     retained: RetainedPaintTree | None = None,
     layout_changed: bool = False,
 ) -> None:
-    with critical_phase("layout and paint"):
+    with critical_phase("layout and paint"), painting_scope():
         if retained is not None:
             return retained.paint(root, focus, layout_changed=layout_changed)
         return _paint_tree(root, host, focus, cache)

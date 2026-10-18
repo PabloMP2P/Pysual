@@ -24,6 +24,7 @@ from .host import Host, Input
 
 
 class _MenuRows(ListView):
+    _paint_reuse = False
     style_parts: ClassVar[tuple[str, ...]] = (
         "body",
         "row",
@@ -459,6 +460,7 @@ def _shortcut(owner: Menu | MenuBar, items: Iterable[MenuItem], shortcut: str) -
 
 
 class Menu(Control):
+    _paint_reuse = False
     items: tuple[MenuItem, ...] = prop(default=(), persist=False)
     width: float | None = prop(default=0.0, minimum=0, affects=Dirty.MEASURE)
     height: float | None = prop(default=0.0, minimum=0, affects=Dirty.MEASURE)
@@ -495,6 +497,7 @@ class Menu(Control):
 
 
 class MenuBar(Control):
+    _paint_reuse = False
     cache_paint: bool = prop(default=True)
     groups: tuple[MenuGroup, ...] = prop(default=(), persist=False)
     focusable: bool = prop(default=True, affects=Dirty.HIT_TEST)

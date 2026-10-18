@@ -1,9 +1,12 @@
 """Measurement reuse respects host openings, metric changes and shutdown."""
 
+from weakref import ref
+
 from _ui_testcase import AsyncUIOwnerTestCase
 from test_library import RecordingHost
 
-from pysual import App, Container, Control, Rect, TextBox
+from pysual import App, ChartSeries, Container, Control, LineChart, Rect, TextBox
+from pysual._text_layout import TextLayoutCache
 from pysual.layout import _size
 from pysual.painting import Painter
 from pysual.runtime import Runtime
@@ -15,6 +18,26 @@ class MetricHost(RecordingHost):
     def __init__(self, advance=40):
         super().__init__()
         self.advance = advance
+
+
+class ChartMetricHost(MetricHost):
+    """Opt into stable metrics while discarding them across host openings."""
+
+    def __init__(self, advance=40):
+        super().__init__(advance)
+        self._text_layout_cache = TextLayoutCache()
+
+    def open(self, title, width, height, resizable, scale):
+        self._text_layout_cache.clear()
+        super().open(title, width, height, resizable, scale)
+
+    def close(self):
+        self._text_layout_cache.clear()
+        super().close()
+
+    def measure(self, text, size, mono=False):
+        width, height = super().measure(text, size, mono)
+        return width * self.advance / 40, height
 
 
 class HostMeasured(Control):
@@ -81,6 +104,51 @@ class MeasurementCacheRuntimeTests(AsyncUIOwnerTestCase):
         await first._cleanup()
         self.start(MetricHost(90))
         self.assertEqual(self.control.bounds.width, 90)
+
+    async def test_chart_axes_refresh_on_same_and_different_host_reopen(self):
+        chart = LineChart(parent=self.app, width=560, height=300, show_legend=False,
+            series=(ChartSeries("s", "S", ((0, 10000), (10, 10001))),))
+        for same_host in (True, False):
+            with self.subTest(same_host=same_host):
+                ordinary = ChartMetricHost(40)
+                first = self.start(ordinary)
+                self.assertEqual(ordinary.texts[:5],
+                    ["10000", "10000.25", "10000.5", "10000.75", "10001"])
+                self.assertIsNotNone(chart._axis_layout)
+                measured_revision = chart._measure_revision
+                await first._cleanup()
+                self.assertGreater(chart._measure_revision, measured_revision)
+                wider = ordinary if same_host else ChartMetricHost(160)
+                wider.advance = 160
+                second = self.start(wider)
+                self.assertEqual(wider.texts[:5], ["0", "0.25", "0.5", "0.75", "1"])
+                self.assertIn("+10000", wider.texts)
+                self.assertIsNotNone(chart._axis_layout)
+                await second._cleanup()
+
+    def test_chart_axes_discard_preopen_font_measurements(self):
+        chart = LineChart(parent=self.app, width=560, height=300, show_legend=False,
+            series=(ChartSeries("s", "S", ((0, 10000), (10, 10001))),))
+        host = ChartMetricHost(40)
+        chart.paint(Painter(host, Rect(0, 0, 560, 300), self.app.theme, chart))
+        self.assertIsNotNone(chart._axis_layout)
+        host.advance = 160
+        self.start(host)
+        self.assertEqual(host.texts[:5], ["0", "0.25", "0.5", "0.75", "1"])
+        self.assertIn("+10000", host.texts)
+
+    def test_destroyed_chart_releases_its_axis_measurement_host(self):
+        chart = LineChart(parent=self.app, width=560, height=300, show_legend=False,
+            series=(ChartSeries("s", "S", ((0, 10000), (10, 10001))),))
+        host = ChartMetricHost(40)
+        host_ref = ref(host)
+        chart.paint(Painter(host, Rect(0, 0, 560, 300), self.app.theme, chart))
+        self.assertIsNotNone(chart._axis_layout)
+        chart.destroy()
+        chart.destroy()  # Repeated destruction remains harmless.
+        del host
+        self.assertTrue(chart._disposed)
+        self.assertIsNone(host_ref())
 
     def test_repaint_after_resource_change_remeasures_and_rearranges(self):
         host = MetricHost(40)

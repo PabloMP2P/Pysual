@@ -22,7 +22,7 @@ GENERATORS = (
 
 def run_generator(name, directory, *arguments):
     return subprocess.run(
-        [sys.executable, "-I", str(ROOT / "tools" / name), *map(str, arguments)],
+        [sys.executable, "-I", "-B", str(ROOT / "tools" / name), *map(str, arguments)],
         cwd=directory, capture_output=True, text=True, timeout=20,
     )
 

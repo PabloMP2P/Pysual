@@ -219,6 +219,12 @@ class ListView(Control):
         if self._scroll != previous_scroll:
             self.invalidate()
 
+    def _paint_inputs(self) -> tuple[object, ...]:
+        return (self._scroll,)
+
+    def _prepare_paint(self, host: Host) -> None:
+        self._clamp_scroll()
+
     def paint(self, p: Painter, /) -> None:
         s = p.body()
         with p._clipped(Rect(0, 0, p.width, p.height)):

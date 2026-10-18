@@ -135,7 +135,7 @@ class TerminalSelectionTests(unittest.TestCase):
             "h.open('isolated',160,64,False,1)", "h.begin('#000000')", "h.present()", "h.close()",
             "assert not any(n in sys.modules for n in ('sdl3','pygame','pyray','PIL'))",
         ))
-        subprocess.run([sys.executable, "-I", "-c", script], check=True, timeout=10)
+        subprocess.run([sys.executable, "-I", "-B", "-c", script], check=True, timeout=10)
 
 
 @unittest.skipUnless(native_executable().is_file(), "Build the C helper for native terminal selection tests")

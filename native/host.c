@@ -56,7 +56,7 @@ typedef struct {
     uint32_t last_request;
     int initialized, continuous, closing, disconnected, protocol_error, has_scene, suspended, needs_draw,
         update_pending;
-    double started, last_frame, close_deadline, interval, fps_limit, update_started;
+    double started, last_frame, close_deadline, interval, fps_limit, update_started, frame_defer_until;
     uint64_t frames, commands, events, scene_updates;
     double draw_seconds, present_seconds;
     double last_draw_seconds, max_draw_seconds, last_present_seconds, max_present_seconds;
@@ -214,6 +214,7 @@ static int draw(Host *h, char *error, int n) {
         h->frames++;
         h->last_frame = now_seconds();
         h->needs_draw = 0;
+        h->frame_defer_until = 0;
         if (h->update_pending) {
             double finished = h->last_frame;
             h->last_scene_render_seconds = h->last_draw_seconds + h->last_present_seconds;
@@ -555,7 +556,45 @@ static void receive_input(Host *h) {
     }
 }
 
-static void process_input(Host *h) {
+static int pending_input(Host *h);
+
+static int socket_readable(Host *h) {
+    char byte;
+    int received = (int)recv(h->socket, &byte, 1, MSG_PEEK);
+    if (received > 0)
+        return 1;
+    if (received == 0 || !would_block())
+        h->disconnected = 1;
+    return 0;
+}
+
+/* Python scene work is a burst of measure/patch requests. A continuous present
+   between them blocks the next request for a whole frame, so wait briefly for
+   a follow-up that is already being sent. The whole burst shares one deadline:
+   sustained service requests must not starve native animation/presentation. */
+static int follow_up_arrived(Host *h) {
+    fd_set reading;
+    struct timeval timeout;
+    double remaining;
+    int result;
+    if (h->disconnected || pending_input(h) || socket_readable(h))
+        return !h->disconnected;
+    remaining = h->frame_defer_until - now_seconds();
+    if (remaining <= 0)
+        return 0;
+    /* Replies have already drained. Sleep until more input or the remaining
+       burst deadline instead of polling an empty socket for that interval. */
+    timeout.tv_sec = 0;
+    timeout.tv_usec = (long)(remaining * 1e6);
+    FD_ZERO(&reading);
+    FD_SET(h->socket, &reading);
+    result = select((int)h->socket + 1, &reading, NULL, NULL, &timeout);
+    if (result < 0 && !would_block())
+        h->disconnected = 1;
+    return result > 0 && !h->disconnected && socket_readable(h);
+}
+
+static unsigned process_input(Host *h) {
     unsigned count = 0;
     size_t consumed = 0;
     while (!h->closing && !h->disconnected && count < COMMAND_BUDGET && h->output_size <= COMMAND_WATERMARK &&
@@ -578,6 +617,7 @@ static void process_input(Host *h) {
         memmove(h->input, h->input + consumed, h->input_size - consumed);
         h->input_size -= consumed;
     }
+    return count;
 }
 
 static int pending_input(Host *h) {
@@ -751,7 +791,7 @@ int main(int argc, char **argv) {
             receive_input(&h);
         if (h.disconnected)
             break;
-        process_input(&h);
+        unsigned serviced = process_input(&h);
         flush_output(&h);
         if (h.initialized && !h.closing) {
             cJSON *events = h.terminal ? pt_poll(h.terminal) : px_renderer_poll(h.renderer), *event;
@@ -772,8 +812,22 @@ int main(int argc, char **argv) {
             if (have_events)
                 flush_output(&h);
         }
-        if (!h.disconnected && wants_frame(&h) && frame_delay(&h) <= 0 && !draw(&h, error, sizeof(error)))
-            begin_close(&h, "native_error", error);
+        if (!h.disconnected && wants_frame(&h) && frame_delay(&h) <= 0) {
+            int defer = 0;
+            /* Coalesce a short service burst, but never restart its deadline.
+               A committed scene presents after this command-processing budget. */
+            if (!h.frame_defer_until)
+                h.frame_defer_until = now_seconds() + 0.002;
+            if (!h.needs_draw && now_seconds() < h.frame_defer_until) {
+                defer = pending_input(&h);
+                if (!defer && serviced && !h.output_size)
+                    defer = follow_up_arrived(&h);
+            }
+            if (h.disconnected)
+                break;
+            if (!defer && !draw(&h, error, sizeof(error)))
+                begin_close(&h, "native_error", error);
+        }
         if (!h.disconnected)
             wait_for_io(&h);
     }

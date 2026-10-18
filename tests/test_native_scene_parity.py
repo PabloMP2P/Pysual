@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from uuid import uuid4
 
@@ -37,7 +38,7 @@ class Primitives(Control):
 @unittest.skipUnless(HOST.is_file(), "Build the C host first")
 class NativeSceneParityTests(UIOwnerTestCase):
     def setUp(self):
-        self.directory = ROOT / "work" / "scene-parity" / uuid4().hex
+        self.directory = Path(tempfile.gettempdir()) / "pysual-tests" / "scene-parity" / uuid4().hex
         self.directory.mkdir(parents=True)
         self.output = self.directory / "frame.bmp"
         self.host = NativeHost(hidden=True, vsync=False)

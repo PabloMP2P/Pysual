@@ -1,10 +1,18 @@
 """Constraint, track, wrapping and dock behavior through ordinary containers."""
 
+import gc
+from random import Random
+from unittest.mock import patch
+from weakref import ref
 import unittest
 
-from pysual import App, Container, Control
+from _ui_testcase import UIOwnerTestCase
+
+from pysual import App, Container, Control, Dirty, Label, ScrollArea
 from pysual.geometry import Rect
-from pysual.layout import arrange
+from pysual.layout import _clear_measurements, arrange
+from pysual.host import Viewport
+import pysual.layout as layout
 from test_library import RecordingHost
 
 
@@ -381,6 +389,548 @@ class ResponsiveLayoutTests(unittest.TestCase):
         fill.dock = "left"
         fill.visible = True
         dock.validate_layout()
+
+
+class CountingChildren(list):
+    def __init__(self, children):
+        super().__init__(children)
+        self.visits = 0
+
+    def __iter__(self):
+        for child in super().__iter__():
+            self.visits += 1
+            yield child
+
+
+class IncrementalGridTests(UIOwnerTestCase):
+    def setUp(self):
+        self.root = App(width=640, height=400)
+        self.host = RecordingHost()
+
+    def tearDown(self):
+        self.root.destroy()
+
+    def test_fixed_grid_content_edit_does_not_scan_siblings(self):
+        grid = Container(parent=self.root, layout="grid", width=600, height=350,
+                         columns=20, spacing=0)
+        labels = [Label(parent=grid, text=str(i)) for i in range(2000)]
+        grid._children = CountingChildren(grid._children)
+        arrange(self.root, self.host)
+        plan = grid._layout_plan
+        boxes = plan.boxes
+        grid._children.visits = 0
+        labels[1000].text = "Changed content"
+        self.assertTrue(self.root.dirty & Dirty.MEASURE)
+        self.assertEqual(grid._layout_children_dirty, {labels[1000]})
+        arrange(self.root, self.host)
+        self.assertIs(grid._layout_plan, plan)
+        self.assertIs(grid._layout_plan.boxes, boxes)
+        self.assertEqual(grid._children.visits, 0)
+        self.assertFalse(labels[1000].dirty & Dirty.MEASURE)
+
+    def test_fixed_grid_geometry_edits_only_recompute_changed_child_boxes(self):
+        grid = Container(parent=self.root, layout="grid", width=600, height=350,
+                         columns=20, spacing=0)
+        labels = [Label(parent=grid, text=str(i)) for i in range(2000)]
+        grid._children = CountingChildren(grid._children)
+        arrange(self.root, self.host)
+        plan = grid._layout_plan
+        original_slots = plan.slots
+        grid._children.visits = 0
+        for values, expected in (
+            ({"margin": 1}, Rect(1, 176, 28, 1.5)),
+            ({"width": 10, "height": 15}, Rect(1, 176, 10, 15)),
+            ({"min_width": 20, "max_height": 10}, Rect(1, 176, 20, 10)),
+            ({"width": None, "height": None, "margin": 0}, Rect(0, 175, 30, 3.5)),
+        ):
+            with self.subTest(values=values):
+                labels[1000].update(**values)
+                with (patch.object(layout, "_grid_tracks", wraps=layout._grid_tracks) as tracks,
+                      patch.object(layout, "_grid_child_box", wraps=layout._grid_child_box) as boxes):
+                    arrange(self.root, self.host)
+                self.assertEqual(tracks.call_count, 0)
+                self.assertEqual(boxes.call_count, 1)
+                self.assertEqual(grid._children.visits, 0)
+                self.assertIs(grid._layout_plan, plan)
+                self.assertIs(plan.slots, original_slots)
+                self.assertEqual(labels[1000].bounds, expected)
+
+        grid.update_children({label: {"margin": 2} for label in labels[:16]})
+        with (patch.object(layout, "_grid_tracks", wraps=layout._grid_tracks) as tracks,
+              patch.object(layout, "_grid_child_box", wraps=layout._grid_child_box) as boxes):
+            arrange(self.root, self.host)
+        self.assertEqual(tracks.call_count, 0)
+        self.assertEqual(boxes.call_count, 16)
+        self.assertEqual(grid._children.visits, 0)
+
+    def test_structure_and_auto_tracks_rebuild_track_allocation(self):
+        grid = Container(parent=self.root, layout="grid", width=300, height=200,
+                         columns=3, spacing=0)
+        labels = [Label(parent=grid, text=str(i)) for i in range(6)]
+        arrange(self.root, self.host)
+        for change in (lambda: labels[0].update(grid_col_span=2),
+                       lambda: labels[1].update(visible=False),
+                       lambda: grid.update(column_tracks=("auto", "*", "*")),
+                       lambda: labels[0].update(margin=10)):
+            change()
+            with patch.object(layout, "_grid_tracks", wraps=layout._grid_tracks) as tracks:
+                arrange(self.root, self.host)
+            self.assertGreater(tracks.call_count, 0)
+
+    def test_custom_arranger_geometry_changes_settle_in_the_current_pass(self):
+        class UpdatingGrid(Container):
+            def arrange_children(self, area, measure):
+                if getattr(self, "_change_sibling", False):
+                    self._change_sibling = False
+                    self.children[1].margin = 7
+                return None
+
+        grid = UpdatingGrid(parent=self.root, layout="grid", width=200, height=100,
+                            columns=2, spacing=0)
+        first, second = Label(parent=grid), Label(parent=grid)
+        arrange(self.root, self.host)
+        grid._change_sibling = True
+        first.text = "Trigger the custom hook"
+        arrange(self.root, self.host)
+        self.assertEqual(second.bounds, Rect(107, 7, 86, 86))
+
+    def test_dirty_custom_siblings_keep_tree_order_when_observing_geometry(self):
+        class ObservingContainer(Container):
+            def _initialize(self):
+                super()._initialize()
+                self._hash = 0
+                self._previous = None
+                self._observations = []
+
+            def __hash__(self):
+                return self._hash
+
+            def arrange_children(self, area, measure):
+                if self._previous is not None:
+                    self._observations.append(self._previous.bounds.width)
+                return None
+
+        grid = Container(parent=self.root, layout="grid", width=200, height=100,
+                         columns=2, spacing=0)
+        first = ObservingContainer(width=40)
+        first._hash = 7
+        grid.add(first)
+        second = ObservingContainer(width=30)
+        second._hash = 1
+        second._previous = first
+        grid.add(second)
+        arrange(self.root, self.host)
+        first.width, second.width = 70, 50
+        second._observations.clear()
+        arrange(self.root, self.host)
+        incremental = list(second._observations)
+        self.assertEqual(incremental, [70])
+        second._observations.clear()
+        _clear_measurements(self.root)
+        arrange(self.root, self.host)
+        self.assertEqual(second._observations, incremental)
+
+    def test_arrange_hook_can_destroy_and_add_children_during_dirty_plan_reuse(self):
+        class StructuralGrid(Container):
+            def arrange_children(self, area, measure):
+                if getattr(self, "_replace_child", False):
+                    self._replace_child = False
+                    self.children[1].destroy()
+                    Label(parent=self, text="Added", width=45)
+                return None
+
+        grid = StructuralGrid(parent=self.root, layout="grid", width=200, height=100,
+                              columns=2, spacing=0)
+        first, removed = Label(parent=grid), Label(parent=grid)
+        arrange(self.root, self.host)
+        # Both original controls are pending when the hook replaces one.
+        first.width, removed.width = 50, 60
+        grid._replace_child = True
+        arrange(self.root, self.host)
+        self.assertTrue(removed._disposed)
+        self.assertEqual(grid.children[1].bounds, Rect(100, 0, 45, 100))
+
+    def test_overlay_geometry_edits_preserve_normal_grid_slots(self):
+        class Overlay(Label):
+            _overlay = True
+
+        grid = Container(parent=self.root, layout="grid", width=200, height=100,
+                         columns=1, spacing=0)
+        ordinary = Label(parent=grid)
+        overlay = Overlay(parent=grid, width=20, height=10)
+        arrange(self.root, self.host)
+        slot = grid._layout_plan.slots[ordinary]
+        overlay.update(width=40, left=15, top=8)
+        with patch.object(layout, "_grid_tracks", wraps=layout._grid_tracks) as tracks:
+            arrange(self.root, self.host)
+        self.assertEqual(tracks.call_count, 0)
+        self.assertEqual(overlay.bounds, Rect(15, 8, 40, 10))
+        self.assertEqual(ordinary.bounds, slot)
+
+    def test_custom_ancestor_measure_content_observes_descendant_changes(self):
+        class ContentSized(Container):
+            def measure_content(self, host, *, width=None, height=None):
+                return 100 + len(self.children[0].children[0].text) * 10, 100
+
+        outer = ContentSized(parent=self.root)
+        grid = Container(parent=outer, layout="grid", width=200, height=100,
+                         columns=1, spacing=0)
+        label = Label(parent=grid, text="a")
+        arrange(self.root, self.host)
+        self.assertEqual(outer.bounds.width, 110)
+        label.text = "abcdefghij"
+        arrange(self.root, self.host)
+        self.assertEqual(outer.bounds.width, 200)
+
+    def test_custom_content_bounds_rechecks_grid_plan_area(self):
+        class ContentInset(Container):
+            def content_bounds(self, rect):
+                return rect.inset(len(self.children[0].text))
+
+        grid = ContentInset(parent=self.root, layout="grid", width=200, height=100,
+                            columns=1, spacing=0)
+        label = Label(parent=grid, text="a")
+        arrange(self.root, self.host)
+        self.assertEqual(label.bounds, Rect(1, 1, 198, 98))
+        label.text = "abcdef"
+        arrange(self.root, self.host)
+        self.assertEqual(label.bounds, Rect(6, 6, 188, 88))
+
+    def test_custom_measurement_and_content_bounds_observe_cell_geometry(self):
+        class ContentSized(Container):
+            def measure_content(self, host, *, width=None, height=None):
+                child = self.children[0].children[0]
+                return 100 + 10 * child.margin + (child.width or 0), 100
+
+        class InsetGrid(Container):
+            def content_bounds(self, rect):
+                return rect.inset(self.children[0].margin)
+
+        outer = ContentSized(parent=self.root)
+        grid = InsetGrid(parent=outer, layout="grid", width=200, height=100,
+                         columns=1, spacing=0)
+        label = Label(parent=grid)
+        arrange(self.root, self.host)
+        self.assertEqual(outer.bounds.width, 100)
+        label.margin = 5
+        arrange(self.root, self.host)
+        self.assertEqual(outer.bounds.width, 150)
+        self.assertEqual(label.bounds, Rect(10, 10, 180, 80))
+        label.width = 40
+        arrange(self.root, self.host)
+        self.assertEqual(outer.bounds.width, 190)
+        self.assertEqual(label.bounds, Rect(10, 10, 40, 80))
+
+    def test_consumed_change_and_invalidate_hooks_cannot_lose_geometry(self):
+        class Consumed(Label):
+            def _changed(self, field, old, value):
+                pass
+
+            def invalidate(self, affects=Dirty.PAINT):
+                pass
+
+        grid = Container(parent=self.root, layout="grid", width=200, height=100,
+                         columns=1, spacing=0)
+        label = Consumed(parent=grid, text="a")
+        arrange(self.root, self.host)
+        label.width = 75
+        arrange(self.root, self.host)
+        self.assertEqual(label.bounds.width, 75)
+        label.update(width=90, margin=5)
+        arrange(self.root, self.host)
+        self.assertEqual(label.bounds, Rect(5, 5, 90, 90))
+
+    def test_atomic_batch_accounts_for_all_geometry_before_first_notification(self):
+        host, root = self.host, self.root
+
+        class Observed(Label):
+            def _changed(self, field, old, value):
+                if field.name == "text":
+                    arrange(root, host)
+                    self._observed = self.bounds
+
+        grid = Container(parent=root, layout="grid", width=200, height=100,
+                         columns=1, spacing=0)
+        label = Observed(parent=grid, text="a")
+        arrange(root, host)
+        label.update(text="b", width=70, margin=4)
+        self.assertEqual(label._observed, Rect(4, 4, 70, 92))
+
+    def test_failed_notification_leaves_committed_geometry_arrangeable(self):
+        class Failing(Label):
+            def _changed(self, field, old, value):
+                raise RuntimeError("notification failed")
+
+        grid = Container(parent=self.root, layout="grid", width=200, height=100,
+                         columns=1, spacing=0)
+        label = Failing(parent=grid)
+        arrange(self.root, self.host)
+        with self.assertRaisesRegex(RuntimeError, "notification failed"):
+            label.width = 80
+        arrange(self.root, self.host)
+        self.assertEqual(label.bounds.width, 80)
+
+    def test_uncached_external_measurement_reaches_custom_ancestor(self):
+        class External(Label):
+            def measure(self, host):
+                return self._preferred, 20
+
+        outer = Container(parent=self.root, layout="stack", spacing=0)
+        label = External(parent=outer, cache_measure=False)
+        label._preferred = 40
+        arrange(self.root, self.host)
+        self.assertEqual(outer.bounds.width, 40)
+        label._preferred = 95
+        arrange(self.root, self.host)
+        self.assertEqual(outer.bounds.width, 95)
+
+    def test_failed_arranger_keeps_dirty_path_for_retry(self):
+        class Unreliable(Container):
+            def arrange_children(self, area, measure):
+                if getattr(self, "_fail", False):
+                    self._fail = False
+                    raise ValueError("try again")
+                return None
+
+        grid = Unreliable(parent=self.root, layout="grid", width=200, height=100)
+        label = Label(parent=grid, text="a")
+        arrange(self.root, self.host)
+        label.width = 80
+        grid._fail = True
+        with self.assertRaisesRegex(ValueError, "try again"):
+            arrange(self.root, self.host)
+        arrange(self.root, self.host)
+        self.assertEqual(label.bounds.width, 80)
+
+    def test_cached_layout_matches_cold_evaluator_across_mutations(self):
+        reference = App(width=640, height=400)
+        self.addCleanup(reference.destroy)
+        reference_host = RecordingHost()
+        pairs = []
+        for root in (self.root, reference):
+            grid = Container(parent=root, layout="grid", width=600, height=300,
+                             columns=4, spacing=3)
+            labels = [Label(parent=grid, text=str(i)) for i in range(12)]
+            pairs.append((root, grid, labels))
+        random = Random(73018)
+        for step in range(60):
+            index = random.randrange(12)
+            values = random.choice([
+                {"text": "x" * random.randrange(1, 50)},
+                {"width": random.choice([None, 20, 70])},
+                {"font_size": random.choice([12, 18, 25])},
+                {"margin": random.choice([0, 2, 7])},
+                {"visible": random.choice([True, False])},
+                {"min_height": random.choice([0, 15, 30])},
+            ])
+            for root, grid, labels in pairs:
+                labels[index].update(**values)
+                if step % 10 == 0:
+                    grid.column_tracks = ("auto", "*", "2*", 40) if step % 20 else ()
+                if step % 15 == 0:
+                    grid.spacing = step % 7
+            _clear_measurements(reference)
+            arrange(self.root, self.host)
+            arrange(reference, reference_host)
+            for actual, expected in zip(pairs[0][2], pairs[1][2]):
+                if actual.visible:
+                    self.assertEqual((actual.bounds, actual._clip, actual._paint_clip),
+                                     (expected.bounds, expected._clip, expected._paint_clip))
+
+    def test_incremental_geometry_matches_cold_layout_for_spans_constraints_and_scrolling(self):
+        class Overlay(Label):
+            _overlay = True
+
+        reference = App(width=640, height=400)
+        self.addCleanup(reference.destroy)
+        pairs = []
+        for root in (self.root, reference):
+            grid = Container(parent=root, layout="grid", width=300, height=200,
+                             column_tracks=("*", 50, "2*", "*"), spacing=3)
+            labels = [Label(parent=grid, text=str(i)) for i in range(10)]
+            overlay = Overlay(parent=grid, width=40, height=15, top=10)
+            scroll = ScrollArea(parent=root, left=320, width=280, height=200,
+                                layout="grid", column_tracks=(180, 180),
+                                row_tracks=(80, 80, 80), spacing=3)
+            rows = [Label(parent=scroll, text=str(i)) for i in range(6)]
+            pairs.append((grid, labels, overlay, scroll, rows))
+        mutations = [
+            lambda grid, labels, overlay, scroll, rows: labels[0].update(margin=7),
+            lambda grid, labels, overlay, scroll, rows: labels[1].update(width=35, height=60),
+            lambda grid, labels, overlay, scroll, rows: labels[1].update(min_width=40, max_height=20),
+            lambda grid, labels, overlay, scroll, rows: labels[0].update(grid_col_span=2, grid_row_span=2),
+            lambda grid, labels, overlay, scroll, rows: overlay.update(width=65, left=25, top=35),
+            lambda grid, labels, overlay, scroll, rows: scroll.update(scroll_x=35, scroll_y=25),
+            lambda grid, labels, overlay, scroll, rows: rows[0].update(width=220, margin=5),
+            lambda grid, labels, overlay, scroll, rows: labels[0].update(width=10, min_width=45, margin=3),
+            lambda grid, labels, overlay, scroll, rows: labels[1].update(width=None, height=None, max_height=None),
+            lambda grid, labels, overlay, scroll, rows: labels[2].update(visible=False),
+            lambda grid, labels, overlay, scroll, rows: labels[2].update(visible=True, max_width=25),
+            lambda grid, labels, overlay, scroll, rows: grid.update(row_tracks=(40, "2*", "*")),
+        ]
+        for step, change in enumerate(mutations):
+            with self.subTest(step=step):
+                for pair in pairs:
+                    change(*pair)
+                _clear_measurements(reference)
+                arrange(self.root, self.host)
+                arrange(reference, self.host)
+                def controls(pair):
+                    grid, labels, overlay, scroll, rows = pair
+                    return (grid, *labels, overlay, scroll, *rows)
+                for actual, expected in zip(controls(pairs[0]), controls(pairs[1])):
+                    if actual.visible:
+                        self.assertEqual((actual.bounds, actual._clip, actual._paint_clip),
+                                         (expected.bounds, expected._clip, expected._paint_clip))
+                self.assertEqual(pairs[0][3]._scroll_limits, pairs[1][3]._scroll_limits)
+
+
+class CustomLayoutTests(UIOwnerTestCase):
+    def test_fixed_grid_recomputes_custom_ancestor_measurement(self):
+        class PreferredFromCaption(Container):
+            def measure(self, host):
+                return 100 + len(self.children[0].children[0].text) * 10, 100
+
+        class AvailableFromCaption(Container):
+            def measure_available(self, host, *, width=None, height=None):
+                return 100 + len(self.children[0].children[0].text) * 10, 100
+
+        for parent_type in (PreferredFromCaption, AvailableFromCaption):
+            with self.subTest(measurement_hook=parent_type.__name__):
+                app = App(width=640, height=400)
+                self.addCleanup(app.destroy)
+                outer = parent_type(parent=app)
+                grid = Container(parent=outer, layout="grid", columns=1,
+                                 width=100, height=100)
+                child = Label(parent=grid, text="a")
+                host = RecordingHost()
+                arrange(app, host)
+                self.assertEqual(outer.bounds.width, 110)
+                child.text = "abcdefghij"
+                arrange(app, host)
+                self.assertEqual(outer.bounds.width, 200)
+
+    def test_fixed_grid_recomputes_custom_layout_size(self):
+        class SizedGrid(Container):
+            def _layout_size(self, width, height):
+                inset = len(self.children[0].text) if self.children else 0
+                return width - inset, height
+
+        for instance_hook in (False, True):
+            with self.subTest(instance_hook=instance_hook):
+                root = Container(width=640, height=400)
+                self.addCleanup(root.destroy)
+                grid_type = Container if instance_hook else SizedGrid
+                grid = grid_type(parent=root, layout="grid", columns=1,
+                                 width=200, height=100, padding=0, spacing=0)
+                child = Label(parent=grid, text="a")
+                if instance_hook:
+                    grid._layout_size = lambda width, height: (
+                        width - len(child.text), height
+                    )
+                host = RecordingHost()
+                arrange(root, host)
+                self.assertEqual(grid.bounds.width, 199)
+                self.assertEqual(child.bounds.width, 199)
+                child.text = "abcdefghij"
+                arrange(root, host)
+                self.assertEqual(grid.bounds.width, 190)
+                self.assertEqual(child.bounds.width, 190)
+
+    def test_grid_recomputes_an_overridden_app_viewport(self):
+        class CustomViewport(App):
+            @property
+            def viewport(self):
+                children = self.children
+                inset = len(children[0].text) if children else 0
+                return Viewport(640 - inset, 400)
+
+        app = CustomViewport(layout="grid", columns=1, width=640, height=400,
+                             padding=0, spacing=0)
+        self.addCleanup(app.destroy)
+        child = Label(parent=app, text="a")
+        host = RecordingHost()
+        arrange(app, host)
+        self.assertEqual(child.bounds.width, 639)
+        child.text = "abcdefghij"
+        arrange(app, host)
+        self.assertEqual(child.bounds.width, 630)
+
+    def test_fixed_grid_recomputes_custom_content_bounds_after_child_change(self):
+        class GutterGrid(Container):
+            def content_bounds(self, bounds):
+                children = self.children
+                return bounds.inset(len(children[0].text) if children else 0)
+
+        host = RecordingHost()
+        grid = GutterGrid(layout="grid", width=640, height=400, columns=1, spacing=0)
+        self.addCleanup(grid.destroy)
+        child = Label(parent=grid, text="a")
+        arrange(grid, host)
+        self.assertEqual(child.bounds, Rect(1, 1, 638, 398))
+        child.text = "abcdefghij"
+        arrange(grid, host)
+        self.assertEqual(child.bounds, Rect(10, 10, 620, 380))
+
+    def test_grid_recomputes_custom_ancestor_content_bounds(self):
+        class GutterStack(Container):
+            def content_bounds(self, bounds):
+                children = self.children
+                leaves = children[0].children if children else ()
+                return bounds.inset(len(leaves[0].text) if leaves else 0)
+
+        for fixed in (False, True):
+            with self.subTest(fixed_grid=fixed):
+                host = RecordingHost()
+                stack = GutterStack(layout="stack", width=640, height=400, spacing=0)
+                self.addCleanup(stack.destroy)
+                grid = Container(parent=stack, layout="grid", flex=1, columns=1, spacing=0,
+                                 width=200 if fixed else None, height=100 if fixed else None)
+                child = Label(parent=grid, text="a")
+                arrange(stack, host)
+                self.assertEqual(child.bounds.x, 1)
+                child.text = "abcdefghij"
+                arrange(stack, host)
+                self.assertEqual(child.bounds.x, 10)
+
+    def test_fixed_grid_does_not_hide_custom_ancestor_arrangement(self):
+        class Positioned(Container):
+            def arrange_children(self, area, measure):
+                grid = self.children[0]
+                return {grid: Rect(area.x + len(grid.children[0].text), area.y, 200, 100)}
+
+        host = RecordingHost()
+        parent = Positioned(width=640, height=400)
+        self.addCleanup(parent.destroy)
+        grid = Container(parent=parent, layout="grid", columns=1, width=200, height=100)
+        child = Label(parent=grid, text="a")
+        arrange(parent, host)
+        self.assertEqual(child.bounds.x, 1)
+        child.text = "abcdefghij"
+        arrange(parent, host)
+        self.assertEqual(child.bounds.x, 10)
+
+    def test_destroyed_grid_releases_cached_children(self):
+        grid = Container(layout="grid", columns=1, width=640, height=400)
+        self.addCleanup(grid.destroy)
+        child = Label(parent=grid, text="cached")
+        child_ref = ref(child)
+        arrange(grid, RecordingHost())
+        grid.destroy()
+        del child
+        gc.collect()
+        self.assertIsNone(child_ref())
+
+    def test_destroyed_child_is_released_without_another_layout_pass(self):
+        grid = Container(layout="grid", columns=1, width=640, height=400)
+        self.addCleanup(grid.destroy)
+        child = Label(parent=grid, text="cached")
+        child_ref = ref(child)
+        arrange(grid, RecordingHost())
+        child.destroy()
+        del child
+        gc.collect()
+        self.assertIsNone(child_ref())
 
 
 if __name__ == "__main__":

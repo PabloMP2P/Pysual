@@ -15,6 +15,7 @@ from math import ceil, floor
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
+from .._text_layout import TextLayoutCache
 from ..geometry import Rect
 from ..host import Viewport
 from ..image_resources import MAX_IMAGE_BYTES, image_source
@@ -140,8 +141,10 @@ class SVGRenderer:
 
     _error_prefix = "web"
     backend = "web"
+    _text_measure_cache_limit = _font.MEASURE_CACHE_TEXT_LIMIT
 
     def __init__(self) -> None:
+        self._text_layout_cache = TextLayoutCache()
         self.size: tuple[float, float] = (960.0, 640.0)
         self._viewport = Viewport(*self.size)
         self._nodes: list[_SvgNode] = []
@@ -211,6 +214,7 @@ class SVGRenderer:
 
     def close_scene(self) -> None:
         """Release cached resources, retaining the last frame for snapshots."""
+        self._text_layout_cache.clear()
         self._target = None
         self._saved_target = None
         self._clip_group = None

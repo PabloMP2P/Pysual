@@ -96,7 +96,7 @@ class FactoryTypeGeneratorTests(unittest.TestCase):
         # A fresh interpreter sees only built-in registrations and also proves
         # the maintenance command works without editable-install path setup.
         result = subprocess.run(
-            [sys.executable, "-I", str(TOOL), "--check"],
+            [sys.executable, "-I", "-B", str(TOOL), "--check"],
             capture_output=True, text=True, timeout=15,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

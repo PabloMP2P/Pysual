@@ -1,12 +1,18 @@
 """Native metric caching can be checked without a compiled host process."""
 
+import os
+from pathlib import Path
+import subprocess
 import unittest
 from unittest.mock import Mock
+
+import pytest
 
 from _ui_testcase import UIOwnerTestCase
 from pysual import Rect, TextBox, dark
 from pysual.backends.native import NativeHost
 from pysual.painting import Painter
+from tools.native import ROOT, compiler_environment
 
 
 class NativeMetricCacheTests(unittest.TestCase):
@@ -135,3 +141,69 @@ class TextDocumentMetricTests(UIOwnerTestCase):
         batches = [c.kwargs["texts"] for c in calls if c.args[0] == "measure_many"]
         self.assertEqual(len(batches), 2)
         self.assertTrue(all(sum(map(len, texts)) <= 1024 * 1024 for texts in batches))
+
+
+def test_metric_cache_keeps_new_entries_reachable_after_collisions(tmp_path):
+    try:
+        compiler, environment = compiler_environment()
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        pytest.skip(f"C compiler unavailable: {error}")
+    renderer = (ROOT / "native/sdl_renderer.c").read_text(encoding="utf-8")
+    # Compile the production helpers themselves; no separate cache model or
+    # renderer instrumentation is needed to check admission and key isolation.
+    start = renderer.index("#define TEXT_METRIC_SLOTS")
+    end = renderer.index("static int measure(PXRenderer", start)
+    source = tmp_path / "text_metrics.c"
+    source.write_text("#include <stdint.h>\n#include <stdio.h>\n#include <string.h>\n"
+                      + renderer[start:end] + r'''
+static int check(const char *text, int pixels, int mono, int width, double height) {
+    int actual_width = -1;
+    double actual_height = -1;
+    if (!measure_cached(text, pixels, mono, &actual_width, &actual_height) ||
+        actual_width != width || actual_height != height) {
+        fprintf(stderr, "Unreachable/wrong metric: %s (%d, %d)\n", text, pixels, mono);
+        return 0;
+    }
+    return 1;
+}
+int main(void) {
+    char text[64], longest[TEXT_METRIC_KEEP + 2];
+    unsigned i, found = 0;
+    int width;
+    double height;
+    /* Force a wrapped, exhausted probe window before testing general churn. */
+    for (i = 0; found < 40 && i < 1000000; ++i) {
+        snprintf(text, sizeof(text), "collision-%u", i);
+        if ((text_metric_hash(text, strlen(text), 16, 0) &
+             (TEXT_METRIC_SLOTS - 1)) != TEXT_METRIC_SLOTS - 1)
+            continue;
+        measure_store(text, 16, 0, i, found + .5);
+        if (!check(text, 16, 0, i, found + .5)) return 1;
+        ++found;
+    }
+    if (found != 40) return 2;
+    for (i = 0; i < TEXT_METRIC_SLOTS * 4; ++i) {
+        snprintf(text, sizeof(text), "churn-%u", i);
+        measure_store(text, 17, 1, i, i * 2.0);
+        if (!check(text, 17, 1, i, i * 2.0)) return 3;
+    }
+    memset(text_metrics, 0, sizeof(text_metrics));
+    measure_store("same", 16, 0, 10, 2384002384.0);
+    measure_store("same", 16, 1, 20, 30);
+    measure_store("same", 17, 0, 40, 50);
+    if (!check("same", 16, 0, 10, 2384002384.0) ||
+        !check("same", 16, 1, 20, 30) || !check("same", 17, 0, 40, 50)) return 4;
+    memset(longest, 'x', sizeof(longest) - 1);
+    longest[sizeof(longest) - 1] = 0;
+    measure_store(longest, 16, 0, 1, 2);
+    if (measure_cached(longest, 16, 0, &width, &height)) return 5;
+    return 0;
+}
+''', encoding="utf-8")
+    executable = tmp_path / ("text_metrics.exe" if os.name == "nt" else "text_metrics")
+    if Path(compiler).stem.lower() == "cl":
+        command = [compiler, "/nologo", "/std:c11", "/O2", str(source), f"/Fe:{executable}"]
+    else:
+        command = [compiler, "-std=c11", "-O2", str(source), "-o", str(executable)]
+    subprocess.run(command, cwd=tmp_path, env=environment, check=True, capture_output=True)
+    subprocess.run([str(executable)], check=True, capture_output=True, timeout=15)

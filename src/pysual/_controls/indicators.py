@@ -43,6 +43,7 @@ class RangeSlider(Control):
     The visible end labels identify the values and can be customized.
     """
 
+    _paint_reuse = False
     cache_paint: bool = prop(default=True)
     value: tuple[float, float] = prop(default=(25.0, 75.0), changed="changed",
                                       affects=Dirty.MEASURE | Dirty.PAINT)
@@ -256,6 +257,7 @@ class RangeSlider(Control):
 class CircularProgress(Control):
     """A determinate, clockwise progress ring with an optional percentage."""
 
+    _paint_reuse = False
     cache_paint: bool = prop(default=True)
     value: float = prop(default=0.0, minimum=0, changed="changed")
     maximum: float = prop(default=100.0, minimum=0.000001)

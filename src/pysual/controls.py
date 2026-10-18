@@ -46,6 +46,7 @@ from .events import (
 from .geometry import Rect
 from .host import Host, Input
 from .painting import Painter, resolve_style
+from ._paint_state import implementation_changed
 from .theme import Theme, dark
 from .schema import (
     Dirty,
@@ -73,6 +74,7 @@ from ._engine import (
 
 if TYPE_CHECKING:
     from .inspection import ControlSnapshot
+    from .layout import _GridPlan
     from .motion import _Transition
 
 
@@ -151,6 +153,14 @@ def _construct_control(
 class _ControlMeta(type):
     """Explicit parenting happens only after the complete Python constructor."""
 
+    def __setattr__(cls, name: str, value: object) -> None:
+        super().__setattr__(name, value)
+        implementation_changed()
+
+    def __delattr__(cls, name: str) -> None:
+        super().__delattr__(name)
+        implementation_changed()
+
     def __new__(
         cls,
         name: str,
@@ -208,7 +218,27 @@ class _ControlMeta(type):
             return _construct_control(cls, args, kwargs)
 
 
+# Child inputs that can change grid slot assignment or track counts. Dimensions
+# and margins change only the child's box inside its allocated fixed/star slot.
+_GRID_PLACEMENT_INPUTS = frozenset({
+    "grid_row", "grid_col", "grid_row_span", "grid_col_span", "visible",
+})
+
+
 class Control(SchemaObject, metaclass=_ControlMeta):
+    # Exact types in the built-in catalog inherit reuse unless their family
+    # needs revision invalidation. Custom subclasses remain outside the catalog.
+    _paint_reuse: ClassVar[bool] = True
+    _transient_fields: ClassVar[dict[str, Callable[[], object]]] = {
+        "_measure_cache": list,
+        "_measure_cache_host": lambda: None,
+        "_layout_valid": lambda: False,
+        "_layout_measure_host": lambda: None,
+        "_layout_measure_environment": lambda: None,
+        "_layout_theme": lambda: None,
+        "_layout_row_height": lambda: None,
+        "_release_paint": lambda: None,
+    }
     if TYPE_CHECKING:
         # The alias adds a typed constructor input without making parent writable
         # or including it in schema, instance values, or serialization.
@@ -386,13 +416,13 @@ class Control(SchemaObject, metaclass=_ControlMeta):
         return runtime is None or runtime.router._focus_to_reveal is self
 
     def update(self, **properties: object) -> None:
-        """Commit several properties atomically with one ancestor invalidation."""
+        """Commit properties atomically and schedule one frame for the batch."""
         properties = dict(self._prepare_update(properties))
         self._validate_candidate(properties)
         self._commit_update(properties)
 
     def _commit_update(self, properties: Mapping[str, object]) -> None:
-        """Commit an already preflighted candidate with coalesced invalidation."""
+        """Commit a preflighted candidate while coalescing frame scheduling."""
         previous = self._batch_dirty
         previous_requested = self._batch_requested
         self._batch_dirty = Dirty.NONE
@@ -409,19 +439,19 @@ class Control(SchemaObject, metaclass=_ControlMeta):
                 self._flush_invalidation(affects)
 
     def _flush_invalidation(self, affects: Dirty | int) -> None:
-        # Public overrides may make new local changes while handling the flush.
         recorded = cast(Dirty, affects)
-        if type(self).invalidate is not Control.invalidate:
-            self.invalidate(recorded)
-            return
         # A batch already recorded each originating change. Its final wake is
         # propagated dirt, not a new local change to the batching container.
         previous = self._measure_coalescing
         self._measure_coalescing = True
         try:
-            self.invalidate(recorded)
+            Control.invalidate(self, recorded)
         finally:
             self._measure_coalescing = previous
+        # Notification overrides cannot consume mandatory batch accounting.
+        # They may make additional local changes, which record normally.
+        if type(self).invalidate is not Control.invalidate:
+            self.invalidate(recorded)
 
     def _adjust_uncached_measurements(self, delta: int) -> None:
         node: Control | None = self
@@ -429,55 +459,109 @@ class Control(SchemaObject, metaclass=_ControlMeta):
             node._measure_uncached += delta
             node = node._parent
 
-    def _invalidate_measure(self, affects: Dirty | int, *, local: bool = True) -> None:
-        if not _mask(affects) & _LAYOUT_MASK:
+    def _record_changes(self, changes: list[tuple[Field, object, object]]) -> None:
+        # An atomic commit has one dependency change, even when it writes many
+        # fields. Preserve extension accounting hooks that opt into each field.
+        if type(self)._record_change is not Control._record_change:
+            super()._record_changes(changes)
             return
-        enabled = self._values["cache_measure"]
-        if enabled != self._measure_cache_enabled:
-            self._adjust_uncached_measurements(1 if not enabled else -1)
-            self._measure_cache_enabled = enabled
-        if local:
-            self._measure_local_revision += 1
-        node = self
-        while node is not None:
-            node._measure_revision += 1
-            node._measure_cache.clear()
-            node = node._parent
+        mask = 0
+        layout_box = False
+        for field, old, value in changes:
+            affects = _mask(self._change_affects(field, old, value))
+            mask |= affects
+            if affects & _LAYOUT_MASK and field.name in _GRID_PLACEMENT_INPUTS:
+                layout_box = True
+        self._invalidate_model(mask, layout_box=layout_box)
 
-    def _record_dirty(self, affects: Dirty) -> None:
-        super()._record_dirty(affects)
-        # Preserve committed sizing changes even when a custom _changed hook
-        # consumes the notification instead of calling super().
-        self._invalidate_measure(affects)
+    def _record_change(self, field: Field, old: object, value: object) -> None:
+        # Committed geometry and paint state must survive a custom _changed
+        # hook that consumes notifications, raises, or arranges immediately.
+        self._invalidate_model(
+            self._change_affects(field, old, value),
+            layout_box=field.name in _GRID_PLACEMENT_INPUTS,
+        )
 
     def invalidate(self, affects: Dirty = Dirty.PAINT) -> None:
         """Request a frame after changing private drawing state in a custom control."""
         self._check_live()
         self._invalidate_model(affects)
 
-    def _invalidate_model(self, affects: Dirty | int) -> None:
+    def _invalidate_model(self, affects: Dirty | int, *, layout_box: bool = True) -> None:
         """Record dirt on this control and its ancestors, then wake the runtime.
 
         Runs on the UI owner: every public write already arrives there.
         """
         mask = _mask(affects)
+        if self._measure_coalescing:
+            # Final batch propagation schedules work whose dependencies have
+            # already been recorded at the originating controls.
+            self._schedule_invalidation(mask)
+            return
+
+        layout = mask & _LAYOUT_MASK
         visual = mask & _VISUAL_MASK
-        if not self._measure_coalescing:
-            # Batch flushes only propagate dirt; their originating changes
-            # already invalidated measurements, input metadata and paint bodies.
-            self._invalidate_measure(mask)
+        uncached_delta = 0
+        if layout:
+            enabled = self._values["cache_measure"]
+            if enabled != self._measure_cache_enabled:
+                uncached_delta = 1 if not enabled else -1
+                self._measure_cache_enabled = enabled
+            self._measure_local_revision += 1
+            if isinstance(self, Container):
+                self._layout_box_revision += 1
+            if layout_box and self._parent is not None:
+                self._parent._layout_box_revision += 1
+        if visual:
+            self._paint_local_revision += 1
+
+        # One traversal records every dependency before any notification can
+        # observe the commit. Batch boundaries coalesce scheduling, not cache
+        # validity: callbacks may measure or paint before the batch finishes.
+        node: Control = self
+        scheduling = True
+        wakes: list[Callable[[], None]] | None = None
+        while True:
+            if layout:
+                node._measure_revision += 1
+                node._measure_cache.clear()
+                if uncached_delta:
+                    node._measure_uncached += uncached_delta
+                node._dirty = int(node._dirty) | mask
             if visual:
-                self._paint_local_revision += 1
-            root = self
-            while root._parent is not None:
-                root = root._parent
-            runtime = getattr(root, "_runtime", None)
-            router = getattr(runtime, "router", None)
-            if router is not None:
-                router.invalidate(affects, self)
-            retained = getattr(runtime, "_retained_paint", None)
-            if retained is not None:
-                retained.invalidate(self, affects)
+                node._paint_revision += 1
+            if scheduling:
+                if node._batch_dirty is not None:
+                    node._batch_dirty = int(node._batch_dirty) | mask
+                    node._batch_requested = True
+                    scheduling = False
+                else:
+                    if not layout:
+                        node._dirty = int(node._dirty) | mask
+                    if node._wake:
+                        if wakes is None:
+                            wakes = []
+                        wakes.append(node._wake)
+            parent = node._parent
+            if parent is None:
+                break
+            if layout:
+                parent._layout_children_dirty.add(node)
+            node = parent
+
+        runtime = getattr(node, "_runtime", None)
+        router = getattr(runtime, "router", None)
+        if router is not None:
+            router.invalidate(affects, self)
+        retained = getattr(runtime, "_retained_paint", None)
+        if retained is not None:
+            retained.invalidate(self, affects)
+        if wakes is not None:
+            for wake in wakes:
+                wake()
+
+    def _schedule_invalidation(self, mask: int) -> None:
+        """Propagate an already recorded change to the nearest batch or wake."""
         node: Control | None = self
         while node is not None:
             if node._batch_dirty is not None:
@@ -485,15 +569,16 @@ class Control(SchemaObject, metaclass=_ControlMeta):
                 node._batch_requested = True
                 break
             node._dirty = int(node._dirty) | mask
-            if visual:
-                node._paint_revision += 1
             if node._wake:
                 node._wake()
             node = node._parent
 
     def _changed(self, field: Field, old: object, value: object) -> None:
-        affects = self._change_affects(field, old, value)
-        self.invalidate(affects)
+        # Core accounting already ran before this notification. Preserve a
+        # custom invalidate override's notification without doing a second
+        # ancestor walk for ordinary built-in controls.
+        if type(self).invalidate is not Control.invalidate:
+            self.invalidate(self._change_affects(field, old, value))
         if field.definition.changed and self._dispatcher is not None:
             getattr(self, field.definition.changed).emit(
                 ChangeEvent(
@@ -846,6 +931,8 @@ class Control(SchemaObject, metaclass=_ControlMeta):
         if self._parent is not None:
             self._parent._adjust_uncached_measurements(-self._measure_uncached)
             self._parent._children.remove(self)
+            self._parent._layout_plan = None
+            self._parent._layout_children_dirty.discard(self)
             self._parent.invalidate(Dirty.MEASURE | Dirty.HIT_TEST)
         if self._binding_owner is not None and self._name is not None:
             self._binding_owner._bindings.pop(self._name, None)
@@ -929,6 +1016,14 @@ def _blueprint_order(definitions: Mapping[str, Blueprint[Any]]) -> list[str]:
 class Container(Control, FactoryTypes):
     """Also the handler scope for composite controls; private state stays Python."""
 
+    _paint_reuse = False
+    _transient_fields: ClassVar[dict[str, Callable[[], object]]] = {
+        "_layout_plan": lambda: None,
+        "_layout_children_dirty": set,
+        "_layout_box_revision": lambda: 0,
+        "_layout_span": lambda: None,
+    }
+
     def _child_effect_clip(self, rect: Rect, content_clip: Rect, inherited_clip: Rect) -> Rect:
         # Transparent layout wrappers have no visible edge. Shadows can extend
         # to the nearest painted surface, while scroll/custom content viewports
@@ -976,9 +1071,13 @@ class Container(Control, FactoryTypes):
         self._children: list[Control] = []
         self._bindings: dict[str, Control] = {}
         self._blueprints_materialized = False
+        self._layout_plan: _GridPlan | None = None
+        self._layout_children_dirty: set[Control] = set()
+        self._layout_box_revision = 0
+        self._layout_span: tuple[Rect, Rect, float] | None = None
 
     def update_children(self, updates: Mapping[Control, Mapping[str, object]]) -> None:
-        """Preflight descendant property batches and invalidate this container once.
+        """Preflight descendant property batches and schedule one frame.
 
         Every target must belong to this subtree. Validation failure leaves all
         controls unchanged; ordinary property notifications still run per field.
@@ -1340,6 +1439,8 @@ class Container(Control, FactoryTypes):
         check_ui_thread()
         if self._disposed:
             return
+        self._layout_plan = None
+        self._layout_children_dirty.clear()
         for child in tuple(self._children):
             child.destroy()
         super().destroy()

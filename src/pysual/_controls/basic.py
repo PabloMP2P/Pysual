@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from typing import ClassVar
+
+from .._paint_state import TextMeasurement
 from ..behaviors import PressBehavior
 from ..commands import normalize_shortcut
 from ..controls import Control
@@ -24,6 +26,12 @@ class Label(Control):
     def measure(self, host: Host) -> tuple[float, float]:
         style = resolve_style(self)
         return host.measure(self.text, style.font_size, style.font_family == "mono")
+
+    def _paint_measurements(self) -> tuple[TextMeasurement, ...]:
+        if not self.text or self._rect.width <= 0:
+            return ()
+        style = resolve_style(self)
+        return ((self.text, style.font_size, style.font_family == "mono"),)
 
     def paint(self, painter: Painter, /) -> None:
         super().paint(painter)
@@ -88,6 +96,14 @@ class Button(Label):
         return max(90, w + padding * 2 + (28 if self.icon else 0)), max(
             h + padding * 2, self.effective_theme.tokens.control_height
         )
+
+    def _paint_measurements(self) -> tuple[TextMeasurement, ...]:
+        style = resolve_style(self)
+        width = max(0, self._rect.width - style.padding * 2)
+        icon_size = min(20, width, self._rect.height) if self.icon else 0
+        icon_width = icon_size + (8 if self.text else 0) if self.icon else 0
+        text = self.text if width > icon_width else ""
+        return ((text, style.font_size, style.font_family == "mono"),)
 
     def paint(self, painter: Painter, /) -> None:
         s = painter.body()

@@ -8,8 +8,8 @@ from collections import Counter, OrderedDict
 from dataclasses import replace
 from math import ceil, floor, isfinite
 from time import monotonic
-from collections.abc import Mapping
-from typing import ClassVar, cast
+from collections.abc import Callable, Mapping, Sequence
+from typing import ClassVar, NamedTuple, cast
 
 from .theme import ResolvedStyle
 
@@ -19,6 +19,7 @@ from .geometry import Rect
 from .schema import Dirty, Field, expect_text, prop
 from .painting import resolve_style, Painter
 from ._engine import TaskHandle
+from ._paint_state import capture_preparation, peek_prepared_paint
 from .graphemes import boundaries, floor_boundary, is_boundary, previous_boundary, next_boundary
 from ._scrolling import Scrollbar, can_scroll, scrollbar, handle_scrollbars, paint_scrollbars
 from ._text_display import single_line
@@ -81,7 +82,54 @@ def _word_kind(char: str) -> str:
     return "space" if char.isspace() else "word" if char.isalnum() or char == "_" else "punct"
 
 
+class _TextPaintView(NamedTuple):
+    lines: Sequence[str]
+    starts: Sequence[int]
+    selection_start: int
+    selection_end: int
+    focused: bool
+    composition: str
+    preview_start: int
+    preview_stop: int
+    preview_delta: int
+    caret_row: int
+    caret_x: float
+    advance: float
+    mono: bool
+    text_left: float
+    line_height: float
+    padding: float
+    size: float
+
+
+class _PreparedTextPaint(NamedTuple):
+    style: ResolvedStyle
+    viewport: Rect
+    view: _TextPaintView
+
+
 class TextBox(Control):
+    # A copied/restored editor keeps its document, selection, view and history,
+    # but measurements and backend handles belong to the next host opening.
+    _transient_fields: ClassVar[dict[str, Callable[[], object]]] = {
+        "_measure_host": lambda: None,
+        "_hit_host": lambda: None,
+        "_hit_context": lambda: None,
+        "_hit_widths": OrderedDict,
+        "_width_cache": dict,
+        "_width_cache_key": lambda: None,
+        "_width_line_counts": lambda: None,
+        "_width_pending": set,
+        "_width_counts": Counter,
+        "_extent_cache": lambda: None,
+        "_text_viewport_metrics": lambda: None,
+        "_line_cache": lambda: None,
+        "_pending_line_cache": lambda: None,
+        "_fixed_line_cache": dict,
+        "_preferred_column": lambda: None,
+        "_tab_maps": OrderedDict,
+        "_tab_map_chars": lambda: 0,
+    }
     cache_paint: bool = prop(default=True)
     text: str = prop(default="", affects=Dirty.PAINT, changed="changed")
     placeholder: str = prop(default="")
@@ -1105,16 +1153,43 @@ class TextBox(Control):
         if before != (self._caret, self._anchor, self._scroll, self._scroll_x, self._composition):
             self.invalidate()
 
+    def _paint_inputs(self) -> tuple[object, ...]:
+        runtime = getattr(self._root(), "_runtime", None)
+        focused = runtime is not None and runtime.router.focus is self
+        return (self._caret, self._anchor, self._scroll, self._scroll_x,
+                self._composition, self._reveal_after_paint, focused,
+                id(self._measure_host), self._scroll_axes)
+
+    def _prepare_paint(self, host: Host) -> None:
+        # Reveal/clamp belongs to preparation, before either cache snapshots it.
+        # Direct/custom drawing uses the same preparation helper in _paint_text.
+        self._measure_host = host
+        self._sync_scrollbars(host)
+        painter = Painter(host, self._rect, self._fast_theme(), self)
+        style = painter.style()
+        viewport = self._text_viewport()
+        capture_preparation(self, host, lambda: _PreparedTextPaint(
+            style, viewport, self._prepare_text(painter, style, viewport),
+        ))
+
     def paint(self, p: Painter, /) -> None:
         s = p.body()
         self._measure_host = p.host
-        self._sync_scrollbars(p.host)
+        # Single-line synchronization is only a flag reset; validating a full
+        # preparation would cost more than repeating that ordinary hook.
+        prepared = peek_prepared_paint(self, p.host) if self.multiline else None
+        # Completed preparation already established the gutters. Body callbacks
+        # may have changed its inputs, so reuse only a still-live preparation;
+        # _paint_text consumes and rechecks it after the host's clip callback.
+        if not (isinstance(prepared, _PreparedTextPaint) and prepared.style == s
+                and prepared.viewport == self._text_viewport()):
+            self._sync_scrollbars(p.host)
         viewport = self._text_viewport()
         with p._clipped(viewport):
             self._paint_text(p, s, viewport)
         paint_scrollbars(p, self._scrollbars())
 
-    def _paint_text(self, p: Painter, s: ResolvedStyle, viewport: Rect) -> None:
+    def _prepare_text(self, p: Painter, s: ResolvedStyle, viewport: Rect) -> _TextPaintView:
         self._measure_host = p.host
         mono = self.monospace or s.font_family == "mono"
         metrics = (viewport.width, viewport.height, self._line_height(), s.padding, mono, self.tab_size)
@@ -1124,7 +1199,6 @@ class TextBox(Control):
         size = s.font_size
         padding = s.padding
         lh = self._line_height()
-        t = p.theme.tokens
         lines, starts = self._lines()
         a, b = sorted((self._caret, self._anchor))
         runtime = getattr(self._root(), "_runtime", None)
@@ -1165,13 +1239,6 @@ class TextBox(Control):
             self._ensure_caret()
             self._clamp_scroll(p.host)
         text_left = self._text_left()
-        if not self.text and self.placeholder and not focused:
-            placeholder = self.placeholder if self.multiline else single_line(self.placeholder)
-            p.text(
-                p.elide(placeholder, max(0, viewport.right - text_left),
-                        size=size, mono=self.monospace),
-                text_left, padding, color=t.muted, size=size, mono=self.monospace,
-            )
         advance = p.measure("M", size=size, mono=True)[0]
         caret_tabs = self._tab_map(lines[row])
         if self._fixed_line(None if composition else row, lines[row], mono=mono):
@@ -1185,6 +1252,30 @@ class TextBox(Control):
             if caret_x - self._scroll_x > available:
                 self._scroll_x = max(0, caret_x - available)
             self._reveal_after_paint = False
+        return _TextPaintView(
+            lines, starts, a, b, focused, composition, preview_start, preview_stop,
+            preview_delta, row, caret_x, advance, mono, text_left, lh, padding, size,
+        )
+
+    def _paint_text(self, p: Painter, s: ResolvedStyle, viewport: Rect) -> None:
+        prepared = p._prepared_paint()
+        view = (
+            prepared.view
+            if isinstance(prepared, _PreparedTextPaint)
+            and prepared.style == s and prepared.viewport == viewport
+            else self._prepare_text(p, s, viewport)
+        )
+        (lines, starts, a, b, focused, composition, preview_start, preview_stop,
+         preview_delta, row, caret_x, advance, mono, text_left, lh, padding, size
+         ) = view
+        t = p.theme.tokens
+        if not self.text and self.placeholder and not focused:
+            placeholder = self.placeholder if self.multiline else single_line(self.placeholder)
+            p.text(
+                p.elide(placeholder, max(0, viewport.right - text_left),
+                        size=size, mono=self.monospace),
+                text_left, padding, color=t.muted, size=size, mono=self.monospace,
+            )
         first = self._scroll + max(
             0, floor((p._clip.y - self._rect.y - padding) / lh)
         )

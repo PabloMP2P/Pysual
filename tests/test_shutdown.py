@@ -37,7 +37,7 @@ except BaseException as exc:
     error = type(exc).__name__
 print(json.dumps(dict(closed=host.closed, done=opening.done, error=error)))
 '''
-    completed = subprocess.run([sys.executable, "-I", "-c", source],
+    completed = subprocess.run([sys.executable, "-I", "-B", "-c", source],
                                capture_output=True, text=True, timeout=10)
     assert completed.returncode == 0, completed.stderr
     outcome = json.loads(completed.stdout)

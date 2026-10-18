@@ -191,6 +191,45 @@ def test_buffered_commands_do_not_bypass_continuous_frame_limit(backend):
         assert after["scene_updates"] == before["scene_updates"]
 
 
+@pytest.mark.parametrize("backend", ["window", "terminal"])
+def test_synchronous_service_requests_do_not_starve_presentations(backend):
+    with raw_host(backend) as host:
+        host.request("frame", commands=[["begin", "#123456"]])
+        host.request("present")
+        host.request("configure", continuous=True, fps_limit=60, vsync=False)
+        before = host.request("stats")
+        deadline = time.monotonic() + .5
+        # Unlike batches, a synchronous producer sends the next request as soon
+        # as each reply arrives. Every follow-up can fit the coalescing window.
+        while time.monotonic() < deadline:
+            after = host.request("stats")
+        frames = after["frames"] - before["frames"]
+        elapsed = after["elapsed_seconds"] - before["elapsed_seconds"]
+        assert frames >= 2, "Service traffic prevented native presentation progress"
+        assert frames <= 60 * elapsed + 2
+        assert after["scene_updates"] == before["scene_updates"]
+
+
+@pytest.mark.parametrize("backend", ["window", "terminal"])
+def test_incomplete_follow_up_does_not_hold_continuous_frames(backend):
+    with raw_host(backend) as host:
+        host.request("frame", commands=[["begin", "#123456"]])
+        host.request("present")
+        host.request("configure", continuous=True, fps_limit=60, vsync=False)
+        before = host.request("stats")
+        request, packet = host.packet("stats")
+        # A follow-up can wake the socket before even its header is complete.
+        # Presentation must continue while that request waits for the sender;
+        # completing it must then deliver exactly the matching reply.
+        host.sock.sendall(packet[:3])
+        time.sleep(.1)
+        host.sock.sendall(packet[3:])
+        after = host.reply(request)
+        assert after["frames"] > before["frames"]
+        assert after["scene_updates"] == before["scene_updates"]
+        assert host.request("stats")["requests"] == after["requests"] + 1
+
+
 def tcp_info(sock):
     # Read-only Windows TCP_INFO_v0, available since Windows 10 1703. This
     # avoids production instrumentation and needs no privileged packet capture.

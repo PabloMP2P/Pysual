@@ -121,13 +121,23 @@ def preset_label(controls):
 
 
 def format_fps_readout(controls, measurements):
-    """One line: preset, backend presentation FPS, and full-cycle submission FPS."""
+    """One line: preset, presentation FPS, submission FPS, and submit latency when known."""
     if not measurements:
         backend = cycle = "—"
     else:
         backend = f"{measurements['backend_fps']:.1f}"
         cycle = f"{measurements['full_cycle_fps']:.1f}"
-    return f"{preset_label(controls)} · Backend FPS {backend} · Full cycle FPS {cycle}"
+    return f"{preset_label(controls)} · Backend FPS {backend} · Full cycle FPS {cycle}{_submit_suffix(measurements)}"
+
+
+def _submit_suffix(measurements):
+    """Paint-to-ack latency. FPS counters hide it when a rate or present cap is hit."""
+    timings = measurements.get("timings_ms") if measurements else None
+    paint = timings.get("paint_and_submit") if isinstance(timings, dict) else None
+    sample = paint.get("p50") if isinstance(paint, dict) else None
+    if not isinstance(sample, (int, float)):
+        return ""
+    return f" · Submit {sample:.1f} ms"
 
 
 def percentiles(values):
@@ -443,7 +453,7 @@ class StressTest(App):
         for index in chosen:
             cell = self._cells[index]
             if cfg.workload == "paint":
-                cell.invalidate()  # Every selected body is rerecorded, even with body reuse.
+                cell.invalidate()  # Marks the body dirty. Unchanged retained segments stay on the host.
             elif cfg.workload == "layout":
                 updates[cell] = {"margin": 0.0 if cell.margin else 1.0}
             elif cfg.workload == "local-update":
