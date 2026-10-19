@@ -217,13 +217,61 @@ class HitIndexTests(UIOwnerTestCase):
         self.assertIs(self.router.hit(self.app, 310, 340), new)
         new.left = 450
         arrange(self.app, self.host)
-        self.assertIsNot(self.router._hit_index, main)
+        self.assertIs(self.router._hit_index, main)
         self.assertIs(self.router.hit(self.app, 310, 340), self.app)
         self.assertIs(self.router.hit(self.app, 460, 340), new)
         popup.dismiss()
         arrange(self.app, self.host)
         self.assertIs(self.router.hit(self.app, 460, 340), new)
         self.app._state = "CREATED"
+
+    def test_bulk_moves_and_viewport_resizes_preserve_hit_order_and_custom_policy(self):
+        class Policy(Container):
+            def _initialize(self):
+                super()._initialize()
+                self._allowed = True
+
+            @property
+            def effective_enabled(self):
+                return self._allowed and super().effective_enabled
+
+        class Overlay(Container):
+            _overlay = True
+
+        panel = Policy(parent=self.app, left=10, top=10, width=840, height=580)
+        controls = [Button(parent=panel, left=index % 12 * 55, top=index // 12 * 28,
+                           width=70, height=34)
+                    for index in range(144)]
+        overlay = Overlay(parent=panel, left=120, top=80, width=160, height=90)
+        Button(parent=overlay, width=100, height=35)
+        arrange(self.app, self.host)
+
+        def verify():
+            points = [(x, y) for x in (0, 15, 75, 145, 230, 399, 450, 680, 959, 970)
+                      for y in (0, 15, 45, 95, 150, 259, 310, 390, 639, 650)]
+            points.extend((control._rect.x + 1, control._rect.y + 1)
+                          for control in controls)
+            self.assert_direct_matches(self.app, points)
+            fresh = _HitIndex(self.app, self.runtime._modality)
+            for point in points:
+                with self.subTest(candidates=point):
+                    self.assertEqual(list(self.router._hit_index.candidates(*point)),
+                                     list(fresh.candidates(*point)))
+
+        verify()
+        for control in controls:
+            control.update(left=control.left + 17, top=control.top + 13)
+        arrange(self.app, self.host)
+        verify()
+        for viewport in ((400, 260), (960, 640)):
+            self.host.size = viewport
+            arrange(self.app, self.host)
+            verify()
+        panel._allowed = False
+        panel.invalidate()
+        verify()
+        panel._allowed = True
+        verify()
 
     def test_clear_releases_geometry_and_input_control_references(self):
         button = Button(parent=self.app, width=100, height=35)

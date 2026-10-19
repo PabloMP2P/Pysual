@@ -155,6 +155,7 @@ class SVGRenderer:
         self._node_image_sources: dict[int, tuple[_SvgNode, dict[str, str]]] = {}
         self._revision = 0
         self._resource_revision = 0
+        self._metrics_revision = 0
         self._surface_serial = 0
         self._surfaces: set[_Surface] = set()
         self._target: _Surface | None = None
@@ -211,6 +212,7 @@ class SVGRenderer:
         self._image_serial = 0
         self._metadata_revision += 1
         self._resource_revision += 1
+        self._metrics_revision += 1
 
     def close_scene(self) -> None:
         """Release cached resources, retaining the last frame for snapshots."""
@@ -246,6 +248,10 @@ class SVGRenderer:
     @property
     def render_scale(self) -> float:
         return self._viewport.scale
+
+    @property
+    def metrics_revision(self) -> int:
+        return self._metrics_revision
 
     @property
     def resource_revision(self) -> int:

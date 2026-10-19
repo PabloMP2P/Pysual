@@ -213,6 +213,19 @@ def _state(control: Control, body: _BuiltinPaint) -> tuple[object, ...]:
     return control._visual_epoch, (() if body.inputs is None else body.inputs(control))
 
 
+def measurement_uses_resources(control: Control) -> bool:
+    """Only unchanged catalog implementations may assume metric-only sizing.
+
+    The implementation guard covers helpers, MRO changes and instance shadows,
+    as well as measure itself. Custom subclasses keep the conservative default.
+    """
+    declared = control._values["measure_resources"]
+    if declared is not None:
+        return cast(bool, declared)
+    body = _bodies.get(type(control))
+    return body is None or not body.matches(control)
+
+
 def paint_measurements(control: Control) -> tuple[TextMeasurement, ...]:
     """Demand known by this exact body's implementation, before drawing it."""
     body = _body(control)

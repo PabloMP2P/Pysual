@@ -201,6 +201,7 @@ class TermTextHost(TerminalSession):
         self._prompt: _FilePrompt | None = None
         self._file_lock = asyncio.Lock()
         self._generation = 0
+        self.metrics_revision = 0
 
     def open(
         self,
@@ -226,6 +227,7 @@ class TermTextHost(TerminalSession):
         self._renderer._images.close()
         self._renderer._images = AsyncImageCache()
         self._generation += 1
+        self.metrics_revision += 1
         self._last_cells = None
         self._file_lock = asyncio.Lock()
 
@@ -250,6 +252,7 @@ class TermTextHost(TerminalSession):
         if changed or (self._renderer.columns, self._renderer.rows) != (columns, rows):
             self._renderer.resize(*size)
             self.resource_revision += 1
+            self.metrics_revision += 1
             self._last_cells = None
         return changed
 

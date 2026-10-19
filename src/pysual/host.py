@@ -368,6 +368,12 @@ class Host(Protocol):
     # Optional reload_image(source) discards that source's successful/failed
     # loads and increments resource_revision so shared cached paint rebuilds.
     # Pending decodes must not publish a result started before the reload.
+    # Optional metrics_revision separates preferred-size changes (fonts, DPI,
+    # metric resets) from image-only resource changes. Without it layout uses
+    # resource_revision as before. Advance metrics_revision for every metric
+    # change; advance resource_revision as well so cached painting refreshes.
+    # Custom controls remain resource-dependent unless they explicitly opt in
+    # with measure_resources=False. Paint caches always use resource_revision.
 
     # Optional when "render_surfaces" is advertised. Handles stay host-owned.
     # A host may also provide surface_byte_size(rect) -> int to include padding
@@ -394,6 +400,12 @@ class Host(Protocol):
     # returns whether a body scope was started. For a started scope,
     # paint_end(completed) restores the target in all cases and composites only
     # when completed=True. Cached target builds can return False (already isolated).
+    # Optional event_driven=True and set_wake_callback(callback) allow the
+    # runtime to sleep until input/resources arrive. Deliver callbacks on the
+    # registering asyncio loop and release them on close. Optional
+    # next_poll_delay is seconds until housekeeping (infinity by default);
+    # wake when a new earlier deadline is established. Hosts without this
+    # contract retain polling for geometry, Escape parsing and image completion.
     def present(self) -> None: ...
     def close(self) -> None: ...
     async def clipboard_read(self) -> str: ...

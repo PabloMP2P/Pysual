@@ -4,13 +4,13 @@ from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from math import isfinite
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 
 from ._engine import ui_method
 from .controls import Container, Control
 from .geometry import Rect
 from .host import Host, text_row_height
-from .schema import _LAYOUT_MASK
+from .schema import Dirty, _LAYOUT_MASK
 
 
 class _LimitedMeasure(Protocol):
@@ -26,6 +26,7 @@ class _LimitedMeasure(Protocol):
 _TrackKind = Literal["fixed", "auto", "star"]
 _Size = tuple[float, float]
 _Demand = tuple[int, int, float]
+_NO_METRICS = object()
 
 
 @dataclass(slots=True)
@@ -45,13 +46,13 @@ class _GridPlan:
 
 
 @contextmanager
-def _measurement_rows(c: Control, host: Host) -> Generator[None, None, None]:
+def _measurement_rows(c: Control, host: Host) -> Generator[Control, None, None]:
     """Expose requested measurement metrics without changing arranged geometry."""
     root = c._root()
     previous = root._measurement_row_height
     root._measurement_row_height = text_row_height(host, 0.0)
     try:
-        yield
+        yield root
     finally:
         root._measurement_row_height = previous
 
@@ -59,7 +60,23 @@ def _measurement_rows(c: Control, host: Host) -> Generator[None, None, None]:
 def _size(
     c: Control, host: Host, *, width: float | None = None, height: float | None = None
 ) -> _Size:
-    with _measurement_rows(c, host):
+    # Each query observes its own host state: a custom parent can change
+    # metrics or resources before asking for another child in the same pass.
+    metrics = getattr(host, "metrics_revision", _NO_METRICS)
+    resources = getattr(host, "resource_revision", 0)
+    environment = _measure_environment(host, resources if metrics is _NO_METRICS else metrics)
+    root = c._root()
+    previous_rows = root._measurement_row_height
+    root._measurement_row_height = cast(float, environment[2])
+    try:
+        if metrics is not _NO_METRICS:
+            previous = root._measure_resource_context
+            if previous is None or previous[0] is not host or previous[1] != resources:
+                _refresh_measure_resources(root, host, resources)
+        elif root._measure_resource_context is not None:
+            # A legacy query can switch just one branch to another host. Clear
+            # siblings too before forgetting their resource baseline.
+            _clear_measurements(root)
         if c._measure_cache_host is not host:
             c._measure_cache.clear()
             c._measure_cache_host = host
@@ -71,7 +88,7 @@ def _size(
             ancestors.append((parent, parent._measure_local_revision, parent._rect))
             parent = parent._parent
         key = (
-            c._measure_revision, width, height, _measure_environment(host),
+            c._measure_revision, width, height, environment,
             c.effective_theme, tuple(ancestors),
             c.__dict__.get("measure", type(c).measure),
             c.__dict__.get("measure_available", type(c).measure_available),
@@ -85,7 +102,9 @@ def _size(
             # Hooks may invalidate during measurement. Do not commit that
             # result under an obsolete generation or after a resource change.
             if (not c._measure_uncached and c._measure_revision == key[0]
-                    and _measure_environment(host) == key[3]):
+                    and _measure_environment(host) == key[3]
+                    and (metrics is _NO_METRICS
+                         or getattr(host, "resource_revision", 0) == resources)):
                 entries.insert(0, (key, preferred))
                 del entries[4:]
         w, h = preferred
@@ -102,13 +121,73 @@ def _size(
             ),
         )
 
+    finally:
+        root._measurement_row_height = previous_rows
 
-def _measure_environment(host: Host) -> tuple[object, ...]:
+
+def _measure_environment(host: Host, revision: object = _NO_METRICS) -> tuple[object, ...]:
     """Host facts that can change preferred sizes without property writes."""
+    if revision is _NO_METRICS:
+        revision = getattr(host, "metrics_revision", _NO_METRICS)
+        if revision is _NO_METRICS:
+            revision = getattr(host, "resource_revision", 0)
     return (
-        getattr(host, "resource_revision", 0), getattr(host, "render_scale", 1),
+        revision,
+        getattr(host, "render_scale", 1),
         text_row_height(host, 0.0), tuple(host.size), getattr(host, "viewport", None),
     )
+
+
+def _refresh_measure_resources(
+    root: Control, host: Host, resources: object = _NO_METRICS,
+) -> None:
+    """Invalidate resource-dependent queries and their cached ancestors once.
+
+    Hosts without separate metrics retain the original full environment key.
+    Walk only on a resource transition; do not keep a registry of custom types
+    or instances. Direct _size calls use the same path as runtime layout.
+    """
+    if resources is _NO_METRICS:
+        if not hasattr(host, "metrics_revision"):
+            if root._measure_resource_context is not None:
+                _clear_measurements(root)
+            return
+        resources = getattr(host, "resource_revision", 0)
+    previous = root._measure_resource_context
+    if previous is not None and previous[0] is host and previous[1] == resources:
+        return
+    if previous is not None and previous[0] is not host:
+        _clear_measurements(root)
+    root._measure_resource_context = (host, resources)
+    if previous is None or previous[0] is not host:
+        return
+
+    from ._paint_state import measurement_uses_resources, painting_scope
+
+    nodes: list[Control] = []
+    pending = [root]
+    while pending:
+        control = pending.pop()
+        nodes.append(control)
+        if isinstance(control, Container):
+            pending.extend(control._children)
+    affected: set[Control] = set()
+    with painting_scope():
+        for control in reversed(nodes):
+            local = measurement_uses_resources(control)
+            if not local and control not in affected:
+                continue
+            control._measure_revision += 1
+            control._measure_cache.clear()
+            control._dirty = int(control._dirty) | int(Dirty.MEASURE)
+            if local:
+                control._layout_valid = False
+                if isinstance(control, Container):
+                    control._layout_plan = None
+            parent = control._parent
+            if parent is not None:
+                affected.add(parent)
+                parent._layout_children_dirty.add(control)
 
 
 def _clear_measurements(root: Control) -> None:
@@ -118,6 +197,7 @@ def _clear_measurements(root: Control) -> None:
         c = pending.pop()
         c._measure_cache.clear()
         c._measure_cache_host = None
+        c._measure_resource_context = None
         c._measure_revision += 1
         c._layout_valid = False
         c._layout_measure_host = None
@@ -130,9 +210,11 @@ def _clear_measurements(root: Control) -> None:
 
 
 def _clamp(value: float, minimum: float, maximum: float | None) -> float:
-    if maximum is not None and maximum < minimum:
+    if maximum is None:
+        return max(minimum, value)
+    if maximum < minimum:
         raise ValueError("Maximum size cannot be smaller than minimum")
-    return max(minimum, min(value, maximum if maximum is not None else value))
+    return max(minimum, min(value, maximum))
 
 
 def _grid_cells(
@@ -826,6 +908,7 @@ def arrange(root: Control, host: Host) -> None:
         _clear_measurements(root)
         root._layout_measure_host = host
         root._layout_measure_environment = environment
+    _refresh_measure_resources(root._root(), host)
     row_height = text_row_height(host, 0.0)
     root._root()._fixed_row_height = row_height
     runtime = getattr(root._root(), "_runtime", None)

@@ -1192,6 +1192,7 @@ class _PaintSegment:
     key: PaintInputs | None = None
     start_index: int = 0
     end_index: int = 0
+    children: tuple[Control, ...] = ()
 
 
 def _prefetch_caption_metrics(host: Host, controls: Sequence[Control]) -> None:
@@ -1336,20 +1337,25 @@ class RetainedPaintTree:
         full: bool = False,
         prepared: dict[Control, PaintInputs] | None = None,
     ) -> tuple[list[str], bool, dict[Control, PaintInputs]]:
+        prepared = {} if prepared is None else prepared
+        if not full and self._refresh_geometry(affected, focus, prepared):
+            return [], False, prepared
         previous = self._records
-        ranges = {control: (record.start_index, record.end_index)
-                  for control, record in previous.items()}
+        ranges: dict[Control, tuple[int, int]] = {}
         paths = {root}
-        for control in affected:
-            node = control
-            while node is not None and node not in paths:
-                paths.add(node)
-                node = node._parent
+        if not full:
+            # Only partial reconciliation can reuse the previous subtrees.
+            ranges = {control: (record.start_index, record.end_index)
+                      for control, record in previous.items()}
+            for control in affected:
+                node = control
+                while node is not None and node not in paths:
+                    paths.add(node)
+                    node = node._parent
         records: dict[Control, _PaintSegment] = {}
         controls: list[Control] = []
         order: list[str] = []
         uncached: set[Control] = set()
-        prepared = {} if prepared is None else prepared
 
         def visit(control: Control, inherited_changed: bool = False) -> None:
             record = previous.get(control)
@@ -1389,6 +1395,7 @@ class RetainedPaintTree:
                 uncached.add(control)
             children = _child_controls(control)
             if children and control._paint_clip.width > 0 and control._paint_clip.height > 0:
+                record.children = tuple(children)
                 ordered = (
                     runtime._modality.paint_order(children)
                     if runtime is not None
@@ -1396,6 +1403,8 @@ class RetainedPaintTree:
                 )
                 for child in ordered:
                     visit(child, inherited_changed)
+            else:
+                record.children = ()
             record.end_index = len(order)
 
         try:
@@ -1408,6 +1417,38 @@ class RetainedPaintTree:
         changed = order != self._order
         self._records, self._control_order, self._order, self._uncached_custom = records, controls, order, uncached
         return removed, changed, prepared
+
+    @staticmethod
+    def _paint_children(control: Control) -> tuple[Control, ...]:
+        if control._paint_clip.width <= 0 or control._paint_clip.height <= 0:
+            return ()
+        return tuple(_child_controls(control))
+
+    def _refresh_geometry(
+        self, affected: set[Control], focus: Control | None,
+        prepared: dict[Control, PaintInputs],
+    ) -> bool:
+        """Keep records and order in place while visible membership is stable."""
+        pending = [(control, False) for control in affected]
+        propagated: set[Control] = set()
+        while pending:
+            control, inherited_changed = pending.pop()
+            record = self._records.get(control)
+            if (record is None or control._disposed or not control._values["visible"]
+                    or record.children != self._paint_children(control)):
+                return False
+            key = prepared.get(control)
+            if key is None:
+                key = prepared[control] = self._key(control, focus)
+            inherited_changed = inherited_changed or (
+                record.key is not None and record.key[4:6] != key[4:6]
+            )
+            if inherited_changed and control not in propagated:
+                # Visit each descendant once, even with nested policy changes.
+                propagated.add(control)
+                pending.extend((child, True) for child in record.children
+                               if child in self._records)
+        return True
 
     def _draw_body(
         self, control: Control, record: _PaintSegment, focus: Control | None, key: PaintInputs
@@ -1509,7 +1550,8 @@ class RetainedPaintTree:
             affected = metadata_dirty | layout_controls | dirty
             remove, order_changed, prepared = self._reconcile_tree(
                 root, runtime, focus, affected,
-                full=force or layout_changed and not layout_seen,
+                full=(force or layout_changed and not layout_seen
+                      or modality_order != self._modality_order),
                 prepared=prepared,
             )
             self._pending_remove.update(remove)

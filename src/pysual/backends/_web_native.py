@@ -10,13 +10,13 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict, deque
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 import json
 from pathlib import Path
-from math import isfinite
+from math import inf, isfinite
 import re
 import secrets
 import socket
@@ -472,6 +472,7 @@ class LiveSVGHost(SVGRenderer, NativeServices):
 
     _error_prefix = "web"
     web_execution = "live"
+    event_driven = True
 
     capabilities = frozenset(
         {
@@ -515,6 +516,46 @@ class LiveSVGHost(SVGRenderer, NativeServices):
         self._disconnect_at: float | None = None
         self._last_contact: float | None = None
         self.url: str | None = None
+        self._wake: Callable[[], None] | None = None
+        self._wake_loop: asyncio.AbstractEventLoop | None = None
+        self._wake_token: object | None = None
+
+    def set_wake_callback(self, callback: Callable[[], None] | None) -> None:
+        with self._condition:
+            self._wake = callback
+            self._wake_loop = asyncio.get_running_loop() if callback is not None else None
+            self._wake_token = None
+
+    def _notify_input(self) -> None:
+        # Called under _condition by HTTP workers as well as the UI owner.
+        loop = self._wake_loop
+        if self._closed or loop is None or self._wake is None or self._wake_token is not None:
+            return
+        token = self._wake_token = object()
+
+        def deliver() -> None:
+            with self._condition:
+                if self._wake_token is not token:
+                    return
+                self._wake_token = None
+                callback = self._wake
+            if callback is not None:
+                callback()
+
+        try:
+            loop.call_soon_threadsafe(deliver)
+        except RuntimeError:
+            self._wake_token = None
+
+    @property
+    def next_poll_delay(self) -> float:
+        """Seconds until disconnect housekeeping; input wakes independently."""
+        with self._condition:
+            deadline = min(
+                self._disconnect_at if self._disconnect_at is not None else inf,
+                self._last_contact + 60 if self._last_contact is not None else inf,
+            )
+            return max(0.0, deadline - time.monotonic())
 
     def open(
         self,
@@ -589,7 +630,7 @@ class LiveSVGHost(SVGRenderer, NativeServices):
                 self._disconnect_at = None
             elif (
                 self._last_contact is not None
-                and time.monotonic() - self._last_contact > 60
+                and time.monotonic() - self._last_contact >= 60
             ):
                 result.append(Input("close"))
                 self._last_contact = None
@@ -722,6 +763,7 @@ class LiveSVGHost(SVGRenderer, NativeServices):
 
                     loop.call_soon_threadsafe(finish)
             self._condition.notify_all()
+            self._notify_input()
             return True
 
     @staticmethod
@@ -754,6 +796,7 @@ class LiveSVGHost(SVGRenderer, NativeServices):
             if revision == -1:
                 self._disconnect_at = None
             self._last_contact = time.monotonic()
+            self._notify_input()
             metadata_revision = (
                 cursor.metadata_revision if cursor is not None
                 else self._sent_metadata_revision
@@ -802,10 +845,13 @@ class LiveSVGHost(SVGRenderer, NativeServices):
     def reload_image(self, source: object) -> None:
         with self._condition:
             super().reload_image(source)
+            self._events.append(Input("repaint"))
+            self._notify_input()
 
     def _resource_error(self, message: str) -> None:
         with self._condition:
             self._events.append(Input("resource_error", text=message))
+            self._notify_input()
 
     def present(self) -> None:
         with self._condition:
@@ -919,6 +965,7 @@ class LiveSVGHost(SVGRenderer, NativeServices):
     def close(self) -> None:
         with self._condition:
             self._closed = True
+            self._wake = self._wake_loop = self._wake_token = None
             for loop, future in self._pending.values():
 
                 def finish(future: asyncio.Future[object] = future) -> None:

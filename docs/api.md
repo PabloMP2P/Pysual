@@ -513,6 +513,20 @@ changes, for example from the source's change handler. These dependencies are
 not discovered by tracking property reads. `invalidate()` without arguments
 requests painting and does not invalidate a cached preferred size.
 
+Hosts may expose a separate `metrics_revision` for fonts and other preferred-size
+metrics. Image-only changes still invalidate painting. Unmodified built-in
+controls can reuse preferred sizes across those changes; custom controls and
+replaced built-in implementations retain resource-based invalidation by default.
+Hosts without `metrics_revision` retain the original combined behavior.
+
+Set `measure_resources=False` only when a custom control's measurement and
+arrangement depend on metrics and declared model inputs, not image resources.
+For external sizing changes, continue to call `invalidate(Dirty.MEASURE)`.
+`measure_resources=True` explicitly requires resource invalidation; the default
+`None` selects the conservative automatic policy. Descendant resource
+dependencies still invalidate cached ancestor sizes, even if the ancestor opts
+into metric-only sizing. This option does not disable painting invalidation.
+
 Set `cache_measure=False` on a control whose measurement cannot follow that
 dependency contract. Its size query is not reused, and a cached ancestor cannot
 hide it when measuring the subtree. This option does not request continuous

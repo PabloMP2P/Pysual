@@ -232,6 +232,7 @@ class Control(SchemaObject, metaclass=_ControlMeta):
     _transient_fields: ClassVar[dict[str, Callable[[], object]]] = {
         "_measure_cache": list,
         "_measure_cache_host": lambda: None,
+        "_measure_resource_context": lambda: None,
         "_layout_valid": lambda: False,
         "_layout_measure_host": lambda: None,
         "_layout_measure_environment": lambda: None,
@@ -304,6 +305,10 @@ class Control(SchemaObject, metaclass=_ControlMeta):
         default=True, affects=Dirty.MEASURE,
         doc="Reuse preferred sizes until geometry inputs change; disable for external sizing state",
     )
+    measure_resources: bool | None = prop(
+        default=None, affects=Dirty.MEASURE,
+        doc="None preserves custom resource dependencies; False opts into metric-only sizing",
+    )
     focusable: bool = prop(default=False, affects=Dirty.HIT_TEST)
     tab_index: int = prop(default=0, affects=Dirty.HIT_TEST)
     _allow_state: ClassVar[bool] = False
@@ -362,6 +367,7 @@ class Control(SchemaObject, metaclass=_ControlMeta):
         self._measure_local_revision = 0
         self._measure_cache: list[tuple[tuple[object, ...], tuple[float, float]]] = []
         self._measure_cache_host: Host | None = None
+        self._measure_resource_context: tuple[Host, object] | None = None
         self._measure_cache_enabled = self._values["cache_measure"]
         self._layout_valid = False
         self._layout_theme: Theme | None = None
@@ -943,6 +949,7 @@ class Control(SchemaObject, metaclass=_ControlMeta):
         self._dispatcher = None
         self._measure_cache.clear()
         self._measure_cache_host = None
+        self._measure_resource_context = None
         self._layout_measure_host = None
         self._layout_measure_environment = None
         self._channels.clear()

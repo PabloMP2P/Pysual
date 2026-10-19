@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bisect import insort
 from collections.abc import Coroutine, Iterator, Sequence
 from inspect import isawaitable, iscoroutine
 from math import ceil, floor, sqrt
@@ -68,6 +69,7 @@ class _HitIndex:
     ) -> None:
         records: list[_Record] = []
         self.excluded = excluded
+        self.root = root
         self.metadata: dict[Control, _Meta] = {}
 
         def state(control: Control) -> _Meta:
@@ -112,16 +114,113 @@ class _HitIndex:
         self.cell_size = max(4, min(64, sqrt(area / max(1, len(records)))))
         self.buckets: dict[tuple[int, int], list[_Record]] = {}
         self.large: list[_Record] = []
+        self.records = {record[1]: record for record in records}
+        # Tree traversal already supplies ascending paint order. A full build
+        # only appends; incremental insertion below must preserve that order.
+        cell_size, buckets, large = self.cell_size, self.buckets, self.large
         for record in records:
             clip = record[2]
-            x0, y0 = floor(clip.x / self.cell_size), floor(clip.y / self.cell_size)
-            x1, y1 = ceil(clip.right / self.cell_size), ceil(clip.bottom / self.cell_size)
+            x0, y0 = floor(clip.x / cell_size), floor(clip.y / cell_size)
+            x1, y1 = ceil(clip.right / cell_size), ceil(clip.bottom / cell_size)
             if (x1 - x0) * (y1 - y0) > 64:
-                self.large.append(record)
+                large.append(record)
                 continue
-            for cell_y in range(y0, y1):
-                for cell_x in range(x0, x1):
-                    self.buckets.setdefault((cell_x, cell_y), []).append(record)
+            for y in range(y0, y1):
+                for x in range(x0, x1):
+                    buckets.setdefault((x, y), []).append(record)
+
+    def _cell_bounds(self, clip: Rect) -> tuple[int, int, int, int]:
+        return (floor(clip.x / self.cell_size), floor(clip.y / self.cell_size),
+                ceil(clip.right / self.cell_size), ceil(clip.bottom / self.cell_size))
+
+    def _insert(self, record: _Record) -> None:
+        x0, y0, x1, y1 = self._cell_bounds(record[2])
+        if (x1 - x0) * (y1 - y0) > 64:
+            insort(self.large, record, key=lambda item: item[0])
+            return
+        for y in range(y0, y1):
+            for x in range(x0, x1):
+                bucket = self.buckets.setdefault((x, y), [])
+                insort(bucket, record, key=lambda item: item[0])
+
+    def _remove(self, record: _Record) -> None:
+        # The cell size stays fixed between structural rebuilds, so the old
+        # clip encodes membership without another per-control cell cache.
+        x0, y0, x1, y1 = self._cell_bounds(record[2])
+        if (x1 - x0) * (y1 - y0) > 64:
+            self.large.remove(record)
+            return
+        for y in range(y0, y1):
+            for x in range(x0, x1):
+                cell = (x, y)
+                bucket = self.buckets[cell]
+                bucket.remove(record)
+                if not bucket:
+                    del self.buckets[cell]
+
+    def refresh(self, dirty: set[Control], popup: Control | None) -> bool:
+        """Patch local geometry; return False when membership/order may change."""
+        # Resizing the viewport invalidates the full index. Check its root
+        # before walking an unordered dirty set or preparing local patches.
+        if self.root in dirty and self.changed(self.root, popup):
+            return False
+        # Rebuild broad changes even in small scenes: removing and sorted-
+        # inserting most records costs more than an append-only bulk build.
+        # Keep a small allowance for ordinary single-control/subtree moves.
+        limit = max(8, len(self.records) // 4)
+        changed: set[Control] = set()
+        for control in dirty:
+            if control is self.root:
+                continue
+            previous = self.metadata.get(control)
+            if previous is None:
+                continue
+            if control._disposed:
+                return False
+            children = tuple(child for child in _child_controls(control)
+                             if child is not self.excluded and child is not popup)
+            current = (control._clip, control._values["visible"], children)
+            if previous == current:
+                continue
+            if previous[1:] != current[1:]:
+                return False
+            changed.add(control)
+            # More changed controls cannot yield a smaller local patch. Stop
+            # before ancestor scans and replacement records that a bulk rebuild
+            # would immediately discard.
+            if len(changed) > limit:
+                return False
+        roots: list[Control] = []
+        for control in changed:
+            parent = control._parent
+            while parent is not None and parent not in changed:
+                parent = parent._parent
+            if parent is None:
+                roots.append(control)
+        updates: dict[Control, _Record] = {}
+        pending = [(control, self.records.get(control._parent) if control._parent is not None else None)
+                   for control in roots]
+        while pending:
+            control, parent_record = pending.pop()
+            record = self.records.get(control)
+            # Newly exposed or clipped-away subtrees use the structural path.
+            if record is None or parent_record is None:
+                return False
+            clip = control._clip.intersect(parent_record[2])
+            if clip.width <= 0 or clip.height <= 0:
+                return False
+            replacement = (record[0], control, clip)
+            updates[control] = replacement
+            if len(updates) > limit:
+                return False
+            pending.extend((child, replacement) for child in self.metadata[control][2]
+                           if child in self.metadata and self.metadata[child][1])
+        for control, record in updates.items():
+            self._remove(self.records[control])
+            self.records[control] = record
+            self.metadata[control] = (control._clip, *self.metadata[control][1:])
+            self._insert(record)
+        return True
 
     def changed(self, control: Control, popup: Control | None) -> bool:
         previous = self.metadata.get(control)
@@ -231,7 +330,7 @@ class Router:
         )
         dirty, self._hit_dirty = self._hit_dirty, set()
         if (self._hit_index is None or self._hit_order != order
-                or any(self._hit_index.changed(control, popup) for control in dirty)):
+                or not self._hit_index.refresh(dirty, popup)):
             self._hit_index = _HitIndex(app, modality, excluded=popup)
         self._hit_index_revision = self._hit_revision
         self._hit_order = order
@@ -247,7 +346,7 @@ class Router:
             parent = parent._parent
         if (self._popup_hit_scope is not popup or self._popup_hit_index is None
                 or self._popup_hit_clip != clip
-                or any(self._popup_hit_index.changed(control, None) for control in dirty)):
+                or not self._popup_hit_index.refresh(dirty, None)):
             self._popup_hit_index = _HitIndex(popup, modality, inherited_clip=clip)
             self._popup_hit_scope, self._popup_hit_clip = popup, clip
 
@@ -406,7 +505,14 @@ class Router:
 
     def _visible(self, c: Control | None) -> bool:
         while c is not None:
-            if c._disposed or not c._values["visible"] or not c._committed_enabled():
+            if c._disposed or not c._values["visible"]:
+                return False
+            # Ordinary enabled state is local here: this loop already checks
+            # every ancestor. Custom policies remain live on each query.
+            if type(c).effective_enabled is Control.effective_enabled:
+                if not c._values["enabled"]:
+                    return False
+            elif not c._committed_enabled():
                 return False
             c = c._parent
         return True

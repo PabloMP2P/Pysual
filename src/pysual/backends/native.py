@@ -147,6 +147,7 @@ class NativeHost(NativeServices):
         self.size = (960.0, 640.0)
         self._viewport = Viewport(*self.size)
         self.resource_revision = 0
+        self.metrics_revision = 0
         self._native_resource_revision: object | None = None
         self.info: dict[str, object] = {}
         self._wake_loop: asyncio.AbstractEventLoop | None = None
@@ -267,7 +268,7 @@ class NativeHost(NativeServices):
             self.close()
             raise
 
-    def _accept_viewport(self, info: Mapping[str, object]) -> None:
+    def _accept_viewport(self, info: Mapping[str, object], *, image_only: bool = False) -> None:
         previous = self._viewport
         previous_revision = self._native_resource_revision
         self._native_resource_revision = info.get("resource_revision", previous_revision)
@@ -276,6 +277,14 @@ class NativeHost(NativeServices):
         if (previous.scale != self._viewport.scale
                 or previous_revision != self._native_resource_revision):
             self.resource_revision += 1
+            # A reload acknowledges exactly one image-generation change. A
+            # larger/unknown jump may include a device reset and stays metric
+            # invalidating, even when its scale is unchanged.
+            if not (image_only and previous.scale == self._viewport.scale
+                    and type(previous_revision) is int
+                    and type(self._native_resource_revision) is int
+                    and self._native_resource_revision == previous_revision + 1):
+                self.metrics_revision += 1
             self._metrics.clear()
             self._metric_bytes = 0
             self._text_layout_cache.clear()
@@ -577,7 +586,7 @@ class NativeHost(NativeServices):
     def reload_image(self, source: str) -> None:
         info = self._request("reload_image", source=_image_source(source))
         self.info.update(cast(Mapping[str, object], info))
-        self._accept_viewport(self.info)
+        self._accept_viewport(self.info, image_only=True)
 
     def sprite(
         self,

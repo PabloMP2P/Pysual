@@ -218,17 +218,7 @@ class Engine:
         return future
 
     def _drain(self) -> None:
-        deadline = monotonic() + 0.004
-        count = 0
-        while count < 64 and monotonic() < deadline:
-            with self._lock:
-                if not self._inbox:
-                    self._scheduled = False
-                    return
-                request = self._inbox.popleft()
-                self._active_requests += 1
-            self._run_request(request)
-            count += 1
+        self._drain_slice()
         with self._lock:
             if self._inbox:
                 _ = self.loop.call_soon(self._drain)
@@ -236,19 +226,22 @@ class Engine:
                 self._scheduled = False
 
     def drain_pending(self) -> None:
-        """Serve the caller requests queued so far, on the owner, right now.
+        """Serve up to 64 queued requests or 4 ms before the next frame.
 
-        The runtime calls this before deciding on a frame, so a burst of
-        property writes from another thread lands in one scene update instead
-        of each write waiting behind a frame. Only requests present at entry are
-        served; later ones take the ordinary scheduled path, so a busy producer
-        cannot postpone the frame indefinitely.
+        Only requests present at entry are eligible. The already scheduled
+        dispatcher owns the remainder, preserving FIFO and cancellation.
         """
         if not self.is_ui_thread():
             raise LifecycleError("drain_pending belongs to the UI owner")
+        self._drain_slice()
+
+    def _drain_slice(self) -> None:
+        deadline = monotonic() + 0.004
         with self._lock:
-            count = len(self._inbox)
-        for _ in range(count):
+            count = min(64, len(self._inbox))
+        for index in range(count):
+            if index and monotonic() >= deadline:
+                break
             with self._lock:
                 if not self._inbox:
                     return

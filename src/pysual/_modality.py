@@ -312,16 +312,16 @@ class ModalManager:
             raise cleanup_failure
 
     def paint_order(self, children: Sequence[Control]) -> list[Control]:
-        modals = [entry.control for entry in self._openings if entry.presentation.modal]
+        modals: list[Control] = [entry.control for entry in self._openings if entry.presentation.modal]
         popup = self.runtime.popup
 
-        def priority(child: Control) -> tuple[int, bool]:
-            rank = max(
-                (i + 1 for i, modal in enumerate(modals) if contains(child, modal)),
-                default=0,
-            )
-            if popup is not None and contains(child, popup):
-                rank = len(modals) + 1
-            return rank, child._overlay
-
-        return sorted(children, key=priority)
+        if popup is not None:
+            modals.append(popup)
+        ranks: dict[Control, int] = {}
+        # Later openings replace earlier ranks on their shared ancestors.
+        for rank, control in enumerate(modals, 1):
+            node: Control | None = control
+            while node is not None:
+                ranks[node] = rank
+                node = node._parent
+        return sorted(children, key=lambda child: (ranks.get(child, 0), child._overlay))
