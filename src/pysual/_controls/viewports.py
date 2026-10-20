@@ -27,10 +27,6 @@ class ScrollArea(Container):
         self._scroll_axes: tuple[bool, bool] = (False, False)
         self._scroll_drag: tuple[int, int, float] | None = None
 
-    def _paint_layout_key(self) -> tuple[tuple[float, float], tuple[bool, bool]]:
-        # Descendant layout determines scrollbar visibility and thumb size.
-        return self._scroll_limits, self._scroll_axes
-
     def content_bounds(self, bounds: Rect) -> Rect:
         area = super().content_bounds(bounds)
         horizontal, vertical = self._scroll_axes

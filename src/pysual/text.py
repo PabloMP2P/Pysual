@@ -19,7 +19,6 @@ from .geometry import Rect
 from .schema import Dirty, Field, expect_text, prop
 from .painting import resolve_style, Painter
 from ._engine import TaskHandle
-from ._paint_state import capture_preparation, peek_prepared_paint
 from .graphemes import boundaries, floor_boundary, is_boundary, previous_boundary, next_boundary
 from ._scrolling import Scrollbar, can_scroll, scrollbar, handle_scrollbars, paint_scrollbars
 from ._text_display import single_line
@@ -100,12 +99,6 @@ class _TextPaintView(NamedTuple):
     line_height: float
     padding: float
     size: float
-
-
-class _PreparedTextPaint(NamedTuple):
-    style: ResolvedStyle
-    viewport: Rect
-    view: _TextPaintView
 
 
 class TextBox(Control):
@@ -1153,37 +1146,10 @@ class TextBox(Control):
         if before != (self._caret, self._anchor, self._scroll, self._scroll_x, self._composition):
             self.invalidate()
 
-    def _paint_inputs(self) -> tuple[object, ...]:
-        runtime = getattr(self._root(), "_runtime", None)
-        focused = runtime is not None and runtime.router.focus is self
-        return (self._caret, self._anchor, self._scroll, self._scroll_x,
-                self._composition, self._reveal_after_paint, focused,
-                id(self._measure_host), self._scroll_axes)
-
-    def _prepare_paint(self, host: Host) -> None:
-        # Reveal/clamp belongs to preparation, before either cache snapshots it.
-        # Direct/custom drawing uses the same preparation helper in _paint_text.
-        self._measure_host = host
-        self._sync_scrollbars(host)
-        painter = Painter(host, self._rect, self._fast_theme(), self)
-        style = painter.style()
-        viewport = self._text_viewport()
-        capture_preparation(self, host, lambda: _PreparedTextPaint(
-            style, viewport, self._prepare_text(painter, style, viewport),
-        ))
-
     def paint(self, p: Painter, /) -> None:
         s = p.body()
         self._measure_host = p.host
-        # Single-line synchronization is only a flag reset; validating a full
-        # preparation would cost more than repeating that ordinary hook.
-        prepared = peek_prepared_paint(self, p.host) if self.multiline else None
-        # Completed preparation already established the gutters. Body callbacks
-        # may have changed its inputs, so reuse only a still-live preparation;
-        # _paint_text consumes and rechecks it after the host's clip callback.
-        if not (isinstance(prepared, _PreparedTextPaint) and prepared.style == s
-                and prepared.viewport == self._text_viewport()):
-            self._sync_scrollbars(p.host)
+        self._sync_scrollbars(p.host)
         viewport = self._text_viewport()
         with p._clipped(viewport):
             self._paint_text(p, s, viewport)
@@ -1258,13 +1224,7 @@ class TextBox(Control):
         )
 
     def _paint_text(self, p: Painter, s: ResolvedStyle, viewport: Rect) -> None:
-        prepared = p._prepared_paint()
-        view = (
-            prepared.view
-            if isinstance(prepared, _PreparedTextPaint)
-            and prepared.style == s and prepared.viewport == viewport
-            else self._prepare_text(p, s, viewport)
-        )
+        view = self._prepare_text(p, s, viewport)
         (lines, starts, a, b, focused, composition, preview_start, preview_stop,
          preview_delta, row, caret_x, advance, mono, text_left, lh, padding, size
          ) = view

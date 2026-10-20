@@ -293,11 +293,6 @@ class SplitPane(Container):
         self._drag: bool | None = None
         self._divider = Rect()
 
-    def _paint_layout_key(self) -> Rect:
-        # Child visibility and size constraints can move/remove the divider
-        # without changing the pane's own properties or outer rectangle.
-        return self._divider
-
     @property
     def first(self) -> Container:
         self._check_live()

@@ -17,10 +17,8 @@ from ._drawing import gradient_fallback, mix_colors as _mix
 from ._nine_slice import MIN_COMPACT_PIXELS, nine_slice
 from ._png import rgba_png_data_uri
 from ._text_layout import TextLayoutCache
-from ._paint_state import (
-    PaintInputs, custom_paint as _custom_paint,
-    paint_inputs, paint_measurements, painting_scope, take_prepared_paint,
-)
+from ._paint_state import PaintInputs, paint_inputs
+from ._caption import Caption, paint_caption
 from .geometry import Rect
 from .graphemes import floor_boundary
 from .icons import draw_icon
@@ -426,11 +424,6 @@ class Painter:
         self._clip = control._clip if control is not None else rect
         self._effect_clip = self._clip
 
-    def _prepared_paint(self) -> object | None:
-        """Take this body's completed preparation, if its inputs remain live."""
-        assert self.control is not None
-        return take_prepared_paint(self.control, self.host)
-
     def effect_bounds(self) -> Rect:
         assert self.control is not None
         bounds = self.control.paint_bounds()
@@ -516,6 +509,39 @@ class Painter:
             size,
             font_family == "mono",
         )
+
+    def caption(
+        self, text: str, rect: Rect | None = None, *,
+        align: Literal["left", "center"] = "left", ellipsis: bool = True,
+        line_height: float | None = None, icon: str = "", icon_size: float = 20,
+        color: str | None = None, size: float | None = None, mono: bool = False,
+        font_family: Literal["ui", "mono"] | None = None,
+    ) -> None:
+        """Draw vertically centered text and an optional leading icon.
+
+        Single-line captions can elide to the supplied local rectangle. Pass
+        ellipsis=False for a multiline block, or line_height for fixed leading.
+        """
+        if align not in ("left", "center"):
+            raise ValueError("align must be left or center")
+        color, size, font_family = self._text_face(
+            color=color, size=size, mono=mono, font_family=font_family,
+        )
+        bounds = (self.bounds if rect is None else
+                  Rect(self.bounds.x + rect.x, self.bounds.y + rect.y,
+                       rect.width, rect.height))
+        caption = Caption(
+            str(text), bounds,
+            color, size, font_family == "mono", align, ellipsis, line_height,
+            icon, icon_size,
+        )
+        deferred = getattr(self.host, "_caption", None) if type(self) is Painter else None
+        if (deferred is not None and all(
+                getattr(type(self), name) is original and name not in self.__dict__
+                for name, original in _CAPTION_PAINTER_METHODS
+        ) and deferred(caption)):
+            return
+        paint_caption(self, caption)
 
     def _text_style(self) -> ResolvedStyle | Tokens:
         return self.style() if self.control is not None else self.theme.tokens
@@ -1184,6 +1210,10 @@ class Painter:
 
 
 _PAINTER_MEASURE = Painter.measure
+_CAPTION_PAINTER_METHODS = tuple(
+    (name, getattr(Painter, name)) for name in
+    ("measure", "elide", "text", "icon", "line", "lines", "segments", "_native_icon")
+)
 
 
 @dataclass
@@ -1193,51 +1223,6 @@ class _PaintSegment:
     start_index: int = 0
     end_index: int = 0
     children: tuple[Control, ...] = ()
-
-
-def _prefetch_caption_metrics(host: Host, controls: Sequence[Control]) -> None:
-    """Batch full captions actually needed by the pending built-in bodies.
-
-    Results go into the shared text service, not a private backend dictionary.
-    Elision requests its candidates only after this full caption overflows.
-    Hosts without the optional cache/batching interfaces keep demand measuring.
-    """
-    measured = optional_host(host, "measure_many")
-    cache = _text_cache(host)
-    if measured is None or cache is None or not controls:
-        return
-    groups: dict[tuple[float, bool], dict[str, tuple[object, ...]]] = {}
-    for control in controls:
-        for text, size, mono in paint_measurements(control):
-            if len(text) > cache.MAX_TEXT:
-                continue
-            key = ("m", text, size, mono)
-            if cache.get(key) is None:
-                groups.setdefault((size, mono), {})[text] = key
-    for (size, mono), pending in groups.items():
-        texts = list(pending)
-        start = 0
-        while start < len(texts):
-            end = start
-            batch_bytes = 128  # Reserve the measurement request envelope.
-            while end < len(texts) and end - start < 512:
-                # Like elision batches, budget for both UTF-8 and JSON control
-                # escapes. Eligible captions are individually below this limit.
-                cost = len(texts[end]) * 6 + 3
-                if end > start and batch_bytes + cost > _ELIDE_BATCH_BYTES:
-                    break
-                batch_bytes += cost
-                end += 1
-            batch = texts[start:end]
-            results = measured.measure_many(batch, size, mono)
-            for text, result in zip(batch, results, strict=True):
-                cache.store(pending[text], result)
-            start = end
-
-
-def _retains_segments(host: object) -> bool:
-    """True when an omitted segment stays on the host instead of being cleared."""
-    return "scene_patches" in getattr(host, "capabilities", ())
 
 
 class RetainedPaintTree:
@@ -1255,7 +1240,7 @@ class RetainedPaintTree:
         self._identities: WeakKeyDictionary[Control, str] = WeakKeyDictionary()
         self._next_identity = 0
         self._dirty: set[Control] = set()
-        self._uncached_custom: set[Control] = set()
+        self._uncached: set[Control] = set()
         self._reconcile = True
         self._force = True
         self._order: list[str] = []
@@ -1277,12 +1262,11 @@ class RetainedPaintTree:
             self._metadata_dirty.add(control)
         if mask & _VISUAL_MASK:
             self._dirty.add(control)
-            # Custom container paint hooks may depend on descendant state, as
-            # they did with propagated RenderCache revisions before patching.
+            # Any parent painter may read descendant state. Follow the same
+            # propagated revisions as surface caching, without type assumptions.
             node = control._parent
             while node is not None:
-                if _custom_paint(node):
-                    self._dirty.add(node)
+                self._dirty.add(node)
                 node = node._parent
 
     def invalidate_all(self) -> None:
@@ -1300,7 +1284,7 @@ class RetainedPaintTree:
         self._control_order.clear()
         self._identities.clear()
         self._dirty.clear()
-        self._uncached_custom.clear()
+        self._uncached.clear()
         self._order.clear()
         self._pending_remove.clear()
         self._metadata_dirty.clear()
@@ -1318,14 +1302,7 @@ class RetainedPaintTree:
         return identity
 
     def _key(self, control: Control, focus: Control | None) -> PaintInputs:
-        # Segments and surfaces share one completed dependency snapshot.
-        # Revision fallback is local here; a surface can depend on descendants.
-        record = self._records.get(control)
-        return paint_inputs(
-            control, self.host, focus, None, local=True,
-            reuse=_retains_segments(self.host),
-            previous=None if record is None else record.key,
-        )
+        return paint_inputs(control, self.host, focus, None)
 
     def _reconcile_tree(
         self,
@@ -1372,7 +1349,7 @@ class RetainedPaintTree:
                     records[child] = cached
                     controls.append(child)
                     order.append(cached.identity)
-                    if child in self._uncached_custom:
+                    if child in self._uncached:
                         uncached.add(child)
                 return
             if control._disposed or not control._values["visible"]:
@@ -1389,9 +1366,9 @@ class RetainedPaintTree:
             records[control] = record
             controls.append(control)
             order.append(record.identity)
-            if not control._values["cache_paint"] and _custom_paint(control):
-                # Noncacheable custom painters retain their original update-
-                # time behavior, including explicit request_frame() calls.
+            if not control._values["cache_paint"]:
+                # Disabling caching means drawing on every requested frame,
+                # for built-in and custom painters alike.
                 uncached.add(control)
             children = _child_controls(control)
             if children and control._paint_clip.width > 0 and control._paint_clip.height > 0:
@@ -1415,7 +1392,7 @@ class RetainedPaintTree:
             del visit
         removed = [record.identity for control, record in previous.items() if control not in records]
         changed = order != self._order
-        self._records, self._control_order, self._order, self._uncached_custom = records, controls, order, uncached
+        self._records, self._control_order, self._order, self._uncached = records, controls, order, uncached
         return removed, changed, prepared
 
     @staticmethod
@@ -1527,7 +1504,9 @@ class RetainedPaintTree:
         layout_controls, self._layout_controls = self._layout_controls, set()
         layout_seen, self._layout_seen = self._layout_seen, False
         force, self._force = self._force, False
-        reconcile, self._reconcile = self._reconcile or layout_changed, False
+        reconcile, self._reconcile = (
+            self._reconcile or layout_changed or bool(layout_controls), False
+        )
         for control in (self._focus, focus):
             if self._focus is not focus and control is not None:
                 dirty.add(control)
@@ -1561,10 +1540,10 @@ class RetainedPaintTree:
             if control not in self._records or control._disposed:
                 continue
             if control._values["cache_paint"]:
-                self._uncached_custom.discard(control)
-            elif _custom_paint(control):
-                self._uncached_custom.add(control)
-        candidates = set(prepared) | dirty | self._uncached_custom
+                self._uncached.discard(control)
+            else:
+                self._uncached.add(control)
+        candidates = set(prepared) | dirty | self._uncached
         getattr(host, "begin_scene")(root._fast_theme().tokens.background)
         bodies: list[tuple[Control, _PaintSegment, PaintInputs]] = []
         for control in candidates:
@@ -1574,10 +1553,8 @@ class RetainedPaintTree:
             key = prepared.get(control)
             if key is None:
                 key = self._key(control, focus)
-            if (force or record.key != key or control in self._uncached_custom
-                    or control in dirty and _custom_paint(control)):
+            if force or record.key != key or control in self._uncached:
                 bodies.append((control, record, key))
-        _prefetch_caption_metrics(host, [control for control, _record, _key in bodies])
         for control, record, key in bodies:
             self._draw_body(control, record, focus, key)
         if target not in self._records:
@@ -1617,7 +1594,7 @@ def paint_tree(
     retained: RetainedPaintTree | None = None,
     layout_changed: bool = False,
 ) -> None:
-    with critical_phase("layout and paint"), painting_scope():
+    with critical_phase("layout and paint"):
         if retained is not None:
             return retained.paint(root, focus, layout_changed=layout_changed)
         return _paint_tree(root, host, focus, cache)

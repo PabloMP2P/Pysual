@@ -162,7 +162,7 @@ def _refresh_measure_resources(
     if previous is None or previous[0] is not host:
         return
 
-    from ._paint_state import measurement_uses_resources, painting_scope
+    from ._paint_state import measurement_uses_resources
 
     nodes: list[Control] = []
     pending = [root]
@@ -172,22 +172,26 @@ def _refresh_measure_resources(
         if isinstance(control, Container):
             pending.extend(control._children)
     affected: set[Control] = set()
-    with painting_scope():
-        for control in reversed(nodes):
-            local = measurement_uses_resources(control)
-            if not local and control not in affected:
-                continue
-            control._measure_revision += 1
-            control._measure_cache.clear()
+    for control in reversed(nodes):
+        local = measurement_uses_resources(control)
+        if not local and control not in affected:
+            continue
+        control._measure_revision += 1
+        control._measure_cache.clear()
+        if isinstance(control, Container):
+            # Arrangers can read resources independently of preferred sizes,
+            # including through a captured host. Always run their normal hooks.
             control._dirty = int(control._dirty) | int(Dirty.MEASURE)
             if local:
                 control._layout_valid = False
-                if isinstance(control, Container):
-                    control._layout_plan = None
-            parent = control._parent
-            if parent is not None:
-                affected.add(parent)
-                parent._layout_children_dirty.add(control)
+                control._layout_plan = None
+        # Leaves still remeasure when their parent requests their size. Reuse
+        # placement only when that actual result produces the same geometry;
+        # place() checks the rectangle, clips and all pre-existing layout dirt.
+        parent = control._parent
+        if parent is not None:
+            affected.add(parent)
+            parent._layout_children_dirty.add(control)
 
 
 def _clear_measurements(root: Control) -> None:
@@ -931,13 +935,24 @@ def arrange(root: Control, host: Host) -> None:
         if (same_context and not c._measure_uncached
                 and not int(c._dirty) & _LAYOUT_MASK):
             return
+        # Arrangement can update private drawing state even when the outer
+        # rectangle stays fixed. Every placed control and its placed ancestors
+        # need fresh drawing; clean subtrees return above without advancing.
+        c._paint_revision += 1
+        if c is root and c._parent is not None:
+            # A direct subtree layout does not visit its owning ancestors.
+            # Their painters may still consume the subtree's arranged state.
+            ancestor: Control | None = c._parent
+            while ancestor is not None:
+                ancestor._paint_revision += 1
+                ancestor = ancestor._parent
+            if retained is not None:
+                retained.invalidate(c, Dirty.PAINT)
         if retained is not None:
             retained.layout_changed(c)
         if router is not None and hasattr(router, "layout_control"):
             router.layout_control(c)
         c._rect, c._clip = rect, intersection
-        if c._layout_row_height != row_height:
-            c._paint_revision += 1
         c._layout_row_height = row_height
         c._paint_clip = effect_clip
         c._layout_valid, c._layout_theme = True, theme

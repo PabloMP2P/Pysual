@@ -3,6 +3,7 @@
 import gc
 import random
 from functools import wraps
+from collections import Counter
 from types import SimpleNamespace
 from weakref import ref
 from unittest.mock import patch
@@ -12,7 +13,7 @@ from test_library import RecordingHost
 
 from pysual import App, Button, Container, Control, Dropdown, Label, Rect, ScrollArea, Style, get_theme
 from pysual import ListView, SegmentedControl, SplitPane, TabControl, TabPage, TextBox, dark
-from pysual._paint_state import custom_paint, paint_inputs
+from pysual._paint_state import paint_inputs
 from pysual._text_layout import TextLayoutCache
 from pysual.layout import _clear_measurements, arrange
 from pysual.painting import RetainedPaintTree, paint_tree
@@ -98,7 +99,7 @@ class CountingButton(Button):
 
 class RetainedPaintTests(UIOwnerTestCase):
     def setUp(self):
-        self.app, self.host = App(width=640, height=400), PatchRecordingHost()
+        self.app, self.host = App(width=640, height=400, cache_paint=True), PatchRecordingHost()
         self.runtime = Runtime(self.app, self.host)
         self.app._runtime = self.runtime
         self.retained = self.runtime._retained_paint = RetainedPaintTree(self.host)
@@ -135,7 +136,6 @@ class RetainedPaintTests(UIOwnerTestCase):
                 self.assertEqual(sum(command[0] == "text" for command in self.host.snapshot()),
                                  expected_rows)
                 self.assert_direct_matches()
-        listing.invalidate()
         self.frame()
         self.assertEqual(self.host.updates, [])
 
@@ -151,15 +151,15 @@ class RetainedPaintTests(UIOwnerTestCase):
         parent = StatusContainer(parent=self.app, width=200, height=100)
         child = Button(parent=parent, text="Before", width=100, height=30)
         self.frame(layout=True)
-        before = parent._paint_local_revision
+        before = parent._paint_revision
         parent.update_children({child: {"text": "After"}})
         self.assertEqual(parent.background, "#ff0000")
-        self.assertGreater(parent._paint_local_revision, before)
+        self.assertGreater(parent._paint_revision, before)
         self.assertIn(parent, self.retained._dirty)
         self.frame(layout=True)
         self.assert_direct_matches()
 
-    def test_hover_and_focus_touch_only_changed_controls_without_clean_tree_reads(self):
+    def test_hover_and_focus_touch_changed_controls_and_ancestors_without_clean_tree_reads(self):
         controls = [CountingButton(parent=self.app, text=str(index), width=30, height=24,
                                    left=index % 20 * 31, top=index // 20 * 25)
                     for index in range(160)]
@@ -167,16 +167,24 @@ class RetainedPaintTests(UIOwnerTestCase):
         baseline = [(control._paints, control._theme_reads) for control in controls]
         self.runtime.router._set_hover(controls[31])
         self.frame()
-        self.assertEqual(len(self.host.updates), 1)
+        self.assertEqual(set(self.host.updates), {
+            self.retained._records[controls[31]].identity,
+            self.retained._records[self.app].identity,
+        })
         for index, control in enumerate(controls):
             if index != 31:
                 self.assertEqual((control._paints, control._theme_reads), baseline[index])
         self.runtime.router.set_focus(controls[31])
         self.frame()
-        self.assertEqual(len(self.host.updates), 1)
+        self.assertEqual(set(self.host.updates), {
+            self.retained._records[controls[31]].identity,
+        })
         self.runtime.router.set_focus(controls[32])
         self.frame()
-        self.assertEqual(len(self.host.updates), 2)
+        self.assertEqual(set(self.host.updates), {
+            self.retained._records[controls[31]].identity,
+            self.retained._records[controls[32]].identity,
+        })
         self.assert_direct_matches()
 
     def test_reflow_add_remove_and_visibility_reuse_stable_identity_and_unaffected_bodies(self):
@@ -332,7 +340,7 @@ class RetainedPaintTests(UIOwnerTestCase):
                     self.assertEqual(outside._paints, outside_paints)
                     self.assert_direct_matches()
 
-    def test_scrollbar_extent_updates_after_child_resize_without_repainting_on_hover(self):
+    def test_scrollbar_updates_with_child_and_preserves_unrelated_bodies(self):
         scroll = ScrollArea(parent=self.app, width=200, height=100)
         child = Button(parent=scroll, text="Child", width=100, height=40)
         outside = CountingButton(parent=self.app, left=250, width=140, height=30)
@@ -347,9 +355,11 @@ class RetainedPaintTests(UIOwnerTestCase):
                 self.assertEqual(outside._paints, outside_paints)
                 self.assertEqual(scroll._scroll_limits[1] > 0, height > 100)
                 self.assert_direct_matches()
+        outside_paints = outside._paints
         self.runtime.router._set_hover(child)
         self.frame()
-        self.assertNotIn(identity, self.host.updates)
+        self.assertIn(identity, self.host.updates)
+        self.assertEqual(outside._paints, outside_paints)
         self.assert_direct_matches()
 
     def test_split_divider_tracks_child_size_constraints_and_visibility(self):
@@ -432,7 +442,7 @@ class RetainedPaintTests(UIOwnerTestCase):
         self.assert_direct_matches()
 
     def test_drag_feedback_follows_children_and_is_removed_on_target_change(self):
-        parent = Container(parent=self.app, width=180, height=100)
+        parent = Container(parent=self.app, width=180, height=100, cache_paint=True)
         Button(parent=parent, text="Child", width=100, height=30)
         other = Button(parent=self.app, text="Other", left=250, width=100, height=30)
         self.frame(layout=True)
@@ -536,18 +546,21 @@ class RetainedPaintTests(UIOwnerTestCase):
         self.assertIn(removed_id, self.host.removed)
         self.assert_direct_matches()
 
-    def test_unchanged_builtin_body_stays_on_the_host(self):
+    def test_clean_builtin_body_stays_on_host_and_explicit_invalidation_repaints(self):
         label = Label(parent=self.app, text="Same", width=80, height=24)
         self.frame(layout=True)
         self.assertTrue(self.host.updates)
-        label.invalidate()
         self.frame()
         self.assertEqual(self.host.updates, [])
+        label.invalidate()
+        self.frame()
+        self.assertIn(self.retained._records[label].identity, self.host.updates)
+        self.assert_direct_matches()
         label.text = "Changed"
         self.frame()
         self.assertTrue(self.host.updates)
 
-    def test_caption_prefetch_preserves_custom_styles_and_batches_builtins(self):
+    def test_caption_measurement_uses_actual_drawing_demand_and_preserves_custom_styles(self):
         class CaptionLabel(Label):
             style_parts = ("caption",)
 
@@ -559,21 +572,28 @@ class RetainedPaintTests(UIOwnerTestCase):
                 painter.text(self.text, 0, 0, size=style.font_size,
                              color=style.foreground, font_family=style.font_family)
 
-        batches = []
+        singles, batches = [], []
+        raw_measure = self.host.measure
+
+        def measure(text, size, mono=False):
+            singles.append(text)
+            return raw_measure(text, size, mono)
 
         def measure_many(texts, size, mono=False):
             batches.append(tuple(texts))
-            return [self.host.measure(text, size, mono) for text in texts]
+            return [raw_measure(text, size, mono) for text in texts]
 
         from pysual._text_layout import TextLayoutCache
         self.host._text_layout_cache = TextLayoutCache()
-        self.host.measure_many = measure_many
+        self.host.measure, self.host.measure_many = measure, measure_many
         Label(parent=self.app, text="Builtin", width=160, height=30)
         CaptionLabel(parent=self.app, text="Custom", top=40, width=160, height=30)
-        self.frame(layout=True)
-        self.assertEqual(len(batches), 1)
-        self.assertIn("Builtin", batches[0])
-        self.assertNotIn("Custom", batches[0])
+        arrange(self.app, self.host)
+        singles.clear()
+        batches.clear()
+        self.frame()
+        measured = singles + [text for batch in batches for text in batch]
+        self.assertEqual(measured, ["Builtin"])
         self.assert_direct_matches()
 
     def test_inherited_body_repaints_private_custom_focus_state(self):
@@ -620,8 +640,6 @@ class RetainedPaintTests(UIOwnerTestCase):
         ]
         self.frame(layout=True)
         before = self.host.snapshot()
-        for control in controls:
-            control.invalidate()
         self.frame()
         self.assertEqual(self.host.updates, [])
         self.assertEqual(self.host.snapshot(), before)
@@ -708,7 +726,7 @@ class RetainedPaintTests(UIOwnerTestCase):
 
 class PaintDependencyTests(UIOwnerTestCase):
     def fixture(self):
-        app = App(width=640, height=400, reduce_motion=True)
+        app = App(width=640, height=400, reduce_motion=True, cache_paint=True)
         host = PatchRecordingHost()
         host._text_layout_cache = TextLayoutCache()
         runtime = Runtime(app, host)
@@ -741,8 +759,8 @@ class PaintDependencyTests(UIOwnerTestCase):
         for index in range(200):
             label.text = f"Caption {index}"
             paint_tree(app, host, retained=retained)
-        self.assertEqual(singles, [])
-        self.assertEqual(batches, [(f"Caption {index}",) for index in range(200)])
+        measured = singles + [text for batch in batches for text in batch]
+        self.assertEqual(Counter(measured), Counter(f"Caption {index}" for index in range(200)))
         self.assertFalse(hasattr(host, "_metrics"))
 
     def test_only_overflowing_caption_requests_truncation_candidates(self):
@@ -750,16 +768,21 @@ class PaintDependencyTests(UIOwnerTestCase):
         Label(parent=app, text="Fits", width=400, height=30)
         Label(parent=app, text="Overflow caption", width=20, height=30, top=40)
         arrange(app, host)
-        batches = []
+        singles, batches = [], []
+        raw_measure = host.measure
+
+        def measure(text, size, mono=False):
+            singles.append(text)
+            return raw_measure(text, size, mono)
 
         def measure_many(texts, size, mono=False):
             texts = tuple(texts)
             batches.append(texts)
-            return [host.measure(text, size, mono) for text in texts]
+            return [raw_measure(text, size, mono) for text in texts]
 
-        host.measure_many = measure_many
+        host.measure, host.measure_many = measure, measure_many
         paint_tree(app, host, retained=retained)
-        measured = [text for batch in batches for text in batch]
+        measured = singles + [text for batch in batches for text in batch]
         self.assertEqual(measured.count("Fits"), 1)
         self.assertNotIn("Fits…", measured)
         self.assertIn("O…", measured)
@@ -781,7 +804,6 @@ class PaintDependencyTests(UIOwnerTestCase):
         WrappedLabel.paint = paint
         label = WrappedLabel(parent=app, width=100, height=30, cache_paint=False)
         label._calls = 0
-        self.assertTrue(custom_paint(label))
         arrange(app, host)
         for _ in range(3):
             paint_tree(app, host, retained=retained)
@@ -808,7 +830,7 @@ class PaintDependencyTests(UIOwnerTestCase):
         paint_tree(app, host)
         self.assertEqual(expected, tuple(host._drawing))
 
-    def test_inherited_opt_out_keeps_private_navigation_state_visible(self):
+    def test_private_navigation_state_repaints_after_invalidation(self):
         app, host, runtime, retained = self.fixture()
         choice = SegmentedControl(parent=app, items=("First", "Second"),
                                   width=220, height=36)
@@ -830,7 +852,7 @@ class PaintDependencyTests(UIOwnerTestCase):
         editor = TextBox(parent=app, text="Input", width=120, height=32)
         arrange(app, host)
         paint_tree(app, host, retained=retained)
-        for name in ("_paint_inputs", "_prepare_paint", "paint_line"):
+        for name in ("_prepare_text", "_text_viewport", "paint_line"):
             with self.subTest(hook=name):
                 original = getattr(editor, name)
 
@@ -847,7 +869,7 @@ class PaintDependencyTests(UIOwnerTestCase):
                     object.__delattr__(editor, name)
                 editor.invalidate()
                 paint_tree(app, host, retained=retained)
-                editor.invalidate()
+                self.assertIn(retained._records[editor].identity, host.updates)
                 paint_tree(app, host, retained=retained)
                 self.assertEqual(host.updates, [])
 
@@ -861,7 +883,6 @@ class PaintDependencyTests(UIOwnerTestCase):
                     super().paint(painter)
 
             control = DynamicLabel()
-            self.assertTrue(custom_paint(control))
             self.assertIsInstance(
                 paint_inputs(control, PatchRecordingHost(), None, control.effective_theme)[0], int
             )
@@ -873,7 +894,7 @@ class PaintDependencyTests(UIOwnerTestCase):
         gc.collect()
         self.assertFalse(any(reference() is not None for reference in references))
 
-    def test_preparation_finishes_caret_and_composition_before_either_cache_key(self):
+    def test_keys_do_not_prepare_caret_and_drawing_completes_reveal(self):
         for composition in ("", "Preview text\nsecond preview row"):
             with self.subTest(composition=composition):
                 app, host, runtime, retained = self.fixture()
@@ -887,11 +908,12 @@ class PaintDependencyTests(UIOwnerTestCase):
                 editor._reveal_after_paint = True
                 cache = RenderCache(host)
                 surface_key = cache.paint_key(editor, editor, app.effective_theme)
-                self.assertFalse(editor._reveal_after_paint)
-                self.assertGreater(editor._scroll_x, 0)
+                self.assertTrue(editor._reveal_after_paint)
                 segment_key = retained._key(editor, editor)
                 self.assertEqual(surface_key, segment_key)
                 paint_tree(app, host, editor, retained=retained)
+                self.assertFalse(editor._reveal_after_paint)
+                self.assertGreater(editor._scroll_x, 0)
                 self.assertEqual(surface_key, paint_inputs(editor, host, editor,
                                                          app.effective_theme))
                 before = host.snapshot()
@@ -920,7 +942,7 @@ class PaintDependencyTests(UIOwnerTestCase):
         finally:
             Label.paint = original
 
-    def test_measurement_callback_replacing_editor_hook_invalidates_prepared_contract(self):
+    def test_measurement_callback_replacement_does_not_publish_stale_drawing(self):
         app, host, runtime, retained = self.fixture()
         editor = TextBox(parent=app, text="A long caption needing caret preparation",
                          width=100, height=40)
@@ -941,27 +963,28 @@ class PaintDependencyTests(UIOwnerTestCase):
 
         host.measure = measure
         try:
-            snapshot = paint_inputs(editor, host, editor, app.effective_theme)
+            paint_tree(app, host, editor, retained=retained)
             self.assertTrue(measured)
-            self.assertIsInstance(snapshot[0], int)
+            expected = host.snapshot()
+            paint_tree(app, host, editor)
+            self.assertEqual(expected, tuple(host._drawing))
         finally:
             TextBox.paint = original
 
-    def test_custom_body_snapshot_calls_its_layout_hook_once(self):
+    def test_legacy_private_layout_key_cannot_add_a_cache_contract(self):
         app, host, runtime, retained = self.fixture()
 
         class CustomLabel(Label):
             def _paint_layout_key(self):
-                self._layout_reads += 1
-                return self._layout_reads
+                raise AssertionError("Private helper names must not enroll cache dependencies")
 
         label = CustomLabel(parent=app, text="Custom", width=100, height=30)
-        label._layout_reads = 0
         arrange(app, host)
-        before = label._layout_reads
-        key = retained._key(label, None)
-        self.assertIsInstance(key.state, int)
-        self.assertEqual(label._layout_reads, before + 1)
+        self.assertIsInstance(retained._key(label, None).state, int)
+        paint_tree(app, host, retained=retained)
+        expected = host.snapshot()
+        paint_tree(app, host)
+        self.assertEqual(expected, tuple(host._drawing))
 
     def test_user_registration_keeps_uncached_custom_callbacks(self):
         from pysual import register_control
@@ -1013,7 +1036,7 @@ class PaintDependencyTests(UIOwnerTestCase):
 
 class IncrementalPaintTests(UIOwnerTestCase):
     def fixture(self, grid_type=Container):
-        app = App(width=640, height=400, reduce_motion=True, theme=dark())
+        app = App(width=640, height=400, reduce_motion=True, theme=dark(), cache_paint=True)
         host = PatchRecordingHost()
         grid = grid_type(parent=app, layout="grid", columns=3,
                          width=600, height=360, spacing=3)

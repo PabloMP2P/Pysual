@@ -76,7 +76,6 @@ class EditorContent(Container, Generic[_V]):
 
 
 class _EditorMessage(Label):
-    _paint_reuse = False
 
     def paint(self, p: Painter, /) -> None:
         style = p.body()

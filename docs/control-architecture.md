@@ -23,6 +23,7 @@ The system has three levels:
 | `controls.py`, `schema.py` | Base Control/Container contracts, observable properties, atomic updates, and compatibility exports. |
 | `_registry.py` | Authoritative registrations, optional legacy aliases, and catalog discovery. |
 | `_catalog.py` | One table of built-in types, family names, authoring metadata, and compatibility factory aliases. |
+| `_paint_state.py` | Shared revision and environment snapshots for cached painting. |
 | `_controls/basic.py`, `actions.py` | Labels, buttons, checked actions, toggles, and exclusive choices. |
 | `_controls/ranges.py`, `viewports.py` | Bounded values, progress, and scrolling containers. |
 | `_controls/lists.py`, `choices.py` | Virtual list rows and choice popup content. |
@@ -70,6 +71,64 @@ Use `factory=False` for new controls. Catalog-only names can match ordinary
 Container member names because they do not install Python attributes. A name
 cannot refer to two registered types. Re-registering the same type/name updates
 its authoring/factory policy; removing an alias does not remove catalog metadata.
+
+Catalog membership does not change invalidation. New and existing built-ins
+follow the same contract as custom controls, including conservative resource
+invalidation for measurement. Adding a catalog entry or changing an existing
+control does not require cache dependency declarations.
+
+## From a control change to a frame
+
+The ordinary control contract covers the complete update path:
+
+1. A `prop` assignment records its `Dirty` flags. Use
+   `Dirty.MEASURE | Dirty.PAINT` for properties that affect preferred size;
+   drawing-only properties keep the default `Dirty.PAINT`.
+2. Private drawing-state changes call `invalidate()`. Private or external
+   sizing-state changes call `invalidate(Dirty.MEASURE)`.
+3. The runtime schedules a frame. Layout refreshes affected measurements and
+   rectangles. Painting uses the recorded invalidations to refresh affected
+   controls and ancestors while retaining valid work elsewhere; it does not
+   need to visit every clean subtree.
+
+Running a control's arrangement also refreshes its drawing. An arranger can
+therefore update private scrollbar, divider, or other drawing state even when
+its outer rectangle stays fixed, without declaring a separate paint key.
+
+Keep `measure` a repeatable size query and painting free of tree mutations.
+Set `cache_paint=True` only when every relevant private drawing-state change
+invalidates the control, including in-place changes to lists or other mutable
+state. These rules apply equally when adding a control and changing an existing
+one; authors do not declare `_paint_inputs`, `_prepare_paint`, `_paint_reuse`,
+or maintain a second list of drawing dependencies.
+
+`invalidate()` is authoritative: it requests fresh painting even when the
+control's observable properties have not changed. This makes a new private
+drawing field work through the same path as an existing one. Calling it without
+changing anything can repeat drawing work; clean controls can reuse their
+output until an invalidation or relevant environment change occurs. For state
+outside the control's subtree, invalidate each dependent control explicitly.
+
+After drawing runs, the native backend can recognize identical updates and
+avoid submitting them again. The standard bridge encodes an update once for
+comparison and transport; the native helper already handles unchanged commands
+within a scene.
+The SVG backend reuses immutable clipping and text fragments and retains a
+segment when its newly produced output equals the previous output. Both require
+no additional declarations from control authors. Drawing callbacks still run,
+so new private state participates automatically.
+
+Resource changes expire cached size answers by default. Layout uses fresh
+answers and reruns affected container arrangements, while retaining a leaf's
+existing placement when its geometry is unchanged. Painting still responds to
+the resource change.
+
+Drawing preparation belongs in the normal drawing call. For example, TextBox
+computes its text view once where it is consumed, rather than passing a cached
+preparation through a separate phase. Text batching groups requests from actual
+drawing work; it does not require a second description of a control's captions
+or determine whether the control is allowed to repaint. Test private and mutable
+state changes by comparing retained output with a fresh draw.
 
 ## Compose behavior and appearance independently
 
@@ -193,9 +252,11 @@ separate requirements.
    parts when actual implementations share a responsibility. Selection models,
    text adornments, and chart scales can evolve within their families as needed.
 3. Keep validation in the schema/update path, input in the ordinary hooks, and
-   drawing portable through `Painter`. Do not add a runtime branch per control.
+   drawing portable through `Painter`. Use `prop` dirty flags and `invalidate`
+   for state changes as described above. Do not add a runtime branch per control.
 4. Export the public type and add its metadata to `_catalog.py` with the default
-   `legacy_factory=False`. The inspiration JSON is not an import manifest.
+   `legacy_factory=False`. No paint-optimization registration is required. The
+   inspiration JSON is not an import manifest.
 5. Run `python tools/generate_factory_types.py` if alias schemas changed. Imports
    and signatures derive from registered schemas rather than another type list.
 6. Test the feature's semantics, composition isolation, atomic validation,

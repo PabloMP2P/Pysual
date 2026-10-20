@@ -260,20 +260,25 @@ class BackendSurfaceCacheTests(UIOwnerTestCase):
         self.assertGreater(cache.stats.hits, 0)
         self.assert_direct_matches(app, host, runtime)
 
-    def test_unchanged_invalidation_reuses_surface_without_drawing(self):
+    def test_unchanged_invalidation_repaints_and_clean_frames_reuse_surface(self):
         for backend in ("terminal", "svg"):
             with self.subTest(backend=backend):
                 app, host, cache, runtime = self.fixture(backend)
                 label = Label(parent=app, text="Stable caption", width=200, height=32)
                 self.warm(app, host, cache, runtime)
                 before = cache.stats
-                label.invalidate()
                 with patch.object(host, "text", wraps=host.text) as text:
                     self.frame(app, host, cache, runtime)
                     text.assert_not_called()
                 self.assertEqual(cache.stats.misses, before.misses)
                 self.assertEqual(cache.stats.rebuilds, before.rebuilds)
                 self.assertEqual(cache.stats.hits, before.hits + 1)
+                self.assert_direct_matches(app, host, runtime)
+                label.invalidate()
+                with patch.object(host, "text", wraps=host.text) as text:
+                    self.frame(app, host, cache, runtime)
+                    self.assertGreater(text.call_count, 0)
+                self.assertGreater(cache.stats.misses, before.misses)
                 self.assert_direct_matches(app, host, runtime)
                 label.text = "Updated caption"
                 self.frame(app, host, cache, runtime)
@@ -329,7 +334,7 @@ class BackendSurfaceCacheTests(UIOwnerTestCase):
                 self.assertNotEqual(self.snapshot(host), initial)
                 self.assert_direct_matches(app, host, runtime)
 
-    def test_editor_admission_uses_state_after_caret_reveal(self):
+    def test_editor_draw_reveals_caret_before_clean_surface_reuse(self):
         for backend in ("terminal", "svg"):
             with self.subTest(backend=backend):
                 app, host, cache, runtime = self.fixture(backend)
@@ -345,11 +350,15 @@ class BackendSurfaceCacheTests(UIOwnerTestCase):
                 self.frame(app, host, cache, runtime)
                 self.assertEqual(cache.stats.rebuilds, 1)
                 before = cache.stats.hits
-                editor.invalidate()
                 with patch.object(host, "text", wraps=host.text) as text:
                     self.frame(app, host, cache, runtime)
                     text.assert_not_called()
                 self.assertEqual(cache.stats.hits, before + 1)
+                self.assert_direct_matches(app, host, runtime)
+                editor.invalidate()
+                with patch.object(host, "text", wraps=host.text) as text:
+                    self.frame(app, host, cache, runtime)
+                    self.assertGreater(text.call_count, 0)
                 self.assert_direct_matches(app, host, runtime)
 
     def test_terminal_backdrop_mismatch_still_rebuilds_unchanged_label(self):

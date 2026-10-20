@@ -70,7 +70,6 @@ class _DayButton(Button):
 
     # Calendar cells are selectable items, not primary command surfaces. Reuse
     # the existing themed row states while keeping Button input/lifetime.
-    _paint_reuse = False
     style_fallbacks: ClassVar[tuple[str, ...]] = ("ListView",)
     style_excludes: ClassVar[tuple[str, ...]] = ("Button",)
     style_parts: ClassVar[tuple[str, ...]] = ("body", "row")
@@ -285,7 +284,6 @@ class CalendarEditor(EditorContent[str]):
 class DatePicker(Control):
     """Single-date picker using canonical Gregorian YYYY-MM-DD strings."""
 
-    _paint_reuse = False
     cache_paint: bool = prop(default=True)
     value: str = prop(default="2000-01-01", changed="changed")
     minimum: str = prop(default=_FIRST)

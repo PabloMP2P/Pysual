@@ -54,7 +54,6 @@ class ControlUpdateTests(UIOwnerTestCase):
         root._runtime = SimpleNamespace(router=router, _retained_paint=retained)
         self.addCleanup(delattr, root, "_runtime")
         root._wake = Mock()
-        before = [c._paint_local_revision for c in (root, parent, *children)]
         revisions = [c._paint_revision for c in (root, parent, *children)]
         with patch.object(retained, "invalidate", wraps=retained.invalidate) as invalidated:
             parent.update_children(
@@ -62,11 +61,8 @@ class ControlUpdateTests(UIOwnerTestCase):
             )
         self.assertEqual(router.invalidate.call_count, len(children))
         self.assertEqual(invalidated.call_count, len(children))
-        self.assertEqual(retained._dirty, {root, *children})
-        self.assertEqual(
-            [c._paint_local_revision - old for c, old in zip((root, parent, *children), before)],
-            [0, 0, 1, 1, 1],
-        )
+        self.assertEqual(retained._dirty, {root, parent, *children})
+        self.assertEqual([call.args[0] for call in invalidated.call_args_list], children)
         self.assertEqual(
             [c._paint_revision - old for c, old in zip((root, parent, *children), revisions)],
             [3, 3, 1, 1, 1],
@@ -86,10 +82,10 @@ class ControlUpdateTests(UIOwnerTestCase):
         root = self.keep(Container())
         child = NestedButton(parent=root, text="Before")
         notifications.clear()
-        local, subtree = child._paint_local_revision, root._paint_revision
+        local, subtree = child._paint_revision, root._paint_revision
         child.update(text="After")
         self.assertEqual(notifications, ["foreground", "text"])
-        self.assertEqual(child._paint_local_revision, local + 2)
+        self.assertEqual(child._paint_revision, local + 2)
         self.assertEqual(root._paint_revision, subtree + 2)
         self.assertEqual((child.text, child.foreground), ("After", "#123456"))
 

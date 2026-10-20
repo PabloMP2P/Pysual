@@ -514,16 +514,16 @@ not discovered by tracking property reads. `invalidate()` without arguments
 requests painting and does not invalidate a cached preferred size.
 
 Hosts may expose a separate `metrics_revision` for fonts and other preferred-size
-metrics. Image-only changes still invalidate painting. Unmodified built-in
-controls can reuse preferred sizes across those changes; custom controls and
-replaced built-in implementations retain resource-based invalidation by default.
-Hosts without `metrics_revision` retain the original combined behavior.
+metrics. Resource changes invalidate measurement and painting by default for
+both built-in and custom controls. Catalog registration and inheritance do not
+infer resource independence from a control's implementation. Hosts without
+`metrics_revision` retain the original combined behavior.
 
 Set `measure_resources=False` only when a custom control's measurement and
 arrangement depend on metrics and declared model inputs, not image resources.
 For external sizing changes, continue to call `invalidate(Dirty.MEASURE)`.
 `measure_resources=True` explicitly requires resource invalidation; the default
-`None` selects the conservative automatic policy. Descendant resource
+`None` keeps the conservative resource-based policy. Descendant resource
 dependencies still invalidate cached ancestor sizes, even if the ancestor opts
 into metric-only sizing. This option does not disable painting invalidation.
 
@@ -597,6 +597,14 @@ given as `(x1, y1, x2, y2)`. They share a color and width and never connect to
 the next stroke. Hosts may batch these operations; hosts without the optional
 `segments` method receive ordinary `line` calls in the original order.
 
+`painter.caption(text, rect=None, align="left", ellipsis=True)` draws text
+vertically centered in a local rectangle, defaulting to the control's full
+bounds. Use `align="center"` to center it horizontally and `icon="name"` for
+a leading icon. Single-line text is fitted with an ellipsis; use
+`ellipsis=False` for a multiline block. Color, size, and font arguments work
+like `painter.text`. The backend can batch the resulting drawing requests;
+controls do not declare a separate list of text to measure.
+
 ```python
 from pysual import Control, Dirty, Rect, prop
 
@@ -625,8 +633,20 @@ a value of the wrong kind. The complete
 slider.
 
 For private drawing state, set `cache_paint=True` only when all changes call
-`invalidate()`. Uncached custom painters run on requested updates. Never mutate
-the control tree during painting or layout.
+`invalidate()`, including in-place changes to mutable values. Invalidation
+requests fresh painting even when observable properties are unchanged; repeated
+invalidations without a state change can repeat drawing work. Clean controls
+can retain valid cached output. Uncached painters run on every requested
+update, for built-in and custom controls alike. Never mutate the control tree
+during painting or layout. An invalidation raised during drawing remains
+pending for the next frame; painting is not an atomic state transaction.
+
+The same authoring contract applies when contributing a built-in control.
+Catalog registration adds discovery and authoring metadata; it does not require
+paint-cache dependency declarations or preparation hooks. Changing an existing
+built-in uses the same property and invalidation rules. See
+[the contributor architecture guide](control-architecture.md#from-a-control-change-to-a-frame)
+for the update path.
 
 `Control.paint_focus(painter)` draws the keyboard outline after the cached body.
 Composite controls may override it when their owner provides the visible focus

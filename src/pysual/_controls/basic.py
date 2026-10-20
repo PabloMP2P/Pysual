@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-from .._paint_state import TextMeasurement
 from ..behaviors import PressBehavior
 from ..commands import normalize_shortcut
 from ..controls import Control
 from ..errors import LifecycleError
+from ..geometry import Rect
 from ..events import ClickEvent, Event
 from ..icons import icon_names
 from ..painting import resolve_style, Painter
@@ -27,29 +27,13 @@ class Label(Control):
         style = resolve_style(self)
         return host.measure(self.text, style.font_size, style.font_family == "mono")
 
-    def _paint_measurements(self) -> tuple[TextMeasurement, ...]:
-        if not self.text or self._rect.width <= 0:
-            return ()
-        style = resolve_style(self)
-        return ((self.text, style.font_size, style.font_family == "mono"),)
-
     def paint(self, painter: Painter, /) -> None:
         super().paint(painter)
         style = painter.style()
-        size = style.font_size
-        text = self.text
-        height = size * 1.2
-        if "\n" in text:
-            height = painter.measure(text, size=size, font_family=style.font_family)[1]
-        else:
-            text = painter.elide(text, painter.width, size=size, font_family=style.font_family)
-        painter.text(
-            text,
-            0,
-            max(0, (painter.height - height) / 2),
-            color=style.foreground,
-            size=size,
-        )
+        multiline = "\n" in self.text
+        painter.caption(self.text, color=style.foreground, size=style.font_size,
+                        font_family=style.font_family, ellipsis=not multiline,
+                        line_height=None if multiline else style.font_size * 1.2)
 
 
 class Button(Label):
@@ -97,41 +81,12 @@ class Button(Label):
             h + padding * 2, self.effective_theme.tokens.control_height
         )
 
-    def _paint_measurements(self) -> tuple[TextMeasurement, ...]:
-        style = resolve_style(self)
-        width = max(0, self._rect.width - style.padding * 2)
-        icon_size = min(20, width, self._rect.height) if self.icon else 0
-        icon_width = icon_size + (8 if self.text else 0) if self.icon else 0
-        text = self.text if width > icon_width else ""
-        return ((text, style.font_size, style.font_family == "mono"),)
-
     def paint(self, painter: Painter, /) -> None:
         s = painter.body()
         content = painter.content_rect()
-        icon_size = min(20, content.width, painter.height) if self.icon else 0
-        icon_width = icon_size + (8 if self.text else 0) if self.icon else 0
-        text = painter.elide(
-            self.text, max(0, content.width - icon_width), size=s.font_size
-        )
-        w, h = painter.measure(text, size=s.font_size)
-        if not text:
-            icon_width = icon_size
-        left = max(content.x, (painter.width - w - icon_width) / 2)
-        if self.icon and icon_size > 0:
-            painter.icon(
-                self.icon,
-                left,
-                max(0, (painter.height - icon_size) / 2),
-                size=icon_size,
-                color=s.foreground,
-            )
-        painter.text(
-            text,
-            left + icon_width,
-            max(0, (painter.height - h) / 2),
-            color=s.foreground,
-            size=s.font_size,
-        )
+        painter.caption(self.text, Rect(content.x, 0, content.width, painter.height),
+                        align="center", icon=self.icon, color=s.foreground,
+                        size=s.font_size, font_family=s.font_family)
 
     def _check_activation(self):
         self._check_live()

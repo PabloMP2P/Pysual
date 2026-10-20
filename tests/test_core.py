@@ -1036,13 +1036,21 @@ class ControlCopyingTests(UIOwnerTestCase):
         self.frame()
         self.assertEqual(original.text, "Before")
         self.assert_direct_matches()
-        self.assertEqual(self.host.updates, [self.retained._records[clone].identity])
+        self.assertEqual(set(self.host.updates), {
+            self.retained._records[clone].identity,
+            self.retained._records[self.app].identity,
+        })
+        self.assertNotIn(self.retained._records[original].identity, self.host.updates)
 
         original.text = "Original changed"
         self.frame()
         self.assertEqual(clone.text, "Clone changed")
         self.assert_direct_matches()
-        self.assertEqual(self.host.updates, [self.retained._records[original].identity])
+        self.assertEqual(set(self.host.updates), {
+            self.retained._records[original].identity,
+            self.retained._records[self.app].identity,
+        })
+        self.assertNotIn(self.retained._records[clone].identity, self.host.updates)
 
     def test_deepcopy_of_detached_control_repaints_independently(self):
         self.assert_independent_copy_repaints(copy.deepcopy)

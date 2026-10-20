@@ -155,9 +155,8 @@ class RenderCache:
     ) -> PaintKey | None:
         """Cheap inputs to effect bounds, before constructing a Painter.
 
-        Known body inputs let unchanged built-ins share retained-scene reuse.
-        Custom paint_bounds hooks follow the same invalidate() contract as
-        custom paint hooks. Include both layout clips: a parent's effect clip
+        All body and paint_bounds hooks follow the same invalidate() contract.
+        Propagated revisions also cover a painter that reads its descendants. Include both layout clips: a parent's effect clip
         can change while the child's body remains entirely inside it.
         """
         if (
@@ -166,9 +165,7 @@ class RenderCache:
             or "render_surfaces" not in self.host.capabilities
         ):
             return None
-        entry = self.entries.get(ref(control))
-        return paint_inputs(control, self.host, focus, theme,
-                            previous=None if entry is None else entry[3])
+        return paint_inputs(control, self.host, focus, theme)
 
     def reuse(self, control: Control, key: PaintKey | None) -> bool:
         """Blit an unchanged body without preparing its styles or effects."""
@@ -217,8 +214,8 @@ class RenderCache:
         clip = control._clip if clip is None else clip
         if prepared_key is None:
             # Public callers may supply an arbitrary draw callback, even for a
-            # built-in control. Only the tree's prepared body contract permits
-            # value-based reuse; this callback retains revision invalidation.
+            # built-in control. It follows the same revision invalidation as
+            # the tree, with the caller's explicit clip.
             scale = self.host.render_scale
             key = PaintInputs(
                 control._paint_revision, control._rect, clip, control._clip,

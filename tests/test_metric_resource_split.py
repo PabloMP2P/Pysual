@@ -1,4 +1,4 @@
-"""Metric-only reuse must preserve conservative custom sizing and painting."""
+"""Explicit metric-only reuse preserves conservative default sizing and painting."""
 import copy
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,7 +9,7 @@ from test_library import RecordingHost
 from test_retained_paint import PatchRecordingHost
 
 from pysual import App, Container, Control, Label, Rect
-from pysual._paint_state import measurement_uses_resources, painting_scope
+from pysual._paint_state import measurement_uses_resources
 from pysual.backends._web_pyodide import BundledSVGHost
 from pysual.backends._web_svg import SVGRenderer
 from pysual.backends.native import NativeHost
@@ -59,14 +59,15 @@ class MetricResourceSplitTests(UIOwnerTestCase):
         self.root._runtime = None
         self.root.destroy()
 
-    def test_image_changes_keep_builtin_sizes_but_metrics_changes_remeasure(self):
+    def test_builtin_default_remeasures_after_resource_and_metric_changes(self):
         child = Label(parent=self.root, text="abc")
         arrange(self.root, self.host)
         self.assertEqual(child.bounds.width, 30)
         before = self.host.measurements
         self.host.resource_revision += 1
         arrange(self.root, self.host)
-        self.assertEqual(self.host.measurements, before)
+        self.assertGreater(self.host.measurements, before)
+        before = self.host.measurements
         self.host.unit = 15
         self.host.metrics_revision += 1
         self.host.resource_revision += 1
@@ -140,12 +141,11 @@ class MetricResourceSplitTests(UIOwnerTestCase):
         self.host.resource_revision += 1
         self.assertEqual(_size(child, self.host)[0], 90)
 
-    def test_helper_replacement_also_disables_automatic_builtin_trust(self):
+    def test_only_explicit_resource_opt_out_changes_the_policy(self):
         child = Label(parent=self.root, text="abc")
-        with painting_scope():
-            self.assertFalse(measurement_uses_resources(child))
-            with patch.object(Label, "_control_height", lambda *args: 99):
-                self.assertTrue(measurement_uses_resources(child))
+        self.assertTrue(measurement_uses_resources(child))
+        with patch.object(Label, "_control_height", lambda *args: 99):
+            self.assertTrue(measurement_uses_resources(child))
         child.measure_resources = False
         self.assertFalse(measurement_uses_resources(child))
 

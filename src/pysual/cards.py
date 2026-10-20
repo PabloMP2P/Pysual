@@ -71,7 +71,6 @@ class ChoiceCard(Control):
     explanation into up to three lines, suitable for a grid of option tiles.
     """
 
-    _paint_reuse = False
     cache_paint: bool = prop(default=True)
     focusable: bool = prop(default=True, affects=Dirty.HIT_TEST)
     text: str = prop(default="", affects=Dirty.MEASURE | Dirty.PAINT)
@@ -244,7 +243,6 @@ class ChoiceCard(Control):
 class _DisclosureHeader(Control):
     """A normal focus/gesture target; the containing section owns its state."""
 
-    _paint_reuse = False
     focusable: bool = prop(default=True, affects=Dirty.HIT_TEST)
 
     def _initialize(self) -> None:

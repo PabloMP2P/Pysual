@@ -11,7 +11,6 @@ from .painting import Painter
 
 
 class _Hint(Label):
-    _paint_reuse = False
     _overlay: ClassVar[bool] = True
 
     def _layout_size(self, width: float, height: float) -> tuple[float, float]:

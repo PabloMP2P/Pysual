@@ -41,7 +41,6 @@ class Badge(Control):
     Style the selected tone part to customize its surface and text together.
     """
 
-    _paint_reuse = False
     cache_paint: bool = prop(default=True)
     text: str = prop(default="", affects=Dirty.MEASURE | Dirty.PAINT)
     tone: Literal["neutral", "info", "success", "warning", "danger"] = prop(
@@ -98,7 +97,6 @@ class AlertBanner(Control):
     focused part on release, and a matched Escape press/release dismisses.
     """
 
-    _paint_reuse = False
     cache_paint: bool = prop(default=True)
     text: str = prop(default="", affects=Dirty.MEASURE | Dirty.PAINT)
     tone: Literal["info", "success", "warning", "danger"] = prop(
@@ -310,7 +308,6 @@ class Meter(Control):
     ordered and inside the range. Value labels display raw units, not progress.
     """
 
-    _paint_reuse = False
     cache_paint: bool = prop(default=True)
     value: float = prop(default=0.0, changed="changed", affects=Dirty.MEASURE | Dirty.PAINT)
     minimum: float = prop(default=0.0)

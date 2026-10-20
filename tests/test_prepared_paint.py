@@ -1,12 +1,10 @@
-"""Preparation belongs to one paint operation and survives no input changes."""
+"""Text drawing prepares locally and observes current state at its point of use."""
 
 from collections import Counter
 from contextlib import contextmanager
 from contextvars import copy_context
-from dataclasses import replace
 import gc
 import sys
-from unittest.mock import patch
 from weakref import ref
 
 from _ui_testcase import UIOwnerTestCase
@@ -14,19 +12,16 @@ from test_render_cache import svg_drawing
 from test_retained_paint import PatchRecordingHost
 from test_web_svg import RecordingRenderer
 
-from pysual import App, DataGrid, ListView, TextBox, TreeView
-from pysual import _paint_state
-from pysual._paint_state import _current_checks, paint_inputs, painting_scope
+from pysual import App, TextBox
 from pysual.layout import arrange
-from pysual.painting import Painter, RetainedPaintTree, paint_tree
+from pysual.painting import RetainedPaintTree, paint_tree
 from pysual.render_cache import RenderCache
 from pysual.runtime import Runtime
 
 
 @contextmanager
 def preparation_calls():
-    # Observing calls must not replace a method: replacement correctly opts a
-    # builtin out of the trusted preparation contract being tested here.
+    # Observe without changing method dispatch or implementation provenance.
     code = TextBox._prepare_text.__code__
     calls = Counter()
     previous = sys.getprofile()
@@ -51,26 +46,6 @@ def scrollbar_calls():
     def observe(frame, event, argument):
         if event == "call" and frame.f_code is code:
             calls[frame.f_locals["self"]] += 1
-
-    sys.setprofile(observe)
-    try:
-        yield calls
-    finally:
-        sys.setprofile(previous)
-
-
-@contextmanager
-def input_calls(kind):
-    codes = {
-        kind._prepare_paint.__code__: "prepare",
-        _paint_state._snapshot.__code__: "snapshot",
-    }
-    calls = Counter()
-    previous = sys.getprofile()
-
-    def observe(frame, event, argument):
-        if event == "call" and frame.f_code in codes:
-            calls[codes[frame.f_code]] += 1
 
     sys.setprofile(observe)
     try:
@@ -151,7 +126,7 @@ class PreparedPaintTests(UIOwnerTestCase):
                 self.assertEqual(calls[editor], 1)
                 assert_direct()
 
-    def test_single_line_paint_skips_scrollbar_preparation_audit(self):
+    def test_single_line_drawing_uses_text_changed_by_body_callback(self):
         for mode in ("retained", "surface", "direct"):
             with self.subTest(mode=mode):
                 app, editor, host, runtime, frame, assert_direct = self.fixture(mode)
@@ -166,12 +141,10 @@ class PreparedPaintTests(UIOwnerTestCase):
                     return rectangle(bounds, *args, **kwargs)
 
                 host.rect = mutate
-                with patch("pysual.text.peek_prepared_paint",
-                           side_effect=AssertionError("Single-line scrollbars need no audit")):
-                    frame()
-                    self.assertTrue(changed)
-                    self.assertEqual(editor._scroll_axes, (False, False))
-                    assert_direct()
+                frame()
+                self.assertTrue(changed)
+                self.assertEqual(editor._scroll_axes, (False, False))
+                assert_direct()
 
     def test_body_callback_scrollbar_mutation_rejects_preparation(self):
         for mode in ("retained", "surface"):
@@ -194,7 +167,7 @@ class PreparedPaintTests(UIOwnerTestCase):
                 with scrollbar_calls() as calls:
                     frame()
                 self.assertTrue(changed)
-                self.assertEqual(calls[editor], 2)
+                self.assertEqual(calls[editor], 1)
                 self.assertEqual(editor._scroll_axes, (False, True))
                 assert_direct()
 
@@ -224,84 +197,30 @@ class PreparedPaintTests(UIOwnerTestCase):
                 with preparation_calls() as calls:
                     frame()
                 self.assertTrue(changed)
-                self.assertEqual(calls[editor], 2)
+                self.assertEqual(calls[editor], 1)
                 assert_direct()
 
-    def test_normalization_only_hooks_take_no_extra_preparation_snapshots(self):
-        for kind in (ListView, DataGrid, TreeView):
-            with self.subTest(control=kind.__name__):
-                control = kind(width=180, height=100)
-                self.addCleanup(control.destroy)
-                host = PatchRecordingHost()
-                arrange(control, host)
-                snapshots = []
-                previous = sys.getprofile()
 
-                def observe(frame, event, argument):
-                    if event == "call" and frame.f_code is _paint_state._snapshot.__code__:
-                        snapshots.append(frame.f_locals["control"])
-
-                with painting_scope():
-                    sys.setprofile(observe)
-                    try:
-                        paint_inputs(control, host, None, control._fast_theme())
-                    finally:
-                        sys.setprofile(previous)
-                    self.assertEqual(snapshots, [control])
-                    self.assertFalse(_current_checks().prepared)
-
-    def test_completed_unchanged_inputs_skip_preparation_with_one_snapshot(self):
-        for kind in (TextBox, ListView, DataGrid, TreeView):
-            with self.subTest(control=kind.__name__):
-                control = kind(width=180, height=100)
-                self.addCleanup(control.destroy)
-                host = PatchRecordingHost()
-                arrange(control, host)
-                with painting_scope():
-                    previous = paint_inputs(control, host, None, None)
-                control.invalidate()
-                with painting_scope(), input_calls(kind) as calls:
-                    current = paint_inputs(control, host, None, None, previous=previous)
-                    self.assertIs(current, previous)
-                    self.assertFalse(_current_checks().prepared)
-                self.assertEqual(calls, {"snapshot": 1})
-
-    def test_changed_normalizers_prepare_without_an_extra_preflight_snapshot(self):
-        for kind in (ListView, DataGrid, TreeView):
-            for changed in ("model", "private"):
-                with self.subTest(control=kind.__name__, changed=changed):
-                    control = kind(width=180, height=100)
-                    self.addCleanup(control.destroy)
-                    host = PatchRecordingHost()
-                    arrange(control, host)
-                    with painting_scope():
-                        previous = paint_inputs(control, host, None, None)
-                    if changed == "model":
-                        control.foreground = "#123456"
-                    else:
-                        control._scroll = 1
-                    with painting_scope(), input_calls(kind) as calls:
-                        paint_inputs(control, host, None, None, previous=previous)
-                    self.assertEqual(calls, {"prepare": 1, "snapshot": 1})
-
-    def test_completed_editor_reuse_does_not_prepare_undrawn_body(self):
+    def test_clean_editor_reuses_body_and_invalidation_prepares_again(self):
         for mode in ("retained", "surface"):
             with self.subTest(mode=mode):
                 app, editor, host, runtime, frame, assert_direct = self.fixture(mode)
                 for _ in range(3):
                     frame()
-                editor.invalidate()
                 with preparation_calls() as calls:
                     frame()
                 self.assertEqual(calls[editor], 0)
+                editor.invalidate()
+                with preparation_calls() as calls:
+                    frame()
+                self.assertEqual(calls[editor], 1)
                 assert_direct()
 
-    def test_changed_environment_focus_and_private_inputs_require_preparation(self):
-        for changed in ("metrics", "scale", "resources", "focus", "caret", "reuse"):
+    def test_changed_environment_focus_and_private_inputs_repaint(self):
+        for changed in ("metrics", "scale", "resources", "focus", "caret"):
             with self.subTest(changed=changed):
                 app, editor, host, runtime, frame, assert_direct = self.fixture()
-                with painting_scope():
-                    previous = paint_inputs(editor, host, None, None)
+                frame()
                 if changed == "metrics":
                     host.text_row_height = 24
                 elif changed == "scale":
@@ -309,16 +228,16 @@ class PreparedPaintTests(UIOwnerTestCase):
                 elif changed == "resources":
                     host.resource_revision += 1
                 elif changed == "focus":
-                    runtime.router.focus = editor
+                    runtime.router.set_focus(editor)
                 elif changed == "caret":
                     editor._caret = editor._anchor = 0
-                with painting_scope(), input_calls(TextBox) as calls:
-                    current = paint_inputs(editor, host, None, None,
-                                           previous=previous, reuse=changed != "reuse")
-                self.assertEqual(calls["prepare"], 1)
-                self.assertIsNot(current, previous)
+                    editor.invalidate()
+                with preparation_calls() as calls:
+                    frame()
+                self.assertEqual(calls[editor], 1)
+                assert_direct()
 
-    def test_preflight_rechecks_snapshot_callback_mutations_before_reuse(self):
+    def test_snapshot_callbacks_are_observed_before_text_drawing(self):
         class CallbackHost(PatchRecordingHost):
             callback = None
 
@@ -332,30 +251,21 @@ class PreparedPaintTests(UIOwnerTestCase):
         for changed in ("text", "caret", "helper"):
             with self.subTest(changed=changed):
                 app, editor, host, runtime, frame, assert_direct = self.fixture(host_type=CallbackHost)
-                with painting_scope():
-                    previous = paint_inputs(editor, host, None, None)
+                frame()
 
                 def mutate():
                     if changed == "text":
-                        editor.text = "Changed during preflight"
+                        editor.text = "Changed during snapshot"
                     elif changed == "caret":
                         editor._caret = editor._anchor = 0
                     else:
-                        def obsolete_inputs():
-                            raise AssertionError("A replaced input projection must not be called")
-                        object.__setattr__(editor, "_paint_inputs", obsolete_inputs)
+                        object.__setattr__(editor, "_text_left", lambda: 40)
 
                 host.callback = mutate
-                with painting_scope(), input_calls(TextBox) as calls:
-                    current = paint_inputs(editor, host, None, None, previous=previous)
+                editor.invalidate()
+                frame()
                 self.assertIsNone(host.callback)
-                self.assertIsNot(current, previous)
-                if changed == "helper":
-                    self.assertEqual(calls["prepare"], 0)
-                    self.assertIsInstance(current.state, int)
-                else:
-                    self.assertEqual(calls["prepare"], 1)
-                    self.assertEqual(current.state, (editor._visual_epoch, editor._paint_inputs()))
+                assert_direct()
 
     def test_alternate_direct_host_restores_measurement_owner_before_reuse(self):
         for mode in ("retained", "surface"):
@@ -367,9 +277,9 @@ class PreparedPaintTests(UIOwnerTestCase):
                 paint_tree(app, other_host)
                 self.assertIs(editor._measure_host, other_host)
                 editor.invalidate()
-                with input_calls(TextBox) as calls:
+                with preparation_calls() as calls:
                     frame()
-                self.assertEqual(calls["prepare"], 1)
+                self.assertEqual(calls[editor], 1)
                 self.assertIs(editor._measure_host, host)
                 # Detached interactions use the last painting host for width
                 # measurement, even if an alternate host had equal metrics.
@@ -388,7 +298,7 @@ class PreparedPaintTests(UIOwnerTestCase):
                 app._runtime = runtime
                 assert_direct()
 
-    def test_measurement_mutation_rejects_result_computed_from_earlier_text(self):
+    def test_measurement_mutation_cannot_hide_the_next_requested_frame(self):
         for mode in ("retained", "surface"):
             with self.subTest(mode=mode):
                 app, editor, host, runtime, frame, assert_direct = self.fixture(mode)
@@ -406,7 +316,12 @@ class PreparedPaintTests(UIOwnerTestCase):
                 with preparation_calls() as calls:
                     frame()
                 self.assertTrue(changed)
-                self.assertEqual(calls[editor], 2)
+                self.assertEqual(calls[editor], 1)
+                # The callback happened during drawing. Its invalidation must
+                # survive the frame that began before this text was committed.
+                with preparation_calls() as calls:
+                    frame()
+                self.assertEqual(calls[editor], 1)
                 assert_direct()
 
     def test_body_callback_mutation_rejects_prepared_text(self):
@@ -427,7 +342,7 @@ class PreparedPaintTests(UIOwnerTestCase):
                 with preparation_calls() as calls:
                     frame()
                 self.assertTrue(changed)
-                self.assertEqual(calls[editor], 2)
+                self.assertEqual(calls[editor], 1)
                 assert_direct()
 
     def test_actual_focus_change_rejects_preparation_when_focus_argument_is_unchanged(self):
@@ -451,7 +366,7 @@ class PreparedPaintTests(UIOwnerTestCase):
         with preparation_calls() as calls:
             paint_tree(app, host, retained=runtime._retained_paint)
         self.assertTrue(changed)
-        self.assertEqual(calls[editor], 2)
+        self.assertEqual(calls[editor], 1)
         assert_direct()
 
     def test_instance_hook_replaced_after_preparation_runs_at_draw_time(self):
@@ -532,22 +447,8 @@ class PreparedPaintTests(UIOwnerTestCase):
         self.assertEqual(calls[editor], 1)
         assert_direct()
 
-    def test_actual_style_and_viewport_must_match_prepared_view(self):
-        app, editor, host, runtime, frame, assert_direct = self.fixture()
-        for changed in ("style", "viewport"):
-            with self.subTest(changed=changed), painting_scope(), preparation_calls() as calls:
-                paint_inputs(editor, host, None, app.effective_theme)
-                painter = Painter(host, editor.bounds, app.effective_theme, editor)
-                style = painter.style()
-                viewport = editor._text_viewport()
-                if changed == "style":
-                    style = replace(style, font_size=style.font_size + 2)
-                else:
-                    viewport = viewport.inset(2)
-                editor._paint_text(painter, style, viewport)
-                self.assertEqual(calls[editor], 2)
 
-    def test_private_input_mutation_during_preparation_is_not_mistaken_for_normalization(self):
+    def test_private_mutation_in_measurement_repaints_on_the_next_frame(self):
         app, editor, host, runtime, frame, assert_direct = self.fixture()
         runtime.router.focus = editor
         editor._caret = editor._anchor = len(editor.text)
@@ -560,75 +461,75 @@ class PreparedPaintTests(UIOwnerTestCase):
             if not changed and text == "M":
                 changed = True
                 editor._caret = editor._anchor = 0
+                editor.invalidate()
             return measure(text, size, mono)
 
         host.measure = mutate
         with preparation_calls() as calls:
             frame()
         self.assertTrue(changed)
-        self.assertEqual(calls[editor], 2)
+        self.assertEqual(calls[editor], 1)
+        with preparation_calls() as calls:
+            frame()
+        self.assertEqual(calls[editor], 1)
         assert_direct()
 
-    def test_snapshot_callback_rechecks_hooks_and_private_inputs_before_consuming(self):
-        class CallbackHost(PatchRecordingHost):
-            callback = None
-
-            @property
-            def resource_revision(self):
-                callback, self.callback = self.callback, None
-                if callback is not None:
-                    callback()
-                return 0
-
+    def test_clip_callbacks_change_helpers_and_caret_before_local_preparation(self):
         for changed in ("helper", "caret"):
             with self.subTest(changed=changed):
-                app, editor, host, runtime, frame, assert_direct = self.fixture(host_type=CallbackHost)
+                app, editor, host, runtime, frame, assert_direct = self.fixture()
                 runtime.router.focus = editor
                 editor._caret = editor._anchor = len(editor.text)
                 editor._reveal_after_paint = False
-                rectangle = host.rect
-                armed = False
-
-                def mutate():
-                    if changed == "helper":
-                        object.__setattr__(editor, "_text_left", lambda: 30)
-                    else:
-                        editor._caret = editor._anchor = 0
+                rectangle, clip = host.rect, host.clip
+                armed = mutated = False
 
                 def arm(bounds, *args, **kwargs):
                     nonlocal armed
-                    if not armed and bounds == editor.bounds:
+                    if bounds == editor.bounds:
                         armed = True
-                        host.callback = mutate
                     return rectangle(bounds, *args, **kwargs)
 
-                host.rect = arm
+                def mutate(bounds):
+                    nonlocal mutated
+                    if armed and not mutated:
+                        mutated = True
+                        if changed == "helper":
+                            object.__setattr__(editor, "_text_left", lambda: 30)
+                        else:
+                            editor._caret = editor._anchor = 0
+                    return clip(bounds)
+
+                host.rect, host.clip = arm, mutate
                 with preparation_calls() as calls:
                     frame()
-                self.assertTrue(armed)
-                self.assertIsNone(host.callback)
-                self.assertEqual(calls[editor], 2)
+                self.assertTrue(mutated)
+                self.assertEqual(calls[editor], 1)
                 assert_direct()
 
-    def test_copied_context_cannot_retain_or_reopen_completed_preparation(self):
+    def test_copied_context_does_not_retain_control_after_drawing(self):
         for failed in (False, True):
             with self.subTest(failed=failed):
                 editor = TextBox(text="Detached source", width=180, height=48)
                 host = PatchRecordingHost()
                 arrange(editor, host)
                 copied = None
-                try:
-                    with painting_scope():
-                        paint_inputs(editor, host, None, editor._fast_theme())
-                        self.assertIn(editor, _current_checks().prepared)
-                        copied = copy_context()
-                        if failed:
-                            raise RuntimeError("failed pass")
-                except RuntimeError:
-                    self.assertTrue(failed)
-                self.assertIsNone(copied.run(_current_checks))
-                copied.run(paint_inputs, editor, host, None, editor._fast_theme())
-                self.assertIsNone(copied.run(_current_checks))
+                rectangle = host.rect
+
+                def capture(*args, **kwargs):
+                    nonlocal copied
+                    copied = copy_context()
+                    if failed:
+                        raise RuntimeError("failed pass")
+                    return rectangle(*args, **kwargs)
+
+                host.rect = capture
+                if failed:
+                    with self.assertRaisesRegex(RuntimeError, "failed pass"):
+                        paint_tree(editor, host)
+                else:
+                    paint_tree(editor, host)
+                self.assertIsNotNone(copied)
                 reference = ref(editor)
                 editor.destroy()
                 del editor

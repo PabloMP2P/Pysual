@@ -44,9 +44,8 @@ from .events import (
     validate_callback,
 )
 from .geometry import Rect
-from .host import Host, Input
+from .host import Host, Input, text_row_height
 from .painting import Painter, resolve_style
-from ._paint_state import implementation_changed
 from .theme import Theme, dark
 from .schema import (
     Dirty,
@@ -153,14 +152,6 @@ def _construct_control(
 class _ControlMeta(type):
     """Explicit parenting happens only after the complete Python constructor."""
 
-    def __setattr__(cls, name: str, value: object) -> None:
-        super().__setattr__(name, value)
-        implementation_changed()
-
-    def __delattr__(cls, name: str) -> None:
-        super().__delattr__(name)
-        implementation_changed()
-
     def __new__(
         cls,
         name: str,
@@ -226,9 +217,6 @@ _GRID_PLACEMENT_INPUTS = frozenset({
 
 
 class Control(SchemaObject, metaclass=_ControlMeta):
-    # Exact types in the built-in catalog inherit reuse unless their family
-    # needs revision invalidation. Custom subclasses remain outside the catalog.
-    _paint_reuse: ClassVar[bool] = True
     _transient_fields: ClassVar[dict[str, Callable[[], object]]] = {
         "_measure_cache": list,
         "_measure_cache_host": lambda: None,
@@ -307,7 +295,7 @@ class Control(SchemaObject, metaclass=_ControlMeta):
     )
     measure_resources: bool | None = prop(
         default=None, affects=Dirty.MEASURE,
-        doc="None preserves custom resource dependencies; False opts into metric-only sizing",
+        doc="None preserves resource dependencies; False opts into metric-only sizing",
     )
     focusable: bool = prop(default=False, affects=Dirty.HIT_TEST)
     tab_index: int = prop(default=0, affects=Dirty.HIT_TEST)
@@ -362,7 +350,6 @@ class Control(SchemaObject, metaclass=_ControlMeta):
             float, float, float, float, float, float, float | None, float | None
         ] | None = None
         self._paint_revision = 0
-        self._paint_local_revision = 0
         self._measure_revision = 0
         self._measure_local_revision = 0
         self._measure_cache: list[tuple[tuple[object, ...], tuple[float, float]]] = []
@@ -489,7 +476,7 @@ class Control(SchemaObject, metaclass=_ControlMeta):
         )
 
     def invalidate(self, affects: Dirty = Dirty.PAINT) -> None:
-        """Request a frame after changing private drawing state in a custom control."""
+        """Request a frame after changing private drawing state."""
         self._check_live()
         self._invalidate_model(affects)
 
@@ -518,8 +505,6 @@ class Control(SchemaObject, metaclass=_ControlMeta):
                 self._layout_box_revision += 1
             if layout_box and self._parent is not None:
                 self._parent._layout_box_revision += 1
-        if visual:
-            self._paint_local_revision += 1
 
         # One traversal records every dependency before any notification can
         # observe the commit. Batch boundaries coalesce scheduling, not cache
@@ -698,10 +683,16 @@ class Control(SchemaObject, metaclass=_ControlMeta):
         self, host: Host, *, width: float | None = None, height: float | None = None
     ) -> tuple[float, float]:
         """Measure with parent space hints; ordinary custom measure hooks still work."""
-        from .layout import _measurement_rows
-
-        with _measurement_rows(self, host):
+        # Layout already supplies this row context. Avoid allocating another
+        # context manager for every leaf, while preserving standalone calls and
+        # restoring the context after nested queries or failed custom hooks.
+        root = self._root()
+        previous = root._measurement_row_height
+        root._measurement_row_height = text_row_height(host, 0.0)
+        try:
             return self.measure(host)
+        finally:
+            root._measurement_row_height = previous
 
     def _layout_size(self, width: float, height: float) -> tuple[float, float]:
         """Constrain arranged size without changing the requested dimensions."""
@@ -1023,7 +1014,6 @@ def _blueprint_order(definitions: Mapping[str, Blueprint[Any]]) -> list[str]:
 class Container(Control, FactoryTypes):
     """Also the handler scope for composite controls; private state stays Python."""
 
-    _paint_reuse = False
     _transient_fields: ClassVar[dict[str, Callable[[], object]]] = {
         "_layout_plan": lambda: None,
         "_layout_children_dirty": set,

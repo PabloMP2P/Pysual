@@ -274,8 +274,8 @@ class RetainedMotionTests(UIOwnerTestCase):
         theme = Theme().styled(Button, Style(fill="#ff0000")).styled(
             Button, Style(fill="#00ff00"), state="hover"
         )
-        self.app = App(width=400, height=220, fps_limit=None, theme=theme)
-        self.panel = Container(parent=self.app, width=400, height=220)
+        self.app = App(width=400, height=220, fps_limit=None, theme=theme, cache_paint=True)
+        self.panel = Container(parent=self.app, width=400, height=220, cache_paint=True)
         self.button = Button(parent=self.panel, width=120, height=40)
         self.toggle = Toggle(parent=self.panel, width=180, height=40, top=60)
         self.other = Button(parent=self.panel, left=200, width=120, height=40)
@@ -306,10 +306,14 @@ class RetainedMotionTests(UIOwnerTestCase):
         return [args for kind, clip, args, kwargs in self.host.segments[identity]
                 if kind == "rect"]
 
-    def assert_only_updated(self, control):
-        self.assertEqual(self.host.updates, [self.retained._records[control].identity])
+    def assert_control_and_ancestors_updated(self, control):
+        expected = set()
+        while control is not None:
+            expected.add(self.retained._records[control].identity)
+            control = control.parent
+        self.assertEqual(set(self.host.updates), expected)
 
-    def test_hover_entry_and_exit_repaint_only_the_animated_segment_then_idle(self):
+    def test_hover_animation_updates_control_and_ancestors_then_becomes_idle(self):
         stable = {control: self.host.segments[self.retained._records[control].identity]
                   for control in (self.app, self.panel, self.other, self.toggle)}
         for kind, started, initial, target in (
@@ -322,12 +326,12 @@ class RetainedMotionTests(UIOwnerTestCase):
                 self.assertEqual(self.rectangles(self.button)[0][1], initial)
                 self.runtime._wake_event.clear()
                 self.frame(started + .06)
-                self.assert_only_updated(self.button)
+                self.assert_control_and_ancestors_updated(self.button)
                 self.assertNotIn(self.rectangles(self.button)[0][1], (initial, target))
                 self.assertFalse(self.runtime._wake_event.is_set())
                 self.assertAlmostEqual(self.runtime._next_frame_at(), started + .06 + 1 / 60)
                 self.frame(started + .2)
-                self.assert_only_updated(self.button)
+                self.assert_control_and_ancestors_updated(self.button)
                 self.assertEqual(self.rectangles(self.button)[0][1], target)
                 self.assertIsNone(self.button._motion)
                 self.assertEqual(self.runtime._next_frame_at(), inf)
@@ -348,11 +352,11 @@ class RetainedMotionTests(UIOwnerTestCase):
         self.frame(100.01)
         self.assertEqual(thumb_x(), start)
         self.frame(100.08)
-        self.assert_only_updated(self.toggle)
+        self.assert_control_and_ancestors_updated(self.toggle)
         self.assertGreater(thumb_x(), start)
         self.assertLess(thumb_x(), start + 19)
         self.frame(100.2)
-        self.assert_only_updated(self.toggle)
+        self.assert_control_and_ancestors_updated(self.toggle)
         self.assertEqual(thumb_x(), start + 19)
         self.assertIsNone(self.toggle._motion)
         self.assertEqual(self.runtime._next_frame_at(), inf)
@@ -376,7 +380,7 @@ class RetainedMotionTests(UIOwnerTestCase):
             self.event("pointer_move")
             transition.assert_called_once_with(.16)
         self.frame(100)
-        self.assert_only_updated(self.button)
+        self.assert_control_and_ancestors_updated(self.button)
         self.assertEqual(self.rectangles(self.button)[0][1], "#00ff00")
         self.assertIsNone(self.button._motion)
         self.assertEqual(self.runtime._next_frame_at(), inf)

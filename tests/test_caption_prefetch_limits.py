@@ -1,15 +1,15 @@
-"""Caption batches stay inside the actual native JSON transport's limits."""
+"""Actual caption commands batch within the native JSON transport's limits."""
 
 from collections import Counter
 import json
 
 from _ui_testcase import UIOwnerTestCase, ui_timeout
 
-from pysual import Container, Label
+from pysual import Container, Label, Rect, dark
 from pysual.backends._native_client import MAX_PAYLOAD, NativeClient
 from pysual.backends.native import NativeHost
 from pysual.layout import arrange
-from pysual.painting import RetainedPaintTree, _prefetch_caption_metrics, paint_tree
+from pysual.painting import Painter, RetainedPaintTree, paint_tree
 
 
 class SerializedMetricTransport(NativeClient):
@@ -59,38 +59,50 @@ class CaptionPrefetchLimitsTests(UIOwnerTestCase):
         self.assertEqual(transport.requests, [])
         return host, transport, panel, labels
 
-    def assert_bounded_prefetch(self, captions):
-        host, transport, _, labels = self.fixture(captions)
-        _prefetch_caption_metrics(host, labels)
+    def draw_fitting_captions(self, captions):
+        host = NativeHost()
+        transport = SerializedMetricTransport()
+        host._client = transport
+        self.addCleanup(host.close)
+        host.begin("#000000")
+        painter = Painter(host, Rect(0, 0, 100000, 40), dark())
+        for text in captions:
+            painter.caption(text, line_height=20)
+        self.assertEqual(transport.requests, [])
+        host._resolve_captions()
+        return transport
+
+    def assert_bounded_captions(self, captions):
+        transport = self.draw_fitting_captions(captions)
         self.assertEqual(transport.measured, Counter(captions))
-        self.assertTrue(all(op == "measure_many" for op, _, _ in transport.requests))
+        requests = [request for request in transport.requests if request[0] != "frame"]
+        self.assertTrue(all(op == "measure_many" for op, _, _ in requests))
         self.assertTrue(all(size <= 1024 * 1024 and count <= 512
-                            for _, size, count in transport.requests))
-        self.assertGreater(len(transport.requests), 1)
+                            for _, size, count in requests))
+        self.assertGreater(len(requests), 1)
 
     def test_500_short_captions_still_share_one_request(self):
         captions = [f"Caption {index}" for index in range(500)]
-        host, transport, _, labels = self.fixture(captions)
-        _prefetch_caption_metrics(host, labels)
+        transport = self.draw_fitting_captions(captions)
         self.assertEqual(transport.measured, Counter(captions))
         self.assertEqual(len(transport.requests), 1)
         self.assertEqual(transport.requests[0][::2], ("measure_many", 500))
 
     def test_caption_count_remains_bounded(self):
         captions = [f"Caption {index}" for index in range(1025)]
-        host, transport, _, labels = self.fixture(captions)
-        _prefetch_caption_metrics(host, labels)
+        transport = self.draw_fitting_captions(captions)
         self.assertEqual(transport.measured, Counter(captions))
-        self.assertEqual([count for _, _, count in transport.requests], [512, 512, 1])
+        self.assertEqual([count for op, _, count in transport.requests if op == "measure_many"],
+                         [512, 512, 1])
 
     def test_utf8_captions_are_bounded_and_measured_once(self):
-        self.assert_bounded_prefetch(astral_captions())
+        self.assert_bounded_captions(astral_captions())
 
     def test_json_escaped_captions_are_bounded_and_measured_once(self):
         suffix = ("\x01\x02\x03\"\\" * 1638)[:8188]
         captions = [f"{index:04d}" + suffix for index in range(512)]
         self.assertTrue(all(len(text) == 8192 for text in captions))
-        self.assert_bounded_prefetch(captions)
+        self.assert_bounded_captions(captions)
 
     @ui_timeout(30)
     def test_large_captions_complete_a_retained_native_scene(self):

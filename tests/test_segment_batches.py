@@ -14,7 +14,9 @@ class SegmentBatchTests(unittest.TestCase):
     def test_unchanged_scene_skips_ipc_but_explicit_present_completes(self):
         host = NativeHost()
         host._request = Mock(return_value={})
-        host._scene_background = "#000000"
+        host.begin_scene("#000000")
+        host.end_scene()
+        host._request.reset_mock()
         host.begin_scene("#000000")
         host.end_scene()
         host._request.assert_not_called()
@@ -28,7 +30,9 @@ class SegmentBatchTests(unittest.TestCase):
             with self.subTest(kind=kind):
                 host = NativeHost()
                 host._request = Mock(return_value={})
-                host._scene_background = "#000000"
+                host.begin_scene("#000000")
+                host.end_scene()
+                host._request.reset_mock()
                 host._on_event({"kind": kind})
                 self.assertEqual(host.poll()[0].kind, kind)
                 host.begin_scene("#000000")
@@ -87,7 +91,12 @@ class SegmentBatchTests(unittest.TestCase):
 
 class RetainedSegmentBatchTests(UIOwnerTestCase):
     def test_donut_strokes_reach_native_retained_commands(self):
-        app, host = App(width=640, height=400), NativeHost()
+        class PaintedApp(App):
+            def paint(self, painter):
+                self._paint_calls = getattr(self, "_paint_calls", 0) + 1
+                super().paint(painter)
+
+        app, host = PaintedApp(width=640, height=400), NativeHost()
         host._request = Mock(return_value={})
         host.measure = lambda text, size, mono=False: (len(text) * size * .6, size * 1.2)
         chart = app.donut_chart(width=400, height=300, slices=(
@@ -109,9 +118,20 @@ class RetainedSegmentBatchTests(UIOwnerTestCase):
             self.assertEqual(sum(len(command[1]) // 2 for command in batches), 513)
             host._request.reset_mock()
             chart.center_text = "Updated"
+            before = app._paint_calls
             paint_tree(app, host, retained=retained)
-            self.assertEqual([segment["id"] for segment in host._request.call_args.kwargs["upsert"]],
-                             [identity])
+            self.assertEqual(app._paint_calls, before + 1)
+            updated = host._request.call_args.kwargs["upsert"]
+            # Ordinary ancestor painting still runs and reaches the same patch;
+            # the native renderer handles equal segments within that update.
+            self.assertEqual({segment["id"] for segment in updated},
+                             {identity, retained._records[app].identity})
+            updated_commands = next(segment["commands"] for segment in updated
+                                    if segment["id"] == identity)
+            self.assertEqual([command for command in updated_commands if command[0] == "segments"],
+                             batches)
+            self.assertTrue(any(command[0] == "text" and command[1] == "Updated"
+                                for command in updated_commands))
         finally:
             app._runtime = None
             app.destroy()

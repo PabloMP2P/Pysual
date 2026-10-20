@@ -15,7 +15,6 @@ from .painting import Painter
 
 
 class _SearchIcon(Label):
-    _paint_reuse = False
 
     def measure(self, host: Host) -> tuple[float, float]:
         return 28, self._control_height(host)
@@ -37,7 +36,6 @@ class _SearchIcon(Label):
 
 
 class _SearchEntry(TextBox):
-    _paint_reuse = False
     style_fallbacks: ClassVar[tuple[str, ...]] = ("SearchField",)
 
     def paint(self, painter: Painter, /) -> None:
@@ -78,7 +76,6 @@ class _SearchEntry(TextBox):
 
 
 class _ClearButton(Button):
-    _paint_reuse = False
     style_excludes: ClassVar[tuple[str, ...]] = ("Button",)
     style_fallbacks: ClassVar[tuple[str, ...]] = ("TextBox",)
 

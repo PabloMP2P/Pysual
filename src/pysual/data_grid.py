@@ -291,7 +291,6 @@ class _BooleanEditor(ListView):
 
 
 class _CellMessage(Label):
-    _paint_reuse = False
 
     def paint(self, p: Painter, /) -> None:
         style = p.body()
@@ -1040,15 +1039,6 @@ class DataGrid(Control):
                 origin=origin,
             )
         )
-
-    def _paint_inputs(self) -> tuple[object, ...]:
-        return (self._scroll, self._scroll_x, self._resize_columns,
-                self._resize, self._pending_reveal)
-
-    def _prepare_paint(self, host: Host) -> None:
-        if self._pending_reveal:
-            self._reveal()
-        self._clamp()
 
     def paint(self, p: Painter, /) -> None:
         row_height, header_height = self._row_height(), self._header_height()

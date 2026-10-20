@@ -109,6 +109,26 @@ def _gradient_stops(first: str, last: str, span: int) -> tuple[_SvgNode, ...]:
     return tuple(stops)
 
 
+@lru_cache(maxsize=4096)
+def _clip_definition(identity: str, x: str, y: str, width: str, height: str) -> _SvgNode:
+    """Share immutable definitions keyed by the exact emitted SVG strings."""
+    return _node("defs", children=[
+        _node("clipPath", {"id": identity}, [
+            _node("rect", {"x": x, "y": y, "width": width, "height": height}),
+        ]),
+    ])
+
+
+@lru_cache(maxsize=4096)
+def _text_node(x: str, y: str, color: str, size: str, family: str, text: str) -> _SvgNode:
+    """Cache only immutable SVG leaves, never painters or renderer services."""
+    return _node("text", {
+        "x": x, "y": y, "fill": color, "font-size": size, "font-family": family,
+        "xml:space": "preserve",
+        "style": "white-space:pre;font-variant-ligatures:none;font-kerning:normal",
+    }, text=text)
+
+
 def _svg_nodes() -> list[_SvgNode]:
     return []
 
@@ -421,8 +441,15 @@ class SVGRenderer:
     def end_segment(self) -> None:
         if not self._segment_open or self._saved_recording is None:
             raise RuntimeError("No retained segment is being recorded")
-        group = _node("g", children=list(self._nodes))
-        self._segments[cast(str, self._segment_id)] = (group, dict(self._frame_gradients))
+        identity = cast(str, self._segment_id)
+        previous = self._segments.get(identity)
+        # All painters and conversions have run. Reuse only identical emitted
+        # output, so publication can recognize this segment by identity.
+        if (previous is None or previous[0].get("children", []) != self._nodes
+                or previous[1] != self._frame_gradients):
+            self._segments[identity] = (
+                _node("g", children=self._nodes), dict(self._frame_gradients),
+            )
         (
             self._nodes, self._frame_gradients, self._clip, self._serial,
             self._clip_group, self._paint_group,
@@ -525,6 +552,7 @@ class SVGRenderer:
         return f"{prefix}_{self._serial}"
 
     def _append(self, node: _SvgNode) -> None:
+        definition: _SvgNode | None = None
         if self._clip is not None:
             if self._clip_group is not None:
                 children = self._clip_group.get("children")
@@ -533,23 +561,20 @@ class SVGRenderer:
                 children.append(node)
                 return
             identity = self._id()
-            self._clip_group = _node("g", {"clip-path": f"url(#{identity})"}, [node])
-            node = _node(
-                "g",
-                children=[
-                    _node(
-                        "defs",
-                        children=[
-                            _node(
-                                "clipPath",
-                                {"id": identity},
-                                [_node("rect", _rect_attrs(self._clip))],
-                            )
-                        ],
-                    ),
-                    self._clip_group,
-                ],
-            )
+            self._clip_group = {
+                "tag": "g", "attrs": {"clip-path": f"url(#{identity})"}, "children": [node],
+            }
+            clip = self._clip
+            x, y, width, height = clip.x, clip.y, max(0, clip.width), max(0, clip.height)
+            arguments = (identity, str.__str__(str(x)), str.__str__(str(y)),
+                         str.__str__(str(width)), str.__str__(str(height)))
+            build = (_clip_definition if sum(map(len, arguments)) <= 1024
+                     else _clip_definition.__wrapped__)
+            definition = build(*arguments)
+            # A definition has no visible output. Keeping it beside the clip
+            # group removes a redundant wrapper without moving the clip onto
+            # transformed primitives or changing the group's clipping space.
+            node = self._clip_group
         if self._target is not None:
             nodes = self._target.nodes
         elif self._paint_group is not None:
@@ -558,6 +583,8 @@ class SVGRenderer:
                 raise KeyError("children")
         else:
             nodes = self._nodes
+        if definition is not None:
+            nodes.append(definition)
         nodes.append(node)
 
     def rect(
@@ -674,21 +701,18 @@ class SVGRenderer:
         for index, line in enumerate(text.split("\n")):
             if not line:
                 continue
-            self._append(
-                _node(
-                    "text",
-                    {
-                        "x": x,
-                        "y": y + index * advance + _font.ascent(size, mono),
-                        "fill": color,
-                        "font-size": size,
-                        "font-family": "Pysual Mono" if mono else "Pysual Sans",
-                        "xml:space": "preserve",
-                        "style": "white-space:pre;font-variant-ligatures:none;font-kerning:normal",
-                    },
-                    text=line,
-                )
-            )
+            baseline = y + index * advance + _font.ascent(size, mono)
+            family = "Pysual Mono" if mono else "Pysual Sans"
+            # Convert arguments eagerly, as _node does. Mutable scalar wrappers
+            # and equal numeric values with different SVG spelling cannot alias.
+            # Base strings also discard attributes attached to str subclasses.
+            x_value, y_value = str.__str__(str(x)), str.__str__(str(baseline))
+            color_value, size_value = str.__str__(str(color)), str.__str__(str(size))
+            content = str.__str__(str(line))
+            arguments = (x_value, y_value, color_value, size_value, family, content)
+            build = (_text_node if len(content) <= _font.MEASURE_CACHE_TEXT_LIMIT
+                     and sum(map(len, arguments)) <= 1024 else _text_node.__wrapped__)
+            self._append(build(*arguments))
 
     def measure(
         self, text: str, size: float, mono: bool = False
