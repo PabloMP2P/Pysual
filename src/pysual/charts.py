@@ -13,7 +13,7 @@ from .controls import Control
 from .geometry import Rect
 from .schema import Dirty, Field, _persist_record, _records, prop
 from .host import Host, text_row_height
-from .painting import Painter
+from .painting import Painter, _PAINTER_MEASURE
 
 _PALETTE = ("#38bdf8", "#34d399", "#fbbf24", "#f472b6", "#a78bfa", "#fb923c", "#94a3b8")
 
@@ -212,7 +212,13 @@ class LineChart(Control):
         # Arbitrary hosts may change their metrics between paint calls without
         # exposing a resource revision. Reuse only with the same explicit
         # metrics contract as Painter's text cache, and honor the sizing opt-out.
-        cacheable = self.cache_measure and isinstance(
+        # An overridden Painter.measure follows the elision-cache policy.
+        # Its widths can change without a host revision, so each paint measures
+        # the axis layout again.
+        ordinary_measure = (
+            type(p).measure is _PAINTER_MEASURE and "measure" not in p.__dict__
+        )
+        cacheable = self.cache_measure and ordinary_measure and isinstance(
             getattr(p.host, "_text_layout_cache", None), TextLayoutCache,
         )
         cached = self._axis_layout if cacheable else None

@@ -169,6 +169,148 @@ class ChartTests(unittest.TestCase):
             self.assertEqual(labels.call_count, 4)
         self.assertIs(chart._points, points)
 
+    def test_axis_cache_bypasses_overridden_painter_measure(self):
+        series = (ChartSeries("s", "S", ((0, 10000), (10, 10001))),)
+        box = Rect(0, 0, 560, 300)
+        ordinary_labels = ["10000", "10000.25", "10000.5", "10000.75", "10001"]
+        offset_labels = ["0", "0.25", "0.5", "0.75", "1"]
+
+        class WiderPainter(Painter):
+            def measure(self, text, **kwargs):
+                width, height = super().measure(text, **kwargs)
+                return width * 4, height
+
+        def paint_instance(chart, host):
+            pen = Painter(host, box, dark(), chart)
+            original = pen.measure
+
+            def measure(text, **kwargs):
+                width, height = original(text, **kwargs)
+                return width * 4, height
+
+            pen.measure = measure
+            chart.paint(pen)
+
+        original_measure = Painter.measure
+
+        def class_measure(self, text, **kwargs):
+            width, height = original_measure(self, text, **kwargs)
+            return width * 4, height
+
+        for kind in ("subclass", "instance", "class"):
+            with self.subTest(kind=kind):
+                chart = LineChart(show_legend=False, series=series)
+                self.addCleanup(chart.destroy)
+                host = MetricCacheHost()
+                chart.paint(Painter(host, box, dark(), chart))
+                self.assertEqual(host.texts[:5], ordinary_labels)
+                self.assertIsNotNone(chart._axis_layout)
+                host.texts.clear()
+                if kind == "subclass":
+                    chart.paint(WiderPainter(host, box, dark(), chart))
+                elif kind == "instance":
+                    paint_instance(chart, host)
+                else:
+                    with patch.object(Painter, "measure", class_measure):
+                        chart.paint(Painter(host, box, dark(), chart))
+                self.assertEqual(host.texts[:5], offset_labels)
+                self.assertIn("+10000", host.texts)
+                self.assertIsNone(chart._axis_layout)
+                host.texts.clear()
+                chart.paint(Painter(host, box, dark(), chart))
+                self.assertEqual(host.texts[:5], ordinary_labels)
+                self.assertIsNotNone(chart._axis_layout)
+
+    def test_svg_axis_layout_follows_custom_painter_font_size(self):
+        from pysual import charts
+        from pysual.backends._web_svg import SVGRenderer
+
+        class AxisSizeChart(LineChart):
+            def _initialize(self) -> None:
+                super()._initialize()
+                self._axis_size = 11
+
+            def paint(self, p, /):
+                measure, text, size = p.measure, p.text, self._axis_size
+
+                def measure_text(value, **kwargs):
+                    if kwargs.get("size") == 11:
+                        kwargs["size"] = size
+                    return measure(value, **kwargs)
+
+                def draw_text(value, x, y, **kwargs):
+                    if kwargs.get("size") == 11:
+                        kwargs["size"] = size
+                    return text(value, x, y, **kwargs)
+
+                p.measure = measure_text
+                p.text = draw_text
+                super().paint(p)
+
+        def scene_texts(host):
+            found = []
+
+            def walk(nodes):
+                for node in nodes:
+                    if node["tag"] == "text":
+                        found.append(node.get("text"))
+                    walk(node.get("children", ()))
+
+            walk(host._nodes)
+            return found
+
+        def axis_margin(host):
+            found = []
+
+            def walk(nodes):
+                for node in nodes:
+                    if node["tag"] == "line" and node["attrs"]["x1"] == node["attrs"]["x2"]:
+                        found.append(float(node["attrs"]["x1"]))
+                    walk(node.get("children", ()))
+
+            walk(host._nodes)
+            self.assertEqual(len(found), 1)
+            return found[0]
+
+        # Size 44 exceeds the y-axis slot in the built-in face, so a fresh
+        # chart switches to an offset tick and a wider plot margin.
+        series = (ChartSeries("s", "S", ((0, 10000), (10, 10001))),)
+        box = Rect(0, 0, 560, 300)
+        host = SVGRenderer()
+        chart = AxisSizeChart(show_legend=False, series=series)
+        self.addCleanup(chart.destroy)
+        chart.paint(Painter(host, box, dark(), chart))
+        self.assertIsNone(chart._axis_layout)
+        self.assertEqual(round(axis_margin(host), 2), 66.49)
+        self.assertEqual(
+            scene_texts(host)[:5],
+            ["10000", "10000.25", "10000.5", "10000.75", "10001"],
+        )
+        host._nodes.clear()
+        chart._axis_size = 44
+        chart.invalidate()
+        chart.paint(Painter(host, box, dark(), chart))
+        fresh = AxisSizeChart(show_legend=False, series=series)
+        self.addCleanup(fresh.destroy)
+        fresh._axis_size = 44
+        fresh_host = SVGRenderer()
+        fresh.paint(Painter(fresh_host, box, dark(), fresh))
+        self.assertIsNone(chart._axis_layout)
+        self.assertEqual(scene_texts(host), scene_texts(fresh_host))
+        self.assertEqual(axis_margin(host), axis_margin(fresh_host))
+        self.assertEqual(round(axis_margin(fresh_host), 2), 111.97)
+        self.assertEqual(scene_texts(fresh_host)[:5], ["0", "0.25", "0.5", "0.75", "1"])
+        self.assertIn("+10000", scene_texts(fresh_host))
+
+        plain = LineChart(show_legend=False, series=series)
+        self.addCleanup(plain.destroy)
+        plain_host = SVGRenderer()
+        with patch.object(charts, "_axis_labels", wraps=charts._axis_labels) as labels:
+            plain.paint(Painter(plain_host, box, dark(), plain))
+            plain.paint(Painter(plain_host, box, dark(), plain))
+            self.assertEqual(labels.call_count, 2)
+        self.assertIsNotNone(plain._axis_layout)
+
     def test_direct_axis_cache_does_not_keep_its_host_alive(self):
         chart = LineChart(show_legend=False,
             series=(ChartSeries("s", "S", ((0, 10000), (10, 10001))),))
