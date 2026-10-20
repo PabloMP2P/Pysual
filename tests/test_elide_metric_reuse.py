@@ -155,8 +155,9 @@ def test_oversized_cache_replacement_preserves_existing_result_and_budget():
     assert cache._bytes < before
 
 
+@pytest.mark.parametrize("batched", [False, True])
 @pytest.mark.parametrize("override", ["subclass", "instance", "class"])
-def test_painter_measure_override_is_respected_after_metric_cache_warmup(override, monkeypatch):
+def test_painter_measure_override_is_respected_after_metric_cache_warmup(override, batched, monkeypatch):
     original = Painter.measure
 
     def wider(self, text, **kwargs):
@@ -166,7 +167,7 @@ def test_painter_measure_override_is_respected_after_metric_cache_warmup(overrid
     class WiderPainter(Painter):
         measure = wider
 
-    host, _, _, _ = metric_host()
+    host, _, batches, _ = metric_host(batched)
     if override == "subclass":
         pen = WiderPainter(host, Rect(0, 0, 300, 50), dark())
     else:
@@ -177,16 +178,18 @@ def test_painter_measure_override_is_respected_after_metric_cache_warmup(overrid
             monkeypatch.setattr(Painter, "measure", wider)
     assert pen.measure("abcd", size=16) == (64, 16)
     assert pen.elide("abcd", 48, size=16) == "ab…"
+    assert batches == []
 
 
+@pytest.mark.parametrize("batched", [False, True])
 @pytest.mark.parametrize("custom_first", [False, True])
-def test_custom_painter_does_not_read_or_replace_ordinary_cached_elision(custom_first):
+def test_custom_painter_does_not_read_or_replace_ordinary_cached_elision(custom_first, batched):
     class WiderPainter(Painter):
         def measure(self, text, **kwargs):
             width, height = super().measure(text, **kwargs)
             return width * 2, height
 
-    host, _, _, _ = metric_host()
+    host, _, _, _ = metric_host(batched)
     ordinary = painter(host)
     custom = WiderPainter(host, Rect(0, 0, 300, 50), dark())
     ordered = ((custom, "a…"), (ordinary, "abc…")) if custom_first else (

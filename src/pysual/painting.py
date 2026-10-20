@@ -661,8 +661,10 @@ class Painter:
                 full_width = metric[0]
                 if full_width <= width:
                     return text
+        # Host batches report raw metrics. An overridden Painter.measure
+        # scores each truncation candidate on the single-string path.
         measured = optional_host(self.host, "measure_many")
-        if measured is not None:
+        if ordinary_measure and measured is not None:
             result = self._elide_many(
                 text, width, size, mono_flag, measured.measure_many, full_width,
             )
