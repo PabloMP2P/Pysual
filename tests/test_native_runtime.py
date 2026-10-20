@@ -7,6 +7,7 @@ import time
 import unittest
 
 from pysual import App, Button, Label, TextBox, terminal
+from pysual._engine import call
 from pysual.backends._native_client import native_executable
 from pysual.backends.native import NativeHost, NativeTermTextHost
 from pysual.geometry import Rect
@@ -64,6 +65,56 @@ def until(predicate):
 
 @unittest.skipUnless(native_executable().is_file(), "Build the native helper")
 class NativeRuntimeTests(unittest.TestCase):
+    def test_native_repaint_replays_unchanged_on_demand_scene(self):
+        # This fixture's root has no per-frame drawing work. Opt into caching
+        # explicitly so an expose can replay the entire unchanged scene.
+        app = App(width=160, height=96, reduce_motion=True, redraw_interval=None,
+                  cache_paint=True)
+        Label(parent=app, text="Unchanged")
+        host = NativeHost(hidden=True, vsync=False)
+        try:
+            app.run(backend=host)
+            # Ensure the initial asynchronous commit has reached presentation.
+            until(lambda: host.native_stats()["frames"] > 0)
+            before = host.native_stats()
+            host._on_event({"kind": "repaint"})
+            until(lambda: host.native_stats()["frames"] > before["frames"])
+            self.assertEqual(host.native_stats()["scene_updates"], before["scene_updates"])
+        finally:
+            app.close()
+            app.wait(timeout=5)
+            app.destroy()
+
+    def test_default_uncached_app_paints_on_an_explicit_frame_request(self):
+        class PaintedApp(App):
+            def paint(self, painter):
+                self._paint_calls = getattr(self, "_paint_calls", 0) + 1
+                super().paint(painter)
+
+        app = PaintedApp(width=160, height=96, reduce_motion=True, redraw_interval=None)
+        self.assertFalse(app.cache_paint)
+        Label(parent=app, text="Unchanged")
+        host = NativeHost(hidden=True, vsync=False)
+        try:
+            app.run(backend=host)
+            until(lambda: host.native_stats()["frames"] > 0)
+            before_calls = app._paint_calls
+            before_segments = host.native_stats()["segments_updated"]
+            app.request_frame()
+            until(lambda: call(lambda: app._paint_calls > before_calls))
+            self.assertEqual(host.native_stats()["segments_updated"], before_segments)
+            # Once the repeated partial patch is accepted, the same painter
+            # still runs while its complete identical output needs no IPC.
+            before_calls = app._paint_calls
+            before_updates = host.native_stats()["scene_updates"]
+            app.request_frame()
+            until(lambda: call(lambda: app._paint_calls > before_calls))
+            self.assertEqual(host.native_stats()["scene_updates"], before_updates)
+        finally:
+            app.close()
+            app.wait(timeout=5)
+            app.destroy()
+
     def test_long_proportional_unicode_and_password_lines_open_and_scroll(self):
         for value, properties in (("a" * 2000, {}), ("a" * 20000, {}),
                                   ("é" * 2000, {"monospace": True}),
@@ -99,7 +150,14 @@ class NativeRuntimeTests(unittest.TestCase):
             self.assertTrue(app.is_open)
             app.action.activate()
             until(lambda: app.message.text == "Changed")
-            until(lambda: host.native_stats()["scene_updates"] >= 2)
+            # Startup/expose requests can also submit the uncached root. Wait
+            # for this control's changed frame, rather than a fixed frame count.
+            def changed_frame_published():
+                retained = app._runtime._retained_paint
+                key = retained._records[app.message].key
+                return key is not None and key.state == app.message._paint_revision
+
+            until(lambda: call(changed_frame_published))
             revision = host.native_stats()["scene_updates"]
             time.sleep(0.08)
             self.assertEqual(host.native_stats()["scene_updates"], revision)

@@ -26,6 +26,10 @@ typedef struct {
     double x, y, w, h;
 } Box;
 typedef struct {
+    int mode;
+    Box box;
+} EffectClip; /* 0 inherits, 1 resets, 2 explicit box. */
+typedef struct {
     unsigned char r, g, b, a;
     int set;
 } Color;
@@ -77,7 +81,7 @@ typedef struct DrawCommand {
     double a, b, c, from, to, duration, edges[4];
     const char *text, *extra;
     Style style;
-    const cJSON *clip;
+    EffectClip clip;
     double *points;
     int frame_w, frame_h, frame_count;
 } DrawCommand;
@@ -143,6 +147,7 @@ struct PXRenderer {
     SDL_Rect clip;
     char error[512];
 };
+static int clip_logical(PXRenderer *r, int clear, Box b);
 
 static void discard_scene_cache(PXRenderer *r) {
     if (r->scene_cache)
@@ -244,6 +249,14 @@ static int draw_color(PXRenderer *r, Color c) {
 static Box box_json(const cJSON *v) {
     Box b = {number(at(v, 0), 0), number(at(v, 1), 0), number(at(v, 2), 0), number(at(v, 3), 0)};
     return b;
+}
+static EffectClip effect_clip_json(const cJSON *v) {
+    EffectClip clip = {0};
+    if (v) {
+        clip.mode = cJSON_IsNull(v) ? 1 : 2;
+        clip.box = box_json(v);
+    }
+    return clip;
 }
 static Box inset(Box b, double n) {
     b.x += n;
@@ -690,10 +703,87 @@ static TTF_Font *font(PXRenderer *r, double size, int mono) {
         fail(r, "Open bundled font");
     return r->fonts[slot].font;
 }
+#define TEXT_METRIC_SLOTS 1024
+#define TEXT_METRIC_KEEP 96
+typedef struct {
+    uint64_t hash;
+    int pixels, mono, length, px_w;
+    double px_h;
+    char text[TEXT_METRIC_KEEP];
+} TextMetric;
+static TextMetric text_metrics[TEXT_METRIC_SLOTS];
+static uint64_t text_metric_hash(const char *text, size_t n, int pixels, int mono) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    size_t i;
+    for (i = 0; i < n; ++i)
+        hash = (hash ^ (unsigned char)text[i]) * UINT64_C(1099511628211);
+    hash ^= (uint64_t)(unsigned)pixels + ((uint64_t)mono << 32);
+    return hash ? hash : 1;
+}
+static int measure_cached(const char *text, int pixels, int mono, int *px_w, double *px_h) {
+    size_t n = strlen(text), probes;
+    uint64_t hash;
+    unsigned slot;
+    if (n > TEXT_METRIC_KEEP)
+        return 0;
+    hash = text_metric_hash(text, n, pixels, mono);
+    slot = (unsigned)hash & (TEXT_METRIC_SLOTS - 1);
+    for (probes = 0; probes < 16; ++probes, slot = (slot + 1) & (TEXT_METRIC_SLOTS - 1)) {
+        TextMetric *found = &text_metrics[slot];
+        if (!found->hash)
+            return 0;
+        if (found->hash == hash && found->pixels == pixels && found->mono == mono && found->length == (int)n &&
+            !memcmp(found->text, text, n)) {
+            *px_w = found->px_w;
+            *px_h = found->px_h;
+            return 1;
+        }
+    }
+    return 0;
+}
+static void measure_store(const char *text, int pixels, int mono, int px_w, double px_h) {
+    size_t n = strlen(text), probes;
+    uint64_t hash;
+    unsigned slot;
+    TextMetric *dest = NULL;
+    if (n > TEXT_METRIC_KEEP)
+        return;
+    hash = text_metric_hash(text, n, pixels, mono);
+    slot = (unsigned)hash & (TEXT_METRIC_SLOTS - 1);
+    for (probes = 0; probes < 16; ++probes, slot = (slot + 1) & (TEXT_METRIC_SLOTS - 1)) {
+        TextMetric *found = &text_metrics[slot];
+        if (!found->hash || (found->hash == hash && found->pixels == pixels && found->mono == mono &&
+                             found->length == (int)n && !memcmp(found->text, text, n))) {
+            dest = found;
+            break;
+        }
+    }
+    if (!dest)
+        /* Replacement must remain inside the lookup's bounded probe window. */
+        dest = &text_metrics[(unsigned)hash & (TEXT_METRIC_SLOTS - 1)];
+    dest->hash = hash;
+    dest->pixels = pixels;
+    dest->mono = mono;
+    dest->length = (int)n;
+    dest->px_w = px_w;
+    dest->px_h = px_h;
+    memcpy(dest->text, text, n);
+}
 static int measure(PXRenderer *r, const char *text, double size, int mono, double *width, double *height) {
-    TTF_Font *f = font(r, size, mono);
-    const char *start = text, *end;
-    int max_width = 0, lines = 0;
+    TTF_Font *f;
+    const char *start, *end;
+    int max_width = 0, lines = 0, pixels, px_w;
+    double px_h;
+    if (!text)
+        text = "";
+    pixels = (int)max2(1, rnd(size * r->scale));
+    if (pixels <= 2048 && measure_cached(text, pixels, mono, &px_w, &px_h)) {
+        *width = px_w / r->scale;
+        *height = px_h / r->scale;
+        return 1;
+    }
+    f = font(r, size, mono);
+    start = text;
     if (!f)
         return 0;
     do {
@@ -710,8 +800,11 @@ static int measure(PXRenderer *r, const char *text, double size, int mono, doubl
             break;
         start = end + 1;
     } while (1);
+    px_h = (double)TTF_GetFontHeight(f) * lines;
     *width = max_width / r->scale;
-    *height = (double)TTF_GetFontHeight(f) * lines / r->scale;
+    *height = px_h / r->scale;
+    if (pixels <= 2048)
+        measure_store(text, pixels, mono, max_width, px_h);
     return 1;
 }
 static int clipped_text_line(PXRenderer *r, TTF_Font *f, const char *text, size_t length, int x, int y, int w, int h,
@@ -1203,7 +1296,7 @@ static cJSON *color_value(Color c) {
     return cJSON_CreateString(text);
 }
 static int shadow(PXRenderer *r, Box b, double radius, Color tint, double blur, double ox, double oy,
-                  const cJSON *effect_clip) {
+                  EffectClip effect_clip) {
     SDL_Rect saved = r->clip, p;
     int was_clipped = r->clip_enabled, pixels = (int)ceil(blur * r->scale), w, h, compact = 0, ok;
     double edges[4] = {0};
@@ -1214,7 +1307,7 @@ static int shadow(PXRenderer *r, Box b, double radius, Color tint, double blur, 
     p.y = rnd((b.y + oy) * r->scale) - pixels;
     p.w = rnd(b.w * r->scale) + 2 * pixels;
     p.h = rnd(b.h * r->scale) + 2 * pixels;
-    if (effect_clip && !clip_box(r, effect_clip))
+    if (effect_clip.mode && !clip_logical(r, effect_clip.mode == 1, effect_clip.box))
         return 0;
     if (!visible_pixels(r, p)) {
         set_clip(r, was_clipped ? &saved : NULL);
@@ -1265,7 +1358,7 @@ static int shadow(PXRenderer *r, Box b, double radius, Color tint, double blur, 
         t && (compact ? nine_texture(r, t, p, edges, tint) : copy_texture(r, t, (Box){p.x, p.y, p.w, p.h}, NULL, tint));
     return set_clip(r, was_clipped ? &saved : NULL) && ok;
 }
-static int surface(PXRenderer *r, Box b, Style s, const cJSON *effect_clip) {
+static int surface(PXRenderer *r, Box b, Style s, EffectClip effect_clip) {
     Color empty = {0}, light, dark, glow;
     double radius = min2(s.radius, min2(b.w, b.h) / 2), width = s.border_width;
     double glow_width = min2(s.glow_width, min2(b.w, b.h) / 2);
@@ -1337,7 +1430,7 @@ static int surface(PXRenderer *r, Box b, Style s, const cJSON *effect_clip) {
         return 0;
     return 1;
 }
-static int marker(PXRenderer *r, Box b, Style s, const char *shape, int checked, const cJSON *effect_clip) {
+static int marker(PXRenderer *r, Box b, Style s, const char *shape, int checked, EffectClip effect_clip) {
     double diameter = min2(b.w, b.h), unit = diameter / 24;
     Color empty = {0};
     int circle = strcmp(shape, "circle") == 0;
@@ -1507,14 +1600,14 @@ static DrawCommand *decode_commands(const cJSON *commands, size_t *count) {
         case CMD_STYLED:
             cmd->box = box_json(at(c, 1));
             cmd->style = style_json(at(c, 2));
-            cmd->clip = at(c, 3);
+            cmd->clip = effect_clip_json(at(c, 3));
             break;
         case CMD_MARKER:
             cmd->box = box_json(at(c, 1));
             cmd->style = style_json(at(c, 2));
             cmd->extra = string(at(c, 3), "square");
             cmd->flag = boolean(at(c, 4), 0);
-            cmd->clip = at(c, 5);
+            cmd->clip = effect_clip_json(at(c, 5));
             break;
         case CMD_CARET:
             cmd->a = number(at(c, 1), 0);
@@ -2625,8 +2718,9 @@ static int execute(PXRenderer *r, const cJSON *c, const cJSON *old, double fract
             s = blend_style(style_json(at(old, 2)), s, fraction);
             b = blend_box(box_json(at(old, 1)), b, fraction);
         }
-        return !strcmp(op, "marker") ? marker(r, b, s, string(at(c, 3), "square"), boolean(at(c, 4), 0), at(c, 5))
-                                     : surface(r, b, s, at(c, 3));
+        return !strcmp(op, "marker")
+                   ? marker(r, b, s, string(at(c, 3), "square"), boolean(at(c, 4), 0), effect_clip_json(at(c, 5)))
+                   : surface(r, b, s, effect_clip_json(at(c, 3)));
     }
     if (!strcmp(op, "caret"))
         return line(r, number(at(c, 1), 0), number(at(c, 2), 0), number(at(c, 1), 0),

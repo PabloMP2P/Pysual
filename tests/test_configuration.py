@@ -16,7 +16,7 @@ def isolated(source, *arguments, env=None):
         environment.pop(key, None)
     environment.update(env or {})
     path = str(Path(__file__).resolve().parents[1]/'src')
-    result = subprocess.run([sys.executable, '-I', '-c',
+    result = subprocess.run([sys.executable, '-I', '-B', '-c',
         f'import sys;sys.path.insert(0,{path!r});\n'+source, *arguments],
         capture_output=True, text=True, env=environment, timeout=15)
     assert result.returncode == 0, result.stderr

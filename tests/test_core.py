@@ -1,11 +1,15 @@
 import ast
 import asyncio
+import copy
 import inspect
 import json
+import pickle
 import threading
 import unittest
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
+from threading import Lock
+from unittest.mock import patch
 from typing import Literal, get_args, get_origin
 
 from pysual import (
@@ -16,6 +20,8 @@ from pysual import (
     ClosingEvent,
     Container,
     Control,
+    Label,
+    dark,
     Dirty,
     Event,
     Popup,
@@ -26,10 +32,16 @@ from pysual import (
     register_control,
 )
 from _support import exercise
-from _ui_testcase import AsyncUIOwnerTestCase
+from _ui_testcase import AsyncUIOwnerTestCase, UIOwnerTestCase
 from pysual.errors import BindingError, EventOverloadError, LifecycleError, SchemaError
 from pysual._value_bag import _ValueBag
 from pysual.host import Input
+from pysual.layout import arrange
+from pysual.schema import Field
+from pysual.painting import RetainedPaintTree, paint_tree
+from pysual.render_cache import RenderCache
+from test_retained_paint import PatchRecordingHost
+from test_render_cache import SurfaceHost
 from pysual.runtime import Runtime
 from test_library import RecordingHost, eventually
 
@@ -262,6 +274,56 @@ class PropertyTests(unittest.TestCase):
             with self.assertRaises(LifecycleError):
                 control.create_task(coroutine)
             self.assertIsNone(coroutine.cr_frame)
+
+    def test_validation_preserves_field_metadata_and_replacement(self):
+        definition = prop(default=())
+        field = Field("items", tuple[str, ...], definition)
+        unchanged = Field("items", tuple[str, ...], definition)
+        original_repr, original_metadata = repr(field), asdict(field)
+        original_hash = hash(field)
+        field.validate(("first",))
+        field.validate(("second",))
+        self.assertEqual(tuple(inspect.signature(Field).parameters),
+                         ("name", "annotation", "definition"))
+        self.assertEqual(tuple(item.name for item in fields(field)),
+                         ("name", "annotation", "definition"))
+        self.assertEqual(repr(field), original_repr)
+        self.assertEqual(asdict(field), original_metadata)
+        self.assertEqual(field, unchanged)
+        self.assertEqual(hash(field), original_hash)
+        self.assertEqual(hash(field), hash(unchanged))
+        numbers = replace(field, annotation=tuple[int, ...])
+        numbers.validate((1, 2))
+        with self.assertRaisesRegex(TypeError, "items: expected"):
+            numbers.validate(("first",))
+        field.validate(("first",))
+
+    def test_unsupported_validation_branch_remains_deferred(self):
+        field = Field("value", str | list[int], prop(default="valid"))
+        field.validate("first")
+        for _ in range(2):
+            with self.assertRaisesRegex(SchemaError, "Unsupported property type"):
+                field.validate([1])
+            field.validate("next")
+
+    def test_frozen_record_with_unhashable_metaclass_retains_validation(self):
+        class UnhashableType(type):
+            __hash__ = None
+
+        @dataclass(frozen=True)
+        class Record(metaclass=UnhashableType):
+            values: tuple[str, ...]
+
+        class RecordControl(Control):
+            record: Record = prop(default=Record(("before",)), persist=False)
+
+        control = RecordControl()
+        self.addCleanup(control.destroy)
+        control.record = Record(("after",))
+        accepted = control.record
+        with self.assertRaisesRegex(SchemaError, "only immutable values"):
+            control.record = Record(["mutable"])
+        self.assertIs(control.record, accepted)
 
 
 class RuntimeInputTests(AsyncUIOwnerTestCase):
@@ -934,6 +996,197 @@ class EventTests(AsyncUIOwnerTestCase):
         with self.assertRaisesRegex(ValueError, "build failed"):
             await exercise(Bad(), scenario)
         App().close()
+
+
+class ControlCopyingTests(UIOwnerTestCase):
+    def setUp(self):
+        self.app, self.host = App(width=320, height=192), PatchRecordingHost()
+        self.runtime = Runtime(self.app, self.host)
+        self.app._runtime = self.runtime
+        self.retained = self.runtime._retained_paint = RetainedPaintTree(self.host)
+
+    def tearDown(self):
+        self.app._runtime = None
+        self.app.destroy()
+
+    def frame(self):
+        arrange(self.app, self.host)
+        paint_tree(self.app, self.host, retained=self.retained, layout_changed=True)
+
+    def assert_direct_matches(self):
+        retained = self.host.snapshot()
+        paint_tree(self.app, self.host)
+        self.assertEqual(retained, tuple(self.host._drawing))
+
+    def assert_independent_copy_repaints(self, clone_control):
+        original = Label(text="Before", width=200, height=32)
+        self.addCleanup(original.destroy)
+        clone = clone_control(original)
+        self.addCleanup(clone.destroy)
+        self.assertIsNot(clone, original)
+        self.assertIsNone(original.parent)
+        self.assertIsNone(clone.parent)
+        self.assertEqual(clone.text, original.text)
+        clone.top = 48
+        self.app.add(original)
+        self.app.add(clone)
+        self.frame()
+
+        clone.text = "Clone changed"
+        self.frame()
+        self.assertEqual(original.text, "Before")
+        self.assert_direct_matches()
+        self.assertEqual(set(self.host.updates), {
+            self.retained._records[clone].identity,
+            self.retained._records[self.app].identity,
+        })
+        self.assertNotIn(self.retained._records[original].identity, self.host.updates)
+
+        original.text = "Original changed"
+        self.frame()
+        self.assertEqual(clone.text, "Clone changed")
+        self.assert_direct_matches()
+        self.assertEqual(set(self.host.updates), {
+            self.retained._records[original].identity,
+            self.retained._records[self.app].identity,
+        })
+        self.assertNotIn(self.retained._records[clone].identity, self.host.updates)
+
+    def test_deepcopy_of_detached_control_repaints_independently(self):
+        self.assert_independent_copy_repaints(copy.deepcopy)
+
+    def test_pickled_detached_control_repaints_independently(self):
+        for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
+            with self.subTest(protocol=protocol):
+                self.assert_independent_copy_repaints(
+                    lambda control, protocol=protocol: pickle.loads(
+                        pickle.dumps(control, protocol=protocol)
+                    )
+                )
+
+    def test_restored_property_bag_keeps_values_and_independent_writes(self):
+        original = _ValueBag({"text": "Before", "width": 200.0})
+        # Exercise copying after a write, with an already advanced generation.
+        original["text"] = "Committed"
+        restorers = [("copy", copy.copy), ("deepcopy", copy.deepcopy)]
+        restorers.extend(
+            (f"pickle protocol {protocol}",
+             lambda bag, protocol=protocol: pickle.loads(pickle.dumps(bag, protocol=protocol)))
+            for protocol in range(pickle.HIGHEST_PROTOCOL + 1)
+        )
+        for name, restore in restorers:
+            with self.subTest(restoration=name):
+                restored = restore(original)
+                self.assertIs(type(restored), _ValueBag)
+                self.assertEqual(restored, original)
+                restored["text"] = "After"
+                self.assertEqual(restored["text"], "After")
+                self.assertEqual(original["text"], "Committed")
+
+
+class StatefulContainer(Container):
+    __slots__ = ("user_slot", "__private_slot")
+
+    def _initialize(self):
+        super()._initialize()
+        self.initialize_calls = getattr(self, "initialize_calls", 0) + 1
+        self.user_slot = {"names": ["original"]}
+        self.__private_slot = "private model state"
+        self.user_state = {"extra": [1, 2]}
+
+    def private_slot_value(self):
+        return self.__private_slot
+
+
+class ControlStateTests(UIOwnerTestCase):
+    def restorers(self):
+        return [("deepcopy", copy.deepcopy), *(
+            (f"pickle {protocol}", lambda original, protocol=protocol:
+             pickle.loads(pickle.dumps(original, protocol=protocol)))
+            for protocol in range(pickle.HIGHEST_PROTOCOL + 1)
+        )]
+
+    def test_public_container_state_accepts_child_edit_before_first_layout(self):
+        container = Container(layout="grid", width=400, height=300)
+        self.addCleanup(container.destroy)
+        child = Label(parent=container, text="Before")
+        # Public dev stored the model dictionary without placement-cache fields.
+        state = dict(container.__dict__)
+        for name in ("_layout_plan", "_layout_children_dirty",
+                     "_layout_box_revision", "_layout_span"):
+            del state[name]
+        container.__dict__.clear()
+        container.__setstate__(state)
+        child.text = "After"
+        self.assertIs(child.parent, container)
+        arrange(container, RecordingHost())
+        self.assertGreater(child.bounds.width, 0)
+
+    def test_property_bag_default_dict_pickle_restores_without_generation_state(self):
+        # Reproduce public dev's ordinary dict-subclass pickle format readably.
+        original = _ValueBag.__new__(_ValueBag)
+        dict.update(original, {"text": "Before"})
+        self.assertNotIn("_epoch", original.__dict__)
+        for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
+            with self.subTest(protocol=protocol):
+                with patch.object(_ValueBag, "__reduce__", object.__reduce__):
+                    payload = pickle.dumps(original, protocol=protocol)
+                restored = pickle.loads(payload)
+                self.assertIs(type(restored), _ValueBag)
+                self.assertEqual(restored, {"text": "Before"})
+                copied = copy.deepcopy(restored)
+                copied["text"] = "Copy changed"
+                restored["text"] = "Restored changed"
+                self.assertEqual(copied["text"], "Copy changed")
+                self.assertEqual(original["text"], "Before")
+
+    def test_restoration_preserves_custom_slots_dict_and_children_without_initialize(self):
+        original = StatefulContainer(layout="grid", width=400, height=300)
+        self.addCleanup(original.destroy)
+        Label(parent=original, text="Keep child")
+        host = RecordingHost()
+        host.connection_lock = Lock()
+        arrange(original, host)
+        for name, restore in self.restorers():
+            with self.subTest(restoration=name):
+                clone = restore(original)
+                self.addCleanup(clone.destroy)
+                self.assertEqual(clone.initialize_calls, 1)
+                self.assertEqual(clone.user_slot, original.user_slot)
+                self.assertEqual(clone.user_state, original.user_state)
+                self.assertEqual(clone.private_slot_value(), "private model state")
+                self.assertEqual(len(clone.children), 1)
+                self.assertIs(clone.children[0].parent, clone)
+                self.assertEqual(clone.children[0].text, "Keep child")
+                clone.user_slot["names"].append("clone")
+                clone.user_state["extra"].append(3)
+                self.assertEqual(original.user_slot, {"names": ["original"]})
+                self.assertEqual(original.user_state, {"extra": [1, 2]})
+                self.assertIsNone(clone._measure_cache_host)
+                self.assertIsNone(clone._layout_measure_host)
+                arrange(clone, RecordingHost())
+                self.assertEqual(clone.children[0].bounds, original.children[0].bounds)
+
+    def test_copied_control_never_releases_the_original_backend_surface(self):
+        original = Label(text="Cached", width=10, height=10)
+        self.addCleanup(original.destroy)
+        host = SurfaceHost()
+        arrange(original, host)
+        cache = RenderCache(host)
+        self.addCleanup(cache.clear)
+        for _ in range(2):
+            cache.start_frame()
+            cache.paint(original, None, lambda: None)
+            cache.finish_frame()
+        self.assertEqual(cache.stats.entries, 1)
+        self.assertIsNotNone(original._release_paint)
+        for name, restore in self.restorers():
+            with self.subTest(restoration=name):
+                clone = restore(original)
+                self.assertIsNone(clone._release_paint)
+                clone.destroy()
+                self.assertEqual(cache.stats.entries, 1)
+                self.assertEqual(host.released, [])
 
 
 if __name__ == "__main__":

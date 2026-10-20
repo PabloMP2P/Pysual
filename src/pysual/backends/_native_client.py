@@ -35,6 +35,7 @@ class NativeHostError(RuntimeError):
 
 # Keep this text equal to the rejection in native/host.c. Raw frames bypass Python.
 _NUL_ERROR = 'Embedded NUL is not representable in a native C string'
+_NATIVE_JSON = json.JSONEncoder(ensure_ascii=False, allow_nan=False, separators=(',', ':'))
 
 # One shape for a native payload. Declared at the request boundary so the
 # embedded-NUL walk can use isinstance and dict.items directly.
@@ -145,8 +146,7 @@ def prepare_native_request(op: str, fields: object) -> dict[str, _Json]:
 def _serialize_native_request(op: str, fields: dict[str, object]) -> bytes:
     """Skip the recursive NUL policy walk when JSON proves it unnecessary."""
     try:
-        payload = json.dumps({'op': op, **fields}, ensure_ascii=False,
-                             allow_nan=False, separators=(',', ':')).encode('utf-8')
+        payload = _NATIVE_JSON.encode({'op': op, **fields}).encode('utf-8')
     except (TypeError, ValueError):
         # Preserve the policy error that preparation would raise before encoding.
         payload = None
@@ -154,8 +154,7 @@ def _serialize_native_request(op: str, fields: dict[str, object]) -> bytes:
     # path, where the existing policy distinguishes it from the actual character.
     if payload is None or b'\\u0000' in payload:
         prepared = prepare_native_request(op, fields)
-        payload = json.dumps({'op': op, **prepared}, ensure_ascii=False,
-                             allow_nan=False, separators=(',', ':')).encode('utf-8')
+        payload = _NATIVE_JSON.encode({'op': op, **prepared}).encode('utf-8')
     return payload
 
 
@@ -497,13 +496,19 @@ class NativeClient:
         if not isinstance(op, str):
             raise TypeError('op must be a string')
         payload = _serialize_native_request(op, kwargs)
+        return self._request_serialized(
+            op, payload, terminal=kwargs.get('backend') == 'terminal' and not
+            (kwargs.get('hidden') or kwargs.get('headless')),
+        )
+
+    def _request_serialized(self, op: str, payload: bytes, *, terminal: bool = False) -> Any:
+        """Send already validated JSON through the ordinary request lifecycle."""
         if len(payload) > MAX_PAYLOAD:
             raise ValueError('Request exceeds the 16 MiB protocol limit')
         if self._process is None:
             if op != 'open':
                 raise NativeHostError('Open the native host first')
-            self._start(terminal=kwargs.get('backend') == 'terminal' and not
-                        (kwargs.get('hidden') or kwargs.get('headless')))
+            self._start(terminal=terminal)
         try:
             # The first content frame can legitimately take longer than an
             # ordinary request. EOF, process exit and explicit errors still fail
@@ -590,3 +595,6 @@ class NativeClient:
 
     def __exit__(self, *args: object) -> None:
         self.close()
+
+
+_NATIVE_REQUEST = NativeClient.request

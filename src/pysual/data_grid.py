@@ -291,6 +291,7 @@ class _BooleanEditor(ListView):
 
 
 class _CellMessage(Label):
+
     def paint(self, p: Painter, /) -> None:
         style = p.body()
         p.text(
@@ -1024,6 +1025,7 @@ class DataGrid(Control):
                 self._apply_validated({"rows": candidate})
             else:
                 self._values["rows"] = candidate
+                self._record_change(self._schema["rows"], rows, candidate)
                 self._changed(self._schema["rows"], rows, candidate)
         finally:
             self._pending_cell = None

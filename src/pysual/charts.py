@@ -4,14 +4,16 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Context, Decimal, localcontext
 from math import ceil, cos, fsum, isfinite, pi, sin
-from typing import ClassVar, Literal
+from typing import ClassVar, Literal, NamedTuple
+from weakref import ReferenceType, ref
 
 from ._text_display import single_line
+from ._text_layout import TextLayoutCache
 from .controls import Control
 from .geometry import Rect
 from .schema import Dirty, Field, _persist_record, _records, prop
-from .host import Host
-from .painting import Painter
+from .host import Host, text_row_height
+from .painting import Painter, _PAINTER_MEASURE
 
 _PALETTE = ("#38bdf8", "#34d399", "#fbbf24", "#f472b6", "#a78bfa", "#fb923c", "#94a3b8")
 
@@ -119,7 +121,20 @@ def _axis_labels(
         return labels, ""
 
 
+class _AxisLayout(NamedTuple):
+    host: ReferenceType[Host]
+    key: tuple[object, ...]
+    ylabels: tuple[str, ...]
+    ynote: str
+    xlabels: tuple[str, ...]
+    xnote: str
+    left: float
+
+
 class LineChart(Control):
+    _transient_fields: ClassVar[dict[str, Callable[[], object]]] = {
+        "_axis_layout": lambda: None,
+    }
     cache_paint: bool = prop(default=True)
     series: tuple[ChartSeries, ...] = prop(default=())
     title: str = prop(default="", affects=Dirty.MEASURE)
@@ -128,6 +143,7 @@ class LineChart(Control):
 
     def _initialize(self) -> None:
         super()._initialize()
+        self._axis_layout: _AxisLayout | None = None
         self._rebuild()
 
     def _validate_update(self, name: str, value: object) -> None:
@@ -188,11 +204,42 @@ class LineChart(Control):
         def measure(text: str) -> float:
             return p.measure(text, size=11, font_family=axis.font_family)[0]
 
-        yvalues = tuple(ymin * (1 - i / 4) + ymax * (i / 4) for i in range(5))
-        ylabels, ynote = _axis_labels(yvalues, max(56, min(120, p.width / 5)), measure)
-        left = max(66, max(map(measure, ylabels)) + 14)
-        xvalues = tuple(xmin * (1 - ratio) + xmax * ratio for ratio in (0, 0.5, 1))
-        xlabels, xnote = _axis_labels(xvalues, max(32, (p.width - left - 16) / 3 - 8), measure)
+        layout_key = (
+            self._extent, p.width, p.height, bool(self.title), self.show_legend, bool(self.series),
+            axis.font_family, getattr(p.host, "render_scale", 1), getattr(p.host, "resource_revision", 0),
+            text_row_height(p.host, 0.0), self._measure_revision,
+        )
+        # Arbitrary hosts may change their metrics between paint calls without
+        # exposing a resource revision. Reuse only with the same explicit
+        # metrics contract as Painter's text cache, and honor the sizing opt-out.
+        # An overridden Painter.measure follows the elision-cache policy.
+        # Its widths can change without a host revision, so each paint measures
+        # the axis layout again.
+        ordinary_measure = (
+            type(p).measure is _PAINTER_MEASURE and "measure" not in p.__dict__
+        )
+        cacheable = self.cache_measure and ordinary_measure and isinstance(
+            getattr(p.host, "_text_layout_cache", None), TextLayoutCache,
+        )
+        cached = self._axis_layout if cacheable else None
+        if cached is not None and cached.host() is p.host and cached.key == layout_key:
+            ylabels, ynote = cached.ylabels, cached.ynote
+            xlabels, xnote, left = cached.xlabels, cached.xnote, cached.left
+        else:
+            yvalues = tuple(ymin * (1 - i / 4) + ymax * (i / 4) for i in range(5))
+            ylabels, ynote = _axis_labels(yvalues, max(56, min(120, p.width / 5)), measure)
+            left = max(66, max(map(measure, ylabels)) + 14)
+            xvalues = tuple(xmin * (1 - ratio) + xmax * ratio for ratio in (0, 0.5, 1))
+            xlabels, xnote = _axis_labels(xvalues, max(32, (p.width - left - 16) / 3 - 8), measure)
+            try:
+                host = ref(p.host) if cacheable else None
+            except TypeError:
+                # Third-party hosts need not support weak references. A bare
+                # object id could later match a different host, so skip reuse.
+                host = None
+            self._axis_layout = None if host is None else _AxisLayout(
+                host, layout_key, ylabels, ynote, xlabels, xnote, left,
+            )
         top = 38 if self.title else 16
         bottom = 50 if self.show_legend and self.series else 30
         top += 16 if ynote else 0
@@ -291,6 +338,17 @@ class ChartSlice:
             raise ValueError("ChartSlice.value must be a finite nonnegative number")
 
 
+@dataclass
+class _DonutGeometry:
+    """Bounded derived geometry, rebuilt from immutable slices when absent."""
+
+    slices: tuple[ChartSlice, ...]
+    fractions: tuple[float, ...]
+    total_text: str
+    spans: tuple[tuple[float, float, int], ...]
+    arcs: list[tuple[tuple[float, float], ...]] | None = None
+
+
 class DonutChart(Control):
     """At most eight immutable slices, drawn using bounded Painter line segments."""
 
@@ -301,6 +359,13 @@ class DonutChart(Control):
     center_mode: Literal["percent", "total", "none"] = prop(default="percent")
     center_text: str | None = prop(default=None)
     style_parts: ClassVar[tuple[str, ...]] = ("body", "legend")
+    _transient_fields: ClassVar[dict[str, Callable[[], object]]] = {
+        "_donut_geometry": lambda: None,
+    }
+    # Public versions serialized these derived values as ordinary members.
+    _transient_obsolete: ClassVar[tuple[str, ...]] = (
+        "_fractions", "_total_text", "_arcs",
+    )
 
     def _initialize(self) -> None:
         super()._initialize()
@@ -321,34 +386,70 @@ class DonutChart(Control):
         super()._changed(field, old, value)
 
     def _rebuild(self) -> None:
+        self._donut_geometry: _DonutGeometry | None = None
+
+    @property
+    def _geometry(self) -> _DonutGeometry:
+        cached = self._donut_geometry
+        if cached is not None and cached.slices is self.slices:
+            return cached
         # Normalize before adding to avoid overflow from finite extreme values.
         maximum = max((s.value for s in self.slices), default=0)
         scaled = tuple(s.value / maximum if maximum else 0 for s in self.slices)
         total = fsum(scaled)
-        self._fractions = tuple(value / total if total else 0 for value in scaled)
+        fractions = tuple(value / total if total else 0 for value in scaled)
         # Decimal keeps a finite display even when the sum exceeds float range.
         # It does not participate in the normalized ring geometry.
         with localcontext(Context(prec=28)):
-            self._total_text = format(
+            total_text = format(
                 sum((Decimal(str(s.value)) for s in self.slices), Decimal(0)), ".4g"
             )
-        self._arcs: list[tuple[tuple[float, float], ...]] = []
+        # Keep the sweep parameters only. Point tuples are hundreds of trig
+        # calls per slice, and a tiny cell never draws them.
+        spans: list[tuple[float, float, int]] = []
         start = -pi / 2
-        for fraction in self._fractions:
+        for fraction in fractions:
             count = ceil(fraction * 512)
             end = start + 2 * pi * fraction
-            self._arcs.append(
-                tuple(
-                    (
-                        cos(start + (end - start) * (i + 0.5) / count),
-                        sin(start + (end - start) * (i + 0.5) / count),
-                    )
-                    for i in range(count)
-                )
-                if count
-                else ()
-            )
+            spans.append((start, end, count))
             start = end
+        cached = self._donut_geometry = _DonutGeometry(
+            self.slices, fractions, total_text, tuple(spans),
+        )
+        return cached
+
+    @property
+    def _fractions(self) -> tuple[float, ...]:
+        return self._geometry.fractions
+
+    @property
+    def _total_text(self) -> str:
+        return self._geometry.total_text
+
+    @property
+    def _arc_spans(self) -> tuple[tuple[float, float, int], ...]:
+        return self._geometry.spans
+
+    @property
+    def _arcs(self) -> list[tuple[tuple[float, float], ...]]:
+        geometry = self._geometry
+        cache = geometry.arcs
+        if cache is None:
+            cache = list[tuple[tuple[float, float], ...]]()
+            for start, end, count in geometry.spans:
+                cache.append(
+                    tuple(
+                        (
+                            cos(start + (end - start) * (i + 0.5) / count),
+                            sin(start + (end - start) * (i + 0.5) / count),
+                        )
+                        for i in range(count)
+                    )
+                    if count
+                    else ()
+                )
+            geometry.arcs = cache
+        return cache
 
     def measure(self, host: Host) -> tuple[float, float]:
         return 360, 340
@@ -377,9 +478,10 @@ class DonutChart(Control):
         # Narrow radial spans keep rounded ring edges consistent on hosts whose
         # wide line strokes are axis-aligned rather than perpendicular to a path.
         thickness = max(1, ceil(2 * pi * radius / 512) + 1)
-        for index, (slice_, arc) in enumerate(zip(self.slices, self._arcs)):
+        for index, slice_ in enumerate(self.slices):
             color = slice_.color or palette[index]
-            if radius > 0:
+            if radius > 0 and self._arc_spans[index][2]:
+                arc = self._arcs[index]
                 p.segments(
                     ((
                         center_x + x * radius * 0.56,

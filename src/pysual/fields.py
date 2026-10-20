@@ -15,6 +15,7 @@ from .painting import Painter
 
 
 class _SearchIcon(Label):
+
     def measure(self, host: Host) -> tuple[float, float]:
         return 28, self._control_height(host)
 

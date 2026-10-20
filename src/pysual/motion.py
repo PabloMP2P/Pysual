@@ -229,7 +229,6 @@ class Motion:
     def _invalidate(self, control: Control) -> None:
         # The runtime already chose to paint this frame. Do not request another
         # immediate frame through _wake; next_frame_at provides the finite demand.
-        control._paint_local_revision += 1
         retained = self.runtime._retained_paint
         if retained is not None:
             retained.invalidate(control, Dirty.PAINT)

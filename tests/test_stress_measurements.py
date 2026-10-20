@@ -210,6 +210,11 @@ def test_fps_readout_names_backend_and_full_cycle_for_every_preset(name):
 def test_fps_readout_uses_the_control_count_when_it_is_not_a_preset():
     shown = format_fps_readout(17, {"backend_fps": 0, "full_cycle_fps": 8})
     assert shown == "17 controls · Backend FPS 0.0 · Full cycle FPS 8.0"
+    timed = format_fps_readout(17, {
+        "backend_fps": 120, "full_cycle_fps": 30,
+        "timings_ms": {"paint_and_submit": {"p50": 12.34}},
+    })
+    assert timed == "17 controls · Backend FPS 120.0 · Full cycle FPS 30.0 · Submit 12.3 ms"
 
 
 def test_relayout_reads_committed_values_instead_of_public_descriptors():

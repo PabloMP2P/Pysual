@@ -1,15 +1,25 @@
 """Preferred-size reuse preserves custom hooks and explicit invalidation."""
 
+import math
 import unittest
 
+import pytest
+
+from _terminal import MemoryTerminal
 from _ui_testcase import UIOwnerTestCase
 from test_library import RecordingHost
 
-from pysual import App, Container, Control, Rect, prop
+from pysual import App, Container, Control, Label, Rect, dark, prop
+from pysual._text_layout import TextLayoutCache
+from pysual.backends._web_svg import SVGRenderer
+from pysual.backends.native import NativeHost
+from pysual.backends.term_text import TermTextHost
+from pysual.backends.terminal import TerminalHost
+from pysual.host import Viewport
 from pysual._engine import call
 from pysual.errors import LifecycleError
 from pysual.layout import _size, arrange
-from pysual.painting import paint_tree
+from pysual.painting import Painter, paint_tree
 from pysual.schema import Dirty
 
 
@@ -56,6 +66,71 @@ class MeasurementCacheTests(UIOwnerTestCase):
         self.assertEqual(parent.bounds.width, 300)
         self.assertGreater(changed._measure_calls, changed_before)
         self.assertEqual(clean._measure_calls, before)
+
+    def test_flex_grid_remeasures_intrinsic_stack_ancestors(self):
+        self.app.update(layout="stack", padding=0, spacing=0)
+        for depth in (0, 2):
+            for batched in (False, True):
+                with self.subTest(depth=depth, batched=batched):
+                    outer = Container(parent=self.app, layout="stack", spacing=0)
+                    parent = outer
+                    for _ in range(depth):
+                        parent = Container(parent=parent, layout="stack", flex=1,
+                                           spacing=0)
+                    grid = Container(parent=parent, layout="grid", flex=1,
+                                     columns=1, spacing=0)
+                    label = Label(parent=grid, text="one", font_size=15)
+                    arrange(self.app, self.host)
+                    self.assertEqual(outer.bounds.height, 18)
+                    if batched:
+                        outer.update_children({label: {"font_size": 45}})
+                    else:
+                        label.font_size = 45
+                    arrange(self.app, self.host)
+                    self.assertEqual(outer.bounds.height, 54)
+                    self.assertEqual(grid.bounds.height, 54)
+                    self.assertEqual(label.bounds.height, 54)
+                    outer.destroy()
+
+    def test_flex_grid_under_fixed_stack_keeps_unchanged_boxes(self):
+        self.app.update(layout="stack", padding=0, spacing=0)
+        parent = Container(parent=self.app, layout="stack", flex=1, spacing=0)
+        grid = Container(parent=parent, layout="grid", flex=1, columns=1, spacing=0)
+        label = Label(parent=grid, text="one", font_size=15)
+        arrange(self.app, self.host)
+        boxes = (parent.bounds, grid.bounds, label.bounds)
+        label.font_size = 45
+        # Dependency notifications reach ancestors even when placement can
+        # reuse the fixed grid's plan. Custom ancestor measurement stays valid.
+        self.assertTrue(self.app.dirty & Dirty.MEASURE)
+        arrange(self.app, self.host)
+        self.assertEqual((parent.bounds, grid.bounds, label.bounds), boxes)
+
+    def test_grid_custom_arranger_still_receives_preferred_size_changes(self):
+        class MeasuredGrid(Container):
+            def arrange_children(self, area, measure):
+                return {child: Rect(area.x, area.y, *measure(child))
+                        for child in self.children}
+
+        grid = MeasuredGrid(parent=self.app, layout="grid", width=300, height=200)
+        label = Label(parent=grid, text="one", font_size=15)
+        arrange(self.app, self.host)
+        self.assertEqual(label.bounds.height, 18)
+        label.font_size = 45
+        arrange(self.app, self.host)
+        self.assertEqual(label.bounds.height, 54)
+
+    def test_grid_overlay_still_receives_preferred_size_changes(self):
+        class OverlayLabel(Label):
+            _overlay = True
+
+        grid = Container(parent=self.app, layout="grid", width=300, height=200)
+        label = OverlayLabel(parent=grid, text="one", font_size=15)
+        arrange(self.app, self.host)
+        self.assertEqual(label.bounds.height, 18)
+        label.font_size = 45
+        arrange(self.app, self.host)
+        self.assertEqual(label.bounds.height, 54)
 
     def test_fixed_size_can_return_to_current_intrinsic_size(self):
         control = Measured(parent=self.app, width=80, height=30)
@@ -340,3 +415,192 @@ class CallerMeasurementCacheTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TextMetricBridge:
+    diagnostics = {}
+
+    def request(self, op, **fields):
+        if op == "open":
+            return {"width": 320, "height": 180, "scale": 1, "resource_revision": 0}
+        if op == "measure":
+            return len(fields["text"]) * 8, 16
+        if op == "measure_many":
+            return [(len(text) * 8, 16) for text in fields["texts"]]
+        raise AssertionError(op)
+
+    def close(self):
+        pass
+
+
+def native_host():
+    host = NativeHost(client_factory=lambda **_kwargs: TextMetricBridge())
+    host.open("Text", 320, 180, True, 1)
+    return host
+
+
+def terminal_host():
+    return TermTextHost(io=MemoryTerminal(40, 12), probe_timeout=0, environ={})
+
+
+def terminal_wrapper():
+    host = TerminalHost(renderer="python", hidden=True)
+    host.open("Text", 320, 180, True, 1)
+    return host
+
+
+def painter(host):
+    return Painter(host, Rect(0, 0, 200, 80), dark())
+
+
+@pytest.mark.parametrize("factory", [native_host, SVGRenderer, terminal_host, terminal_wrapper])
+def test_measure_and_elide_reuse_between_painters_on_all_builtin_hosts(factory, monkeypatch):
+    host = factory()
+    # This fixture counts shared-cache calls, independently of a host's own LRU.
+    monkeypatch.setattr(host, "_text_measure_cache_limit", 0, raising=False)
+    raw = host.measure
+    calls = []
+
+    def counted(text, size, mono=False):
+        calls.append(text)
+        return raw(text, size, mono)
+
+    monkeypatch.setattr(host, "measure", counted)
+    try:
+        first, second = painter(host), painter(host)
+        expected = first.measure("caption", size=16, font_family="ui")
+        before = len(calls)
+        assert second.measure("caption", size=16, font_family="ui") == expected
+        assert len(calls) == before
+        fitted = first.elide("Repeated café caption", 48, size=16, font_family="ui")
+        assert fitted.endswith("…")
+        before = len(calls)
+        assert second.elide("Repeated café caption", 48, size=16, font_family="ui") == fitted
+        assert len(calls) == before
+    finally:
+        if isinstance(host, SVGRenderer):
+            host.close_scene()
+        else:
+            host.close()
+
+
+@pytest.mark.parametrize("change", ["resource", "scale", "row"])
+def test_metric_environment_changes_clear_old_entries(change, monkeypatch):
+    host = SVGRenderer()
+    host._text_measure_cache_limit = 0
+    width = 10
+    monkeypatch.setattr(host, "measure", lambda *_args: (width, 16))
+    pen = painter(host)
+    assert pen.measure("caption", size=16) == (10, 16)
+    width = 20
+    if change == "resource":
+        host._resource_revision += 1
+    elif change == "scale":
+        host._viewport = Viewport(*host.size, scale=2)
+    else:
+        host.text_row_height = 24
+    assert pen.measure("caption", size=16) == (20, 16)
+    assert len(host._text_layout_cache._entries) == 1
+
+
+def test_native_metric_replacement_invalidates_both_measurement_and_elision():
+    host = native_host()
+    try:
+        pen = painter(host)
+        assert pen.measure("caption", size=16) == (56, 16)
+        assert pen.elide("caption", 32, size=16).endswith("…")
+        host._store_metric("caption", 16, False, (24, 16))
+        assert pen.measure("caption", size=16) == (24, 16)
+        assert pen.elide("caption", 32, size=16) == "caption"
+        # Native display sanitation still occurs before the raw metric cache.
+        assert pen.measure("cap\0tion", size=16) == (24, 16)
+    finally:
+        host.close()
+    assert not host._text_layout_cache._entries
+
+
+@pytest.mark.parametrize("factory", [SVGRenderer, terminal_host])
+def test_reopening_and_closing_release_cached_text(factory):
+    host = factory()
+    pen = painter(host)
+    # Default SVG retains long metrics here while its own font LRU owns short
+    # ones. Exercise both shared long measurements and overflowing captions.
+    text = ("x" * (host._text_measure_cache_limit + 1)
+            if isinstance(host, SVGRenderer) else "before opening")
+    pen.measure(text, size=16)
+    assert host._text_layout_cache._entries
+    if isinstance(host, SVGRenderer):
+        host.reset_scene("Text", 320, 180)
+    else:
+        host.open("Text", 320, 180, True, 1)
+    assert not host._text_layout_cache._entries
+    pen.elide("during opening", 48, size=16)
+    assert host._text_layout_cache._entries
+    if isinstance(host, SVGRenderer):
+        host.close_scene()
+        host.reset_scene("Again", 320, 180)
+    else:
+        host.close()
+        host.open("Again", 320, 180, True, 1)
+    assert not host._text_layout_cache._entries
+    pen.measure(text, size=16)
+    assert host._text_layout_cache._entries
+    if isinstance(host, SVGRenderer):
+        host.close_scene()
+    else:
+        host.close()
+    assert not host._text_layout_cache._entries
+
+
+def test_entry_and_text_byte_budgets_evict_oldest_use_and_skip_long_inputs(monkeypatch):
+    cache = TextLayoutCache()
+    monkeypatch.setattr(cache, "MAX_ENTRIES", 2)
+    cache.store(("m", "first"), (1, 1))
+    cache.store(("m", "second"), (2, 2))
+    assert cache.get(("m", "first")) == (1, 1)
+    cache.store(("m", "third"), (3, 3))
+    assert cache.get(("m", "second")) is None
+    assert len(cache._entries) == 2
+    cache.clear()
+    monkeypatch.setattr(cache, "MAX_BYTES", 1100)
+    cache.store(("e", "a" * 100), "b" * 100)
+    assert cache._bytes > 1000  # Includes the fitted output as well as its input.
+    cache.store(("m", "next"), (1, 1))
+    assert cache.get(("e", "a" * 100)) is None
+    assert cache._bytes <= cache.MAX_BYTES
+    previous = cache._bytes
+    cache.store(("m", "x" * (cache.MAX_TEXT + 1)), (1, 1))
+    assert cache._bytes == previous
+    cache.prepare((1, 1, 0))
+    assert not cache._entries and cache._bytes == 0
+
+
+def test_third_party_hosts_need_no_new_attribute_or_capability():
+    class Host:
+        __slots__ = ("calls",)
+
+        def __init__(self):
+            self.calls = 0
+
+        def measure(self, text, size, mono=False):
+            self.calls += 1
+            return len(text) * 8, 16
+
+    host = Host()
+    pen = painter(host)
+    assert pen.elide("caption", 32, size=16) == "cap…"
+    before = host.calls
+    assert pen.elide("caption", 32, size=16) == "cap…"
+    assert host.calls > before
+    assert not hasattr(host, "_text_layout_cache")
+
+
+def test_invalid_measurements_and_oversized_text_are_not_cached():
+    host = SVGRenderer()
+    pen = painter(host)
+    for size in (math.nan, math.inf, -1):
+        with pytest.raises(ValueError):
+            pen.measure("caption", size=size)
+    assert not host._text_layout_cache._entries
+    pen.measure("x" * (TextLayoutCache.MAX_TEXT + 1), size=16)
+    assert not host._text_layout_cache._entries

@@ -76,6 +76,7 @@ class EditorContent(Container, Generic[_V]):
 
 
 class _EditorMessage(Label):
+
     def paint(self, p: Painter, /) -> None:
         style = p.body()
         p.text(

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import struct
 import sys
+import tempfile
 import time
 import unittest
 from uuid import uuid4
@@ -63,7 +64,7 @@ class NativeWindowTests(unittest.TestCase):
         self.addCleanup(self.client.close)
         # Ordinary inherited permissions let the separate native process access
         # captures even under Windows sandbox identities (mkdtemp uses 0700).
-        self.directory = PACKAGE.parents[1] / "work" / "sdl-tests" / uuid4().hex
+        self.directory = Path(tempfile.gettempdir()) / "pysual-tests" / "sdl-tests" / uuid4().hex
         self.directory.mkdir(parents=True)
         self.output = self.directory / "frame.bmp"
         self.addCleanup(self.cleanup_capture)

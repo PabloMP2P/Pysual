@@ -17,6 +17,7 @@ from weakref import ReferenceType, ref
 from .controls import Control
 from .geometry import Rect
 from .host import Host
+from ._paint_state import PaintInputs, paint_inputs
 from .theme import Theme
 
 
@@ -35,7 +36,7 @@ class CacheStats:
     reuse_seconds: float = 0.0
 
 
-PaintKey = tuple[int, Rect, Rect, Rect, Theme, bool, bool, bool, bool, float, int]
+PaintKey = PaintInputs
 CacheEntry = tuple[PaintKey, object, int, PaintKey | None]
 Owner = ReferenceType[Control]
 
@@ -154,8 +155,8 @@ class RenderCache:
     ) -> PaintKey | None:
         """Cheap inputs to effect bounds, before constructing a Painter.
 
-        Custom paint_bounds hooks follow the same invalidate() contract as
-        custom paint hooks. Include both layout clips: a parent's effect clip
+        All body and paint_bounds hooks follow the same invalidate() contract.
+        Propagated revisions also cover a painter that reads its descendants. Include both layout clips: a parent's effect clip
         can change while the child's body remains entirely inside it.
         """
         if (
@@ -164,19 +165,7 @@ class RenderCache:
             or "render_surfaces" not in self.host.capabilities
         ):
             return None
-        return (
-            control._paint_revision,
-            control._rect,
-            control._clip,
-            control._paint_clip,
-            theme,
-            control._committed_enabled(),
-            control._hover,
-            control._pressed,
-            control is focus,
-            self.host.render_scale,
-            self.host.resource_revision,
-        )
+        return paint_inputs(control, self.host, focus, theme)
 
     def reuse(self, control: Control, key: PaintKey | None) -> bool:
         """Blit an unchanged body without preparing its styles or effects."""
@@ -224,19 +213,15 @@ class RenderCache:
         self._seen.add(owner)
         clip = control._clip if clip is None else clip
         if prepared_key is None:
+            # Public callers may supply an arbitrary draw callback, even for a
+            # built-in control. It follows the same revision invalidation as
+            # the tree, with the caller's explicit clip.
             scale = self.host.render_scale
-            key = (
-                control._paint_revision,
-                control._rect,
-                clip,
-                control._clip,
-                control._fast_theme(),
-                control._committed_enabled(),
-                control._hover,
-                control._pressed,
-                control is focus,
-                scale,
-                self.host.resource_revision,
+            key = PaintInputs(
+                control._paint_revision, control._rect, clip, control._clip,
+                control._fast_theme(), control._committed_enabled(),
+                control._hover, control._pressed, control is focus, None,
+                scale, self.host.resource_revision,
             )
         else:
             # Misses use the already-observed inherited state too; otherwise
@@ -244,7 +229,7 @@ class RenderCache:
             scale = prepared_key[-2]
             # Effect bounds size the surface; the body clip also determines
             # its pixels and can change while shadow bounds stay unchanged.
-            key = (*prepared_key[:2], clip, prepared_key[2], *prepared_key[4:])
+            key = prepared_key._replace(clip=clip, paint_clip=prepared_key.clip)
         entry = self.entries.get(owner)
         if (entry is not None and entry[0] == key and entry[2] <= self.budget
                 and (self._surface_matches is None or self._surface_matches(entry[1]))):

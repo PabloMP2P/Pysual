@@ -114,13 +114,13 @@ def test_project_installs_only_library_packages():
     assert "assets/*" in data and "web/notices/*.txt" in data
 
 
-def test_sdist_contains_readme_assets_and_typing_configs(tmp_path):
+def test_sdist_contains_readme_assets_and_test_dependencies(tmp_path):
     # Exercise the real packaging rules in an isolated minimal checkout.
     source = tmp_path / "source"
-    typing_configs = ("pyrightconfig.json", "examples/pyrightconfig.json",
-                      "tests/typing/pyrightconfig.json")
+    required_files = ("pyrightconfig.json", "examples/pyrightconfig.json",
+                      "tests/typing/pyrightconfig.json", "tests/native_message_wait.c")
     for relative in ("setup.py", "pyproject.toml", "MANIFEST.in", "README.md", "LICENSE",
-                     "src/pysual/__init__.py", "docs/theme-families.png", *typing_configs):
+                     "src/pysual/__init__.py", "docs/theme-families.png", *required_files):
         target = source / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(ROOT / relative, target)
@@ -135,9 +135,9 @@ def test_sdist_contains_readme_assets_and_typing_configs(tmp_path):
         assert b"(https://github.com/PabloMP2P/Pysual/blob/main/docs/theme-families.png)" in readme
         image = archive.extractfile(f"{root}/docs/theme-families.png").read()
         assert image == (ROOT / "docs/theme-families.png").read_bytes()
-        for relative in typing_configs:
-            config = archive.extractfile(f"{root}/{relative}").read()
-            assert config == (ROOT / relative).read_bytes()
+        for relative in required_files:
+            content = archive.extractfile(f"{root}/{relative}").read()
+            assert content == (ROOT / relative).read_bytes()
 
 
 def test_release_workflow_matches_the_pypi_publisher():

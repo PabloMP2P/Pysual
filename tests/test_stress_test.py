@@ -33,8 +33,13 @@ class StressRecordingHost(RecordingHost):
 @contextmanager
 def opened(config, host=None):
     app = StressTest(config)
+    host = host if host is not None else StressRecordingHost()
     try:
-        app.run(backend=host if host is not None else StressRecordingHost())
+        app.run(backend=host)
+        # run() can return after the first frame, before the loaded handler
+        # binds the host and enables its editors. Every lifecycle test needs
+        # that handler to finish before inspecting or changing the dashboard.
+        until(lambda: call(lambda: app._host is host))
         yield app
     finally:
         app.close()
@@ -114,10 +119,14 @@ def test_sample_shows_backend_and_full_cycle_fps_for_the_active_preset():
         until(lambda: not app.snapshot_report()["warming_up"])
         app.sample_button.activate()
         until(lambda: "—" not in app.fps_readout.text)
-        prefix, cycle = app.fps_readout.text.split(" · Full cycle FPS ")
+        prefix, rest = app.fps_readout.text.split(" · Full cycle FPS ")
+        cycle, separator, submit = rest.partition(" · Submit ")
         assert prefix.startswith("Preset small · Backend FPS ")
         float(prefix.removeprefix("Preset small · Backend FPS "))
         float(cycle)
+        if separator:
+            assert submit.endswith(" ms")
+            float(submit.removesuffix(" ms"))
 
 
 def test_live_metrics_start_enabled():

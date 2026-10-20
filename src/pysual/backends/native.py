@@ -16,9 +16,11 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Any, Literal, NotRequired, Protocol, TypedDict, cast
 
+from .._caption import Caption, paint_caption
+from .._text_layout import TextLayoutCache
 from ..geometry import Rect
-from ..host import CapabilityError, Input, MAX_TEXT_BYTES, Viewport
-from ..theme import ResolvedStyle, Style
+from ..host import CapabilityError, Host, Input, MAX_TEXT_BYTES, Viewport
+from ..theme import ResolvedStyle, Style, Theme
 from . import _native_client
 from ._native_client import display_text
 from ._native import NativeServices
@@ -49,6 +51,7 @@ class _ScenePending(TypedDict):
 _Metric = tuple[float, float]
 _MetricKey = tuple[str, float, bool]
 _Setting = bool | int | float | None
+_CAPTION_THEME = Theme()  # Caption font/color values are already resolved.
 
 
 def _display(value: str) -> str:
@@ -59,12 +62,15 @@ def _rect(rect: Rect | None) -> list[float] | None:
     return None if rect is None else [rect.x, rect.y, rect.width, rect.height]
 
 
+_STYLE_NAMES = tuple(field.name for field in fields(Style))
+
+
 def _style(style: Style | ResolvedStyle) -> dict[str, object]:
     # Style validates immutable scalars, so only the wire mapping needs a copy.
     # Narrow once. Casting every field would run on each recorded face.
     if not isinstance(style, Style):
         raise TypeError("Resolved style must be a Style")
-    return {field.name: getattr(style, field.name) for field in fields(style)}
+    return {name: getattr(style, name) for name in _STYLE_NAMES}
 
 
 def _image_source(source: str) -> str:
@@ -129,10 +135,13 @@ class NativeHost(NativeServices):
         self._overflow = False
         self._commands: list[object] = []
         self._scene_background: str | None = None
+        self._output: bytes | None = None
         self._scene_pending: _ScenePending | None = None
+        self._repaint_pending = False
         self._segment: _Segment | None = None
         self._metrics: OrderedDict[_MetricKey, tuple[_Metric, int]] = OrderedDict()
         self._metric_bytes = 0
+        self._text_layout_cache = TextLayoutCache()
         self._settings: dict[str, _Setting] = {}
         self._transition_seconds = 0.0
         self._title: str | None = None
@@ -141,6 +150,7 @@ class NativeHost(NativeServices):
         self.size = (960.0, 640.0)
         self._viewport = Viewport(*self.size)
         self.resource_revision = 0
+        self.metrics_revision = 0
         self._native_resource_revision: object | None = None
         self.info: dict[str, object] = {}
         self._wake_loop: asyncio.AbstractEventLoop | None = None
@@ -210,6 +220,18 @@ class NativeHost(NativeServices):
             raise RuntimeError("Native host is not open")
         return self._client.request(op, **kwargs)
 
+    def _request_output(self, op: str, payload: bytes, **fields: Any) -> Any:
+        # Existing host/client request hooks keep receiving ordinary fields.
+        # Only the unmodified bridge can consume the already encoded output.
+        client = self._client
+        if (getattr(self._request, "__func__", None) is _HOST_REQUEST
+                and isinstance(client, _native_client.NativeClient)
+                and getattr(client.request, "__func__", None) is _native_client._NATIVE_REQUEST):
+            if self._closed:
+                raise RuntimeError("Native host is not open")
+            return client._request_serialized(op, payload)
+        return self._request(op, **fields)
+
     def open(
         self,
         title: str,
@@ -261,7 +283,7 @@ class NativeHost(NativeServices):
             self.close()
             raise
 
-    def _accept_viewport(self, info: Mapping[str, object]) -> None:
+    def _accept_viewport(self, info: Mapping[str, object], *, image_only: bool = False) -> None:
         previous = self._viewport
         previous_revision = self._native_resource_revision
         self._native_resource_revision = info.get("resource_revision", previous_revision)
@@ -270,8 +292,21 @@ class NativeHost(NativeServices):
         if (previous.scale != self._viewport.scale
                 or previous_revision != self._native_resource_revision):
             self.resource_revision += 1
-            self._metrics.clear()
-            self._metric_bytes = 0
+            # Resource changes can affect equal commands. Relearn accepted
+            # output after the next submission, and preserve OS presentation.
+            self._output = None
+            self._repaint_pending = True
+            # A reload acknowledges exactly one image-generation change. A
+            # larger/unknown jump may include a device reset and stays metric
+            # invalidating, even when its scale is unchanged.
+            if not (image_only and previous.scale == self._viewport.scale
+                    and type(previous_revision) is int
+                    and type(self._native_resource_revision) is int
+                    and self._native_resource_revision == previous_revision + 1):
+                self.metrics_revision += 1
+                self._metrics.clear()
+                self._metric_bytes = 0
+                self._text_layout_cache.clear()
 
     def poll(self) -> list[Input]:
         with self._event_lock:
@@ -294,6 +329,10 @@ class NativeHost(NativeServices):
                 data["viewport"] = _viewport(data["viewport"], self.size)
             if data["kind"] == "error" and not data.get("text"):
                 data["text"] = str(raw.get("error", "Native host failed"))
+            if data["kind"] in ("repaint", "resume"):
+                # The OS can require presentation without changing the scene.
+                # Consume this on the UI owner, alongside the runtime's event.
+                self._repaint_pending = True
             events.append(Input(**cast(Any, data)))
         return events
 
@@ -351,13 +390,12 @@ class NativeHost(NativeServices):
     def begin(self, background: str) -> None:
         self._scene_pending = None
         self._commands = []
+        self._segment = None
         self._commands.append(["begin", background])
 
     def begin_scene(self, background: str) -> None:
         """Start a control patch batch; unchanged controls send no commands."""
-        self._scene_pending = {"upsert": [], "remove": []}
-        if background != self._scene_background:
-            self._scene_pending["background"] = background
+        self._scene_pending = {"upsert": [], "remove": [], "background": background}
         self._commands = []
         self._segment = None
 
@@ -408,6 +446,127 @@ class NativeHost(NativeServices):
     ) -> None:
         self._commands.append(["text", _display(text), x, y, color, size, mono])
 
+    def _caption(self, caption: Caption) -> bool:
+        # Foreign hosts and customized measurement/drawing services stay eager.
+        # Only the built-in native recorder owns this deferred command format.
+        if not self._caption_services_match():
+            return False
+        self._commands.append(caption)
+        return True
+
+    def _caption_services_match(self) -> bool:
+        services = _CAPTION_SERVICES.get(type(self))
+        return services is not None and all(
+            getattr(getattr(self, name), "__func__", None) is method
+            for name, method in services
+        )
+
+    def _resolve_captions(self, *, _retry: bool = False) -> None:
+        """Batch actual caption commands, then lower them to ordinary text.
+
+        Leave recording untouched on a measurement error, so a retry cannot
+        serialize a partially resolved scene. No control or callback is kept.
+        """
+        pending = self._scene_pending
+        groups = ([self._commands] if pending is None else
+                  [segment["commands"] for segment in pending["upsert"]])
+        captions = [(commands, index, command)
+                    for commands in groups for index, command in enumerate(commands)
+                    if isinstance(command, Caption)]
+        if not captions:
+            return
+        from ..painting import Painter, _CAPTION_PAINTER_METHODS, _text_cache
+
+        environment = self.metrics_revision, self.resource_revision, self.render_scale
+        ordinary = self._caption_services_match() and all(
+            getattr(Painter, name) is original for name, original in _CAPTION_PAINTER_METHODS
+        )
+        requests: dict[tuple[float, bool], dict[str, None]] = {}
+        metrics: dict[_MetricKey, _Metric] = {}
+        for _, _, caption in captions:
+            text = caption.measurement()
+            if ordinary and text is not None:
+                requests.setdefault((caption.size, caption.mono), {})[text] = None
+        for (size, mono), unique in requests.items():
+            batch: list[str] = []
+            batch_bytes = 128
+
+            def measure_batch() -> None:
+                results = self.measure_many(batch, size, mono)
+                for text, result in zip(batch, results, strict=True):
+                    metrics[text, size, mono] = result
+
+            for text in unique:
+                # Oversize captions retain the ordinary single-text request;
+                # short captions share bounded UTF-8/JSON-safe batches.
+                if len(text) > TextLayoutCache.MAX_TEXT:
+                    metrics[text, size, mono] = self.measure(text, size, mono)
+                    continue
+                cost = len(text) * 6 + 3
+                if batch and (len(batch) >= 512 or batch_bytes + cost > 1024 * 1024):
+                    measure_batch()
+                    batch = []
+                    batch_bytes = 128
+                batch.append(text)
+                batch_bytes += cost
+            if batch:
+                measure_batch()
+
+        stable = ordinary and environment == (self.metrics_revision, self.resource_revision, self.render_scale)
+        if not stable:
+            # A service callback changed the metric environment while replying.
+            # Discard that batch and use ordinary live measurements below.
+            self._metrics.clear()
+            self._metric_bytes = 0
+            self._text_layout_cache.clear()
+        replacements: list[tuple[list[object], int, list[object]]] = []
+        for commands, index, caption in captions:
+            text, bounds = caption.text, caption.bounds
+            available = caption.geometry()[2]
+            painter = Painter(cast(Host, self), bounds, _CAPTION_THEME)
+            if stable and caption.ellipsis:
+                if available <= 0:
+                    text = ""
+                elif metrics[text, caption.size, caption.mono][0] > available:
+                    metric = metrics[text, caption.size, caption.mono]
+                    if len(text) <= TextLayoutCache.MAX_TEXT:
+                        cache = _text_cache(cast(Host, self))
+                        assert cache is not None
+                        cache.store(("m", text, caption.size, caption.mono), metric)
+                        text = painter.elide(text, available, size=caption.size,
+                                             font_family="mono" if caption.mono else "ui")
+                    else:
+                        text = painter._elide_many(text, available, caption.size,
+                                                  caption.mono, self.measure_many, metric[0])
+            output: list[object] = []
+            previous = self._commands
+            self._commands = output
+            try:
+                if stable:
+                    paint_caption(painter, caption, text=text,
+                                  metric=metrics.get((text, caption.size, caption.mono)))
+                else:
+                    paint_caption(painter, caption)
+            finally:
+                self._commands = previous
+            replacements.append((commands, index, output))
+        changed = environment != (self.metrics_revision, self.resource_revision, self.render_scale)
+        changed |= ordinary and (not self._caption_services_match() or any(
+            getattr(Painter, name) is not original for name, original in _CAPTION_PAINTER_METHODS
+        ))
+        if changed:
+            # This also covers metric changes during overflow/elision. Retry
+            # only these immutable primitives, never the control's paint hook.
+            self._metrics.clear()
+            self._metric_bytes = 0
+            self._text_layout_cache.clear()
+            if _retry:
+                raise RuntimeError("Native text services changed repeatedly while drawing captions")
+            self._resolve_captions(_retry=True)
+            return
+        for commands, index, output in reversed(replacements):
+            commands[index:index + 1] = output
+
     def _store_metric(
         self, text: str, size: float, mono: bool, result: _Metric
     ) -> _Metric:
@@ -418,6 +577,8 @@ class NativeHost(NativeServices):
         previous = self._metrics.pop(key, None)
         if previous is not None:
             self._metric_bytes -= previous[1]
+            if previous[0] != result:
+                self._text_layout_cache.clear()
         while self._metrics and (
             len(self._metrics) >= 16384 or self._metric_bytes + cost > 16 * 1024 * 1024
         ):
@@ -563,7 +724,7 @@ class NativeHost(NativeServices):
     def reload_image(self, source: str) -> None:
         info = self._request("reload_image", source=_image_source(source))
         self.info.update(cast(Mapping[str, object], info))
-        self._accept_viewport(self.info)
+        self._accept_viewport(self.info, image_only=True)
 
     def sprite(
         self,
@@ -613,20 +774,45 @@ class NativeHost(NativeServices):
         self._present(scheduled=False)
 
     def _present(self, *, scheduled: bool) -> None:
+        self._resolve_captions()
         pending = self._scene_pending
+        background = pending.get("background") if pending is not None else None
+        op: str | None = None
+        fields: dict[str, object] = {}
         if pending is None:
-            self._request("frame", commands=self._commands, transition_seconds=self._transition_seconds)
-            self._scene_background = None
-        else:
-            if (pending["upsert"] or pending["remove"]
-                    or "order" in pending or "background" in pending):
-                self._request("patch", **pending, transition_seconds=self._transition_seconds)
-                self._scene_background = pending.get("background", self._scene_background)
-            else:
-                # Runtime repaints share the native cap; deliberate low-level
-                # presents still complete immediately without a scene update.
-                self._request("present", scheduled=scheduled)
-            self._scene_pending = None
+            if not (self._scene_background is not None and not self._commands):
+                op, fields = "frame", {"commands": self._commands}
+        elif (pending["upsert"] or pending["remove"] or "order" in pending
+              or self._output is None or type(background) is not str
+              or background != self._scene_background):
+            # An empty update of an acknowledged background only needs replay.
+            # An explicit order, even [], still needs native validation.
+            op, fields = "patch", dict(pending)
+        submitted = False
+        if op is not None:
+            fields["transition_seconds"] = self._transition_seconds
+            output = _native_client._serialize_native_request(op, fields)
+            # An identical accepted patch is idempotent unless it removes IDs:
+            # removing a missing ID and inserting it is valid only the first time.
+            if output != self._output or (pending is not None and pending["remove"]):
+                self._request_output(op, output, **fields)
+                # Publish only acknowledged bytes. Failures leave recording and
+                # the last accepted output intact for a caller's retry.
+                self._output = output
+                submitted = True
+                # Keep the same retained-mode marker and freeze its wire value,
+                # without retaining an arbitrary str subclass and its attributes.
+                self._scene_background = str.__str__(background) if isinstance(background, str) else None
+        elif self._transition_seconds:
+            # Even an empty update must reject invalid transition values.
+            _native_client._serialize_native_request(
+                "frame", {"transition_seconds": self._transition_seconds}
+            )
+        if not submitted and (not scheduled or self._repaint_pending
+                              or (pending is None and self._scene_background is not None and not self._commands)):
+            self._request("present", scheduled=scheduled)
+        self._scene_pending = None
+        self._repaint_pending = False
         self._transition_seconds = 0.0
 
     def text_input(self, rect: Rect | None) -> None:
@@ -685,8 +871,12 @@ class NativeHost(NativeServices):
             self._opened = False
             self._commands.clear()
             self._scene_pending = self._segment = None
+            self._output = None
+            self._scene_background = None
+            self._repaint_pending = False
             self._metrics.clear()
             self._metric_bytes = 0
+            self._text_layout_cache.clear()
 
 
 class NativeTermTextHost(NativeHost):
@@ -712,3 +902,16 @@ class NativeTermTextHost(NativeHost):
     ) -> list[_Metric]:
         from ._term_cells import safe_text
         return super().measure_many(tuple(safe_text(text) for text in texts), size, mono)
+
+
+# Capture every host service used by caption text and icon strokes.
+_CAPTION_SERVICES = {
+    kind: tuple(
+        (name, getattr(kind, name))
+        for name in ("measure", "measure_many", "text", "icon", "lines", "line")
+    )
+    for kind in (NativeHost, NativeTermTextHost)
+}
+
+
+_HOST_REQUEST = NativeHost._request

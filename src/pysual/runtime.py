@@ -24,7 +24,7 @@ from .host import (
     optional_host, read_native_stats,
 )
 from .input import Router
-from .layout import _clear_measurements, _measure_environment, arrange
+from .layout import _clear_measurements, _measure_environment, _refresh_measure_resources, arrange
 from .motion import Motion
 from . import painting as _painting
 from .render_cache import RenderCache
@@ -163,7 +163,9 @@ class Runtime:
                 if self._pending_size.get(axis) == acknowledged[axis]:
                     self._pending_size.pop(axis, None)
             if axis not in self._pending_size:
-                self.app._values[axis] = actual
+                stored = self.app._values[axis]
+                if stored != actual or type(stored) is not type(actual):
+                    self.app._values[axis] = actual
         if previous != self.viewport:
             if previous.scale != self.viewport.scale:
                 self.render_cache.clear()
@@ -276,6 +278,8 @@ class Runtime:
 
     def _layout_pending(self) -> bool:
         environment = _measure_environment(self.host)
+        if self._measure_host is self.host and environment == self._measure_environment:
+            _refresh_measure_resources(self.app, self.host)
         return (
             self._force_layout
             or self._measure_host is not self.host
@@ -296,6 +300,10 @@ class Runtime:
             self._measure_host = self.host
             self._measure_environment = environment
             self._force_layout = True
+        else:
+            # arrange() clears all measurements on host/metric changes. Only
+            # resource-only changes need the selective dependency traversal.
+            _refresh_measure_resources(app, self.host)
         # Consume only propagated hit-policy paths before arrangement can clear
         # their ancestors. Focus/capture reconcile below uses the current policy,
         # independently of whether this frame also changes sibling geometry.
@@ -522,7 +530,10 @@ class Runtime:
                     if owner.popup is not None:
                         owner.popup.dismiss(restore_focus=False)
                     owner.invalidate()
-                app._values["width"], app._values["height"] = self.host.size
+                width, height = self.host.size
+                if (app._values["width"] != width or type(app._values["width"]) is not type(width)
+                        or app._values["height"] != height or type(app._values["height"]) is not type(height)):
+                    app._values["width"], app._values["height"] = width, height
                 self._sync_viewport()
                 app._attach_dispatcher(self.dispatcher)
                 self._paint_frame()
@@ -598,10 +609,19 @@ class Runtime:
         from ._engine import critical_phase
 
         engine = get_engine()
+        pending: deque[Input] = deque()
         while not self._stop.is_set():
             self._wake_event.clear()
             self.dispatcher.raise_errors()
-            for event in self.host.poll():
+            if not pending:
+                pending.extend(self.host.poll())
+            input_deadline = perf_counter() + 0.004
+            handler_budget = min(64, max(1, (self.dispatcher.limit or 128) // 2))
+            for index in range(min(64, len(pending))):
+                if index and (perf_counter() >= input_deadline
+                              or self.dispatcher.pending >= handler_budget):
+                    break
+                event = pending.popleft()
                 self.hints.observe(event)
                 if event.kind == "error":
                     raise RuntimeError(event.text)
@@ -619,11 +639,8 @@ class Runtime:
                     self._suspend(event.kind == "suspend")
                 elif not self.suspended and not self._native_blockers:
                     self._process_input(event)
-            # Serve worker-thread requests queued so far before deciding on a
-            # frame: a burst of property writes from another thread then lands
-            # in one scene update instead of each write waiting behind a frame.
-            # Only requests present now are served, so a frame is never
-            # postponed indefinitely by a busy producer.
+            # Share the dispatcher's bounded slice so queued worker writes
+            # can join this frame without monopolizing the owner thread.
             engine.drain_pending()
             prepared_changed, prepared_seconds = False, 0.0
             if perf_counter() >= self._next_frame_at():
@@ -642,10 +659,15 @@ class Runtime:
             if rendered:
                 with critical_phase("layout and paint"):
                     self._paint_frame(prepared_changed, prepared_seconds)
-            if getattr(self.host, "event_driven", False):
+            if pending:
+                # Yield between slices even when no frame is due. Keep every
+                # sample, and do not poll another batch ahead of this one.
+                delay = 0.0
+            elif getattr(self.host, "event_driven", False):
                 deadline = min(
                     self._next_frame_at(),
                     self.hints.next_deadline if not self.suspended else inf,
+                    perf_counter() + getattr(self.host, "next_poll_delay", inf),
                 )
                 delay = max(0.0, deadline - perf_counter())
             else:

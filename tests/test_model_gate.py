@@ -6,7 +6,11 @@ import threading
 from types import SimpleNamespace
 import unittest
 
-from pysual import Container, Label
+from _ui_testcase import UIOwnerTestCase
+from test_retained_paint import PatchRecordingHost
+from test_library import RecordingHost
+
+from pysual import App, Container, Control, Label, Rect, dark
 from pysual._engine import (
     DispatchTimeout,
     Engine,
@@ -14,9 +18,12 @@ from pysual._engine import (
     call,
     capture_origin,
     check_origin,
+    get_engine,
     is_ui_thread,
 )
 from pysual.errors import LifecycleError
+from pysual.layout import arrange
+from pysual.painting import Painter, RetainedPaintTree, paint_tree
 
 
 class OriginGuardTests(unittest.TestCase):
@@ -132,11 +139,78 @@ class WorkerAccessTests(unittest.TestCase):
         self.assertEqual([call(lambda l=l: l.text) for l in labels], ["49", "1049"])
 
 
+class PainterStyleAccessTests(unittest.TestCase):
+    def painter(self, control):
+        return Painter(RecordingHost(), Rect(0, 0, 100, 32), dark(), control)
+
+    def test_fresh_painter_rejects_disposed_control(self):
+        label = Label(text="Disposed")
+        label.destroy()
+        with self.assertRaisesRegex(LifecycleError, "disposed"):
+            self.painter(label).style()
+
+    def test_fresh_painter_rejects_stale_origin_after_window_reopens(self):
+        app = App()
+        self.addCleanup(app.destroy)
+        label = Label(parent=app)
+
+        def reopen():
+            app._presentation, app._generation = object(), 1
+            origin = capture_origin(label)
+            app._presentation, app._generation = object(), 2
+            label.foreground = "#123456"
+            return origin
+
+        origin = call(reopen)
+        token = _origin.set(origin)
+        try:
+            with self.assertRaisesRegex(LifecycleError, "old UI invocation"):
+                self.painter(label).style()
+        finally:
+            _origin.reset(token)
+
+    def test_custom_liveness_runs_on_owner_before_style_is_cached(self):
+        threads = []
+
+        class Audited(Label):
+            def _check_live(self):
+                threads.append(threading.get_ident())
+                super()._check_live()
+
+        label = Audited(text="Audited")
+        self.addCleanup(label.destroy)
+        painter = self.painter(label)
+        threads.clear()
+        with ThreadPoolExecutor(1) as pool:
+            style = pool.submit(painter.style).result(5)
+        owner = call(threading.get_ident)
+        self.assertTrue(threads and all(ident == owner for ident in threads))
+        before = len(threads)
+        self.assertIs(painter.style(), style)
+        self.assertEqual(len(threads), before)
+
+
 class DrainPendingTests(unittest.TestCase):
     def make_engine(self, **kwargs):
         engine = Engine(**kwargs)
         self.addCleanup(engine.shutdown)
         return engine
+
+    def test_independent_engine_does_not_replace_or_clear_the_ui_owner(self):
+        owner = get_engine()
+        independent = self.make_engine()
+        self.assertEqual(
+            owner.call(lambda: (is_ui_thread(), owner.is_ui_thread(), independent.is_ui_thread())),
+            (True, True, False),
+        )
+        self.assertEqual(
+            independent.call(lambda: (is_ui_thread(), owner.is_ui_thread(), independent.is_ui_thread())),
+            (False, False, True),
+        )
+        self.assertEqual(independent.call(lambda: independent.call(lambda: "nested")), "nested")
+        independent.shutdown()
+        self.assertTrue(owner.call(is_ui_thread))
+        self.assertEqual(owner.call(lambda: owner.call(lambda: "nested")), "nested")
 
     def test_drain_pending_serves_requests_queued_before_entry_in_order(self):
         engine = self.make_engine()
@@ -295,6 +369,51 @@ class DrainPendingTests(unittest.TestCase):
         engine.call(lambda: None)
         self.assertEqual(observed, ["caller"])
         self.assertIsInstance(engine.loop, asyncio.AbstractEventLoop)
+
+
+class RetainedPaintAccessTests(UIOwnerTestCase):
+    def paint_reader(self, target):
+        class Reader(Control):
+            def paint(self, painter):
+                self._observed = self._target.text
+
+        root = Container(width=640, height=400)
+        self.addCleanup(root.destroy)
+        reader = Reader(parent=root, width=100, height=50)
+        reader._target = target
+        host = PatchRecordingHost()
+        arrange(root, host)
+        retained = RetainedPaintTree(host)
+        self.addCleanup(retained.clear)
+        paint_tree(root, host, retained=retained)
+
+    def test_retained_paint_rejects_stale_origin_reads_of_another_window(self):
+        foreign = App()
+        self.addCleanup(foreign.destroy)
+        foreign._presentation, foreign._generation = object(), 1
+        target = Label(parent=foreign, text="new opening")
+        old_origin = capture_origin(target)
+        foreign._presentation, foreign._generation = object(), 2
+        token = _origin.set(old_origin)
+        try:
+            with self.assertRaisesRegex(LifecycleError, "old UI invocation"):
+                self.paint_reader(target)
+        finally:
+            _origin.reset(token)
+
+    def test_retained_paint_preserves_instance_liveness_hooks(self):
+        target = Label(text="guarded")
+        self.addCleanup(target.destroy)
+
+        def reject():
+            raise LifecycleError("instance liveness hook")
+
+        target._check_live = reject
+        try:
+            with self.assertRaisesRegex(LifecycleError, "instance liveness hook"):
+                self.paint_reader(target)
+        finally:
+            del target._check_live
 
 
 if __name__ == "__main__":

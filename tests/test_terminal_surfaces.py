@@ -1,13 +1,14 @@
 """Cached terminal paint must produce the same complete cells as direct paint."""
 
 import unittest
+from unittest.mock import patch
 
 from _terminal import MemoryTerminal
 from _ui_testcase import UIOwnerTestCase
 
 from pysual import App, Button, Container, Label, Rect, Style, TextBox
 from pysual._png import encode_png
-from pysual.backends._term_cells import CellRenderer
+from pysual.backends._term_cells import Cell, CellRenderer
 from pysual.backends.term_text import TermTextHost
 from pysual.backends.terminal import TerminalHost
 from pysual.image_resources import image_source
@@ -140,6 +141,36 @@ class CellSurfaceTests(unittest.TestCase):
         self.assertEqual(surface.backdrop, [])
         self.assertEqual(surface.cells, [])
 
+    def test_background_storage_is_bounded_and_eviction_preserves_surface_equality(self):
+        direct, cached = self.renderer(), self.renderer()
+        bounds = Rect(40, 32, 80, 32)
+        original = "#112233"
+        cached.begin(original)
+        surface = cached.surface_create(bounds)
+        cached.surface_begin(surface)
+        cached.text("好 stable", 40, 32, "#fff", 16)
+        cached.surface_end()
+        for index in range(24):
+            color = f"#{index:02x}3456"
+            cached.begin(color)
+            self.assertLessEqual(len(cached._background_cells), 8)
+            self.assertTrue(all(cell.background == (index, 52, 86)
+                                for cell in cached.cells))
+            self.assertFalse(cached.surface_matches(surface))
+        cached.begin(original)
+        self.assertLessEqual(len(cached._background_cells), 8)
+        # The original value was evicted, so value equality must remain a full
+        # correctness fallback for old surfaces; identity is only a shortcut.
+        self.assertIsNot(cached.cells[0], surface.backdrop[0])
+        self.assertTrue(cached.surface_matches(surface))
+        cached.clip(None)
+        cached.surface_blit(surface)
+        direct.begin(original)
+        direct.clip(bounds)
+        direct.text("好 stable", 40, 32, "#fff", 16)
+        self.assertEqual(cached.cells, direct.cells)
+        self.assertEqual(cached._ink, direct._ink)
+
 
 class TerminalRenderCacheTests(UIOwnerTestCase):
     def setUp(self):
@@ -157,6 +188,112 @@ class TerminalRenderCacheTests(UIOwnerTestCase):
         paint_tree(self.app, self.host)
         self.assertEqual(cells, self.host._renderer.cells)
         self.assertEqual(ink, self.host._renderer._ink)
+
+    def test_idle_frame_reuses_immutable_cells_without_equality_work_or_output(self):
+        Label(parent=self.app, text="Stable 好 e\u0301", left=40, top=32,
+              width=160, height=32)
+        arrange(self.app, self.host)
+        for _ in range(3):
+            paint_tree(self.app, self.host, cache=self.cache)
+        before = tuple(self.host._renderer.cells), bytes(self.host._renderer._ink)
+        self.host.io.output.clear()
+        comparisons = []
+        compare = Cell.__eq__
+
+        def counted(left, right):
+            comparisons.append(1)
+            return compare(left, right)
+
+        with patch.object(Cell, "__eq__", counted):
+            paint_tree(self.app, self.host, cache=self.cache)
+        self.assertEqual(comparisons, [])
+        self.assertEqual(self.host.io.output, [])
+        self.assertEqual(before, (tuple(self.host._renderer.cells),
+                                  bytes(self.host._renderer._ink)))
+        self.assert_matches_direct()
+
+    def test_cached_frame_matches_direct_after_background_change_and_resize(self):
+        Label(parent=self.app, text="界 overlapping", left=40, top=32,
+              width=160, height=32)
+        arrange(self.app, self.host)
+        for _ in range(3):
+            self.assert_matches_direct()
+        for color in ("#334455", "#aa440088", "#334455"):
+            self.app.theme = self.app.theme.derive(background=color)
+            arrange(self.app, self.host)
+            self.assert_matches_direct()
+        self.host.features.columns, self.host.features.rows = 50, 14
+        self.host._geometry()
+        arrange(self.app, self.host)
+        self.assert_matches_direct()
+
+    def test_returning_to_a_cached_background_keeps_idle_comparisons_bounded(self):
+        Label(parent=self.app, text="Retained text", left=40, top=32,
+              width=160, height=32)
+        arrange(self.app, self.host)
+        for _ in range(3):
+            paint_tree(self.app, self.host, cache=self.cache)
+        original = self.app.theme
+        changed = original.derive(background="#304050")
+        for theme in (changed, original, changed, original):
+            self.app.theme = theme
+            arrange(self.app, self.host)
+            paint_tree(self.app, self.host, cache=self.cache)
+        for _ in range(3):
+            paint_tree(self.app, self.host, cache=self.cache)
+        comparisons = []
+        compare = Cell.__eq__
+
+        def counted(left, right):
+            comparisons.append(1)
+            return compare(left, right)
+
+        with patch.object(Cell, "__eq__", counted):
+            paint_tree(self.app, self.host, cache=self.cache)
+        self.assertEqual(comparisons, [])
+        self.assert_matches_direct()
+
+    def test_private_custom_state_invalidates_cached_terminal_drawing(self):
+        class CustomCaption(Label):
+            def _initialize(self):
+                super()._initialize()
+                self._caption = "Before 界"
+
+            def paint(self, painter):
+                painter.text(self._caption, 0, 0)
+
+        # The partially overlapping wide glyph exercises surface padding and
+        # backdrop composition in the same path as ordinary custom drawing.
+        Label(parent=self.app, text="好 backdrop", left=32, top=32,
+              width=160, height=32)
+        custom = CustomCaption(parent=self.app, left=40, top=32,
+                               width=160, height=32, cache_paint=True)
+        arrange(self.app, self.host)
+        for _ in range(3):
+            self.assert_matches_direct()
+        custom._caption = "After e\u0301"
+        custom.invalidate()
+        self.assert_matches_direct()
+        self.assertIn("After", "\n".join(self.host._renderer.snapshot_rows()))
+
+    def test_uncached_custom_callbacks_still_run_on_every_terminal_frame(self):
+        class PerFrameCaption(Label):
+            def _initialize(self):
+                super()._initialize()
+                self._paint_calls = 0
+
+            def paint(self, painter):
+                self._paint_calls += 1
+                painter.text(f"Frame {self._paint_calls}", 0, 0)
+
+        custom = PerFrameCaption(parent=self.app, width=160, height=32,
+                                 cache_paint=False)
+        arrange(self.app, self.host)
+        for expected in range(1, 5):
+            paint_tree(self.app, self.host, cache=self.cache)
+            self.assertEqual(custom._paint_calls, expected)
+            self.assertIn(f"Frame {expected}",
+                          "\n".join(self.host._renderer.snapshot_rows()))
 
     def test_stable_editor_and_label_survive_unrelated_and_backdrop_changes(self):
         panel = Container(parent=self.app, width=320, height=192, background="#884400")

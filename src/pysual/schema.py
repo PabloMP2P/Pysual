@@ -6,10 +6,11 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, fields, is_dataclass, replace
 from difflib import get_close_matches
 from enum import IntFlag, auto
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from math import isfinite
 import sys
 from types import MappingProxyType, UnionType
+from weakref import ReferenceType, ref
 from typing import (
     Any,
     ClassVar,
@@ -29,6 +30,7 @@ if sys.version_info >= (3, 14):
 
 from .errors import LifecycleError, SchemaError
 from ._value_bag import _ValueBag, _replaced_bag
+from ._transient import _TransientStateMixin
 from ._engine import (
     call,
     check_origin,
@@ -320,49 +322,109 @@ def _init_argument(
     return default
 
 
+_FROZEN_FIELDS: dict[
+    int, tuple[ReferenceType[type[object]], tuple[str, ...] | None]
+] = {}
+_SCALAR = 0
+_UNION = 1
+_LITERAL = 2
+_REPEAT = 3
+_FIXED = 4
+_RECORD = 5
+_BAD = 6
+
+
+def _frozen_fields(kind: type[object]) -> tuple[str, ...] | None:
+    """Reuse field names without extending a class's lifetime."""
+    identity = id(kind)
+    slot = _FROZEN_FIELDS.get(identity)
+    if slot is not None and slot[0]() is kind:
+        return slot[1]
+    names = None
+    if is_dataclass(kind) and getattr(kind, "__dataclass_params__").frozen:
+        names = tuple(f.name for f in fields(kind))
+    def discard(dead: ReferenceType[type[object]]) -> None:
+        current = _FROZEN_FIELDS.get(identity)
+        if current is not None and current[0] is dead:
+            del _FROZEN_FIELDS[identity]
+
+    # WeakKeyDictionary still hashes and compares its keys. Identity keys also
+    # support classes with unhashable or value-comparing metaclasses.
+    _FROZEN_FIELDS[identity] = (ref(kind, discard), names)
+    return names
+
+
 def _immutable(value: object) -> bool:
     if value is None or type(value) in (str, bool, int, float):
         return True
     if isinstance(value, tuple):
         return all(_immutable(item) for item in cast(tuple[object, ...], value))
-    if (
-        is_dataclass(value)
-        and not isinstance(value, type)
-        and getattr(type(value), "__dataclass_params__").frozen
-    ):
-        return all(_immutable(getattr(value, f.name)) for f in fields(value))
-    return False
+    names = _frozen_fields(type(value))
+    if names is None:
+        return False
+    return all(_immutable(getattr(value, name)) for name in names)
 
 
-def valid_type(value: object, annotation: Any) -> bool:
-    if type(value) is float and not isfinite(value):
-        raise ValueError("Property numbers must be finite")
+def _compile(annotation: Any) -> tuple[object, ...]:
+    """Build a field-owned checker; hot checks skip get_origin/get_args."""
     origin, args = get_origin(annotation), get_args(annotation)
     if origin in (Union, UnionType):
-        return any(valid_type(value, t) for t in args)
-    if origin is Literal:
-        # bool and int compare equal in Python, but describe distinct choices.
-        return any(type(value) is type(choice) and value == choice for choice in args)
-    if origin is tuple:
-        if not isinstance(value, tuple):
-            return False
-        items = cast(tuple[object, ...], value)
+        compiled: tuple[object, ...] = (_UNION, tuple(_compile(arg) for arg in args))
+    elif origin is Literal:
+        compiled = (_LITERAL, args)
+    elif origin is tuple:
         if len(args) == 2 and args[1] is Ellipsis:
-            return all(valid_type(item, args[0]) for item in items)
-        return len(args) == len(items) and all(
-            valid_type(item, kind) for item, kind in zip(items, args)
-        )
-    if annotation in (str, bool, int, float, type(None)):
-        return type(value) is annotation or (annotation is float and type(value) is int)
-    if (
+            compiled = (_REPEAT, _compile(args[0]))
+        else:
+            compiled = (_FIXED, tuple(_compile(arg) for arg in args))
+    elif annotation in (str, bool, int, float, type(None)):
+        compiled = (_SCALAR, annotation)
+    elif (
         isinstance(annotation, type)
         and is_dataclass(annotation)
         and getattr(annotation, "__dataclass_params__").frozen
     ):
+        compiled = (_RECORD, annotation)
+    else:
+        compiled = (_BAD, cast(object, annotation))
+    return compiled
+
+
+def _accept(value: object, checker: tuple[object, ...]) -> bool:
+    if type(value) is float and not isfinite(value):
+        raise ValueError("Property numbers must be finite")
+    kind = checker[0]
+    if kind == _SCALAR:
+        expected = checker[1]
+        return type(value) is expected or (expected is float and type(value) is int)
+    if kind == _UNION:
+        return any(_accept(value, option) for option in cast(tuple[tuple[object, ...], ...], checker[1]))
+    if kind == _LITERAL:
+        # bool and int compare equal in Python, but describe distinct choices.
+        return any(
+            type(value) is type(choice) and value == choice
+            for choice in cast(tuple[object, ...], checker[1])
+        )
+    if kind == _REPEAT or kind == _FIXED:
+        if not isinstance(value, tuple):
+            return False
+        items = cast(tuple[object, ...], value)
+        if kind == _REPEAT:
+            item = cast(tuple[object, ...], checker[1])
+            return all(_accept(item_value, item) for item_value in items)
+        options = cast(tuple[tuple[object, ...], ...], checker[1])
+        return len(options) == len(items) and all(
+            _accept(item_value, option) for item_value, option in zip(items, options)
+        )
+    if kind == _RECORD:
         if not _immutable(value):
             raise SchemaError("Property dataclasses must contain only immutable values")
-        return isinstance(value, annotation)
-    raise SchemaError(f"Unsupported property type {annotation!r}; use immutable values")
+        return isinstance(value, cast(type[object], checker[1]))
+    raise SchemaError(f"Unsupported property type {checker[1]!r}; use immutable values")
+
+
+def valid_type(value: object, annotation: Any) -> bool:
+    return _accept(value, _compile(annotation))
 
 
 @dataclass(frozen=True)
@@ -370,6 +432,10 @@ class Field:
     name: str
     annotation: object
     definition: Property
+
+    @cached_property
+    def _checker(self) -> tuple[object, ...]:
+        return _compile(self.annotation)
 
     @property
     def serializable(self) -> bool:
@@ -427,24 +493,23 @@ class Field:
     def validate(self, value: object, *, previous: object = _UNVALIDATED) -> None:
         # Unchanged immutable tuple entries were already validated by this field.
         # Reuse that proof by identity; retain no cache or second copy of the data.
-        args = get_args(self.annotation)
+        checker = self._checker
         if value is previous:
             valid = True
         elif (
-            isinstance(value, tuple)
+            checker[0] == _REPEAT
+            and isinstance(value, tuple)
             and isinstance(previous, tuple)
-            and get_origin(self.annotation) is tuple
-            and len(args) == 2
-            and args[1] is Ellipsis
         ):
             current = cast(tuple[object, ...], value)
             prior = cast(tuple[object, ...], previous)
+            item = cast(tuple[object, ...], checker[1])
             valid = all(
-                (i < len(prior) and item is prior[i]) or valid_type(item, args[0])
-                for i, item in enumerate(current)
+                (i < len(prior) and entry is prior[i]) or _accept(entry, item)
+                for i, entry in enumerate(current)
             )
         else:
-            valid = valid_type(cast(object, value), self.annotation)
+            valid = _accept(cast(object, value), checker)
         subject = cast(object, value)
         if not valid:
             raise TypeError(
@@ -551,18 +616,22 @@ class _Slot:
             obj._validate_update(self.field.name, value)
         if old != value:
             obj._values[self.field.name] = value
-            obj._record_dirty(self.field.definition.affects)
+            obj._record_change(self.field, old, value)
             obj._changed(self.field, old, value)
 
 
 @dataclass_transform(
     kw_only_default=True, eq_default=False, field_specifiers=(prop, _init_argument)
 )
-class SchemaObject:
+class SchemaObject(_TransientStateMixin):
     _schema: ClassVar[Mapping[str, Field]] = MappingProxyType({})
     # Heterogeneous committed properties. The bag's stub types known keys, and
     # reads use dict's own lookup rather than a cast on every access.
     _values: _ValueBag
+
+    @property
+    def _visual_epoch(self) -> int:
+        return self._values._epoch
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
@@ -615,16 +684,19 @@ class SchemaObject:
         unknown = properties.keys() - self._schema.keys()
         if unknown:
             raise TypeError(unknown_name(sorted(unknown)[0], self._schema))
-        bag = _ValueBag()
+        values: dict[str, object] = {}
         for name, field in self._schema.items():
             value = properties.get(name, field.definition.default)
             field.validate(value)
-            bag[name] = value
+            values[name] = value
+        bag = _ValueBag(values)
         self._values = bag
         self._dirty = 0
         self._disposed = False
         self._initialize()
-        for name, value in bag.items():
+        # Initial normalization is part of the initial committed state.
+        self._values._epoch = 0
+        for name, value in self._values.items():
             self._validate_live_update(name, value)
             self._validate_update(name, value)
 
@@ -688,9 +760,20 @@ class SchemaObject:
         if not changes:
             return
         self._values = _replaced_bag(self._values, values)
+        self._record_changes(changes)
+        # A notification can measure or arrange immediately. All committed
+        # fields must have invalidated their dependents before the first hook.
         for field, old, value in changes:
-            self._record_dirty(field.definition.affects)
             self._changed(field, old, value)
+
+    def _record_changes(self, changes: list[tuple[Field, object, object]]) -> None:
+        """Account for an atomic commit before delivering its notifications."""
+        for field, old, value in changes:
+            self._record_change(field, old, value)
+
+    def _record_change(self, field: Field, old: object, value: object) -> None:
+        """Internal commit accounting, separate from overridable notifications."""
+        self._record_dirty(field.definition.affects)
 
     def _record_dirty(self, affects: Dirty) -> None:
         """Record committed property dirt before overridable notifications."""

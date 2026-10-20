@@ -1,6 +1,7 @@
 """Bounded text surfaces preserve whole-line shaping at native pixel scales."""
 
 from pathlib import Path
+import tempfile
 import unittest
 from uuid import uuid4
 
@@ -8,9 +9,6 @@ from pysual import App, Label, Rect
 from pysual.backends._native_client import native_executable
 from pysual.backends.native import NativeHost
 from test_native_window import bmp_pixels
-
-ROOT = Path(__file__).resolve().parents[1]
-
 
 @unittest.skipUnless(native_executable().is_file(), "Build the native helper")
 class NativeTextFragmentTests(unittest.TestCase):
@@ -35,7 +33,7 @@ class NativeTextFragmentTests(unittest.TestCase):
                         app.wait(2)
 
     def test_visible_pixels_match_whole_line_at_left_middle_and_end(self):
-        directory = ROOT / "work" / "text-fragments" / uuid4().hex
+        directory = Path(tempfile.gettempdir()) / "pysual-tests" / "text-fragments" / uuid4().hex
         directory.mkdir(parents=True)
         output = directory / "frame.bmp"
         self.addCleanup(directory.rmdir)

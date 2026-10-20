@@ -12,6 +12,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+from .._text_layout import TextLayoutCache
 from ..geometry import Rect
 from ..graphemes import boundaries
 from ..host import CapabilityError, Input, TextFile
@@ -193,12 +194,14 @@ class TermTextHost(TerminalSession):
         super().__init__(
             io=io, protocol="text", probe_timeout=probe_timeout, environ=environ
         )
+        self._text_layout_cache = TextLayoutCache()
         self.color = _color_mode(color, self._environ)
         self._renderer = CellRenderer(1, 1, monochrome=self.color == "none")
         self._last_cells: tuple[Cell, ...] | None = None
         self._prompt: _FilePrompt | None = None
         self._file_lock = asyncio.Lock()
         self._generation = 0
+        self.metrics_revision = 0
 
     def open(
         self,
@@ -214,11 +217,17 @@ class TermTextHost(TerminalSession):
             )
         super().open(title, width, height, resizable, scale)
 
+    def close(self) -> None:
+        self._text_layout_cache.clear()
+        super().close()
+
     def _reset_open_state(self) -> None:
         super()._reset_open_state()
+        self._text_layout_cache.clear()
         self._renderer._images.close()
         self._renderer._images = AsyncImageCache()
         self._generation += 1
+        self.metrics_revision += 1
         self._last_cells = None
         self._file_lock = asyncio.Lock()
 
@@ -243,6 +252,7 @@ class TermTextHost(TerminalSession):
         if changed or (self._renderer.columns, self._renderer.rows) != (columns, rows):
             self._renderer.resize(*size)
             self.resource_revision += 1
+            self.metrics_revision += 1
             self._last_cells = None
         return changed
 
@@ -447,6 +457,9 @@ class TermTextHost(TerminalSession):
             else tuple(self._renderer.cells)
         )
         if cells == self._last_cells:
+            # Surface admission may replace equal immutable cells. Retain the
+            # current objects so subsequent idle frames compare by identity.
+            self._last_cells = cells
             return
         changes = self._changes(cells)
         first = next(changes, None)

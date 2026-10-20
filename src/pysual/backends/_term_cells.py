@@ -182,6 +182,7 @@ class CellRenderer:
 
     MAX_CELLS = 1024 * 1024
     MAX_EDGE = 16384
+    _BACKGROUND_COLORS = 8
 
     def __init__(
         self,
@@ -203,6 +204,14 @@ class CellRenderer:
         self._images: ImageCache = ImageCache()
         self.resource_revision = 0
         self._background: RGB = (0, 0, 0)
+        # Cells are immutable. Keep one background value across unchanged
+        # frames so backdrop and presentation comparisons can reuse identity.
+        self._background_cell = Cell(background=self._background)
+        # Retained surfaces can survive a theme change and become reusable when
+        # its background returns. Keep only eight recent immutable blank cells.
+        self._background_cells: dict[RGB, Cell] = {
+            self._background: self._background_cell,
+        }
         self._origin_col = 0
         self._origin_row = 0
         self._target: _CellSurface | None = None
@@ -230,7 +239,7 @@ class CellRenderer:
             raise ValueError("Text framebuffer exceeds its 1 Mi-cell/16384 edge budget")
         self.columns, self.rows = columns, rows
         self.size = float(width), float(height)
-        self.cells = [Cell(background=self._background)] * (columns * rows)
+        self.cells = [self._background_cell] * (columns * rows)
         # 0 = decoration, 1 = text, 2 = image with stored upper/lower samples.
         self._ink = bytearray(columns * rows)
         self.resource_revision += 1
@@ -263,7 +272,15 @@ class CellRenderer:
 
     def begin(self, background: str) -> None:
         self._background = _over(_color(background), (0, 0, 0))
-        self.cells = [Cell(background=self._background)] * (self.columns * self.rows)
+        if self._background_cell.background != self._background:
+            cell = self._background_cells.get(self._background)
+            if cell is None:
+                cell = Cell(background=self._background)
+                if len(self._background_cells) >= self._BACKGROUND_COLORS:
+                    del self._background_cells[next(iter(self._background_cells))]
+                self._background_cells[self._background] = cell
+            self._background_cell = cell
+        self.cells = [self._background_cell] * (self.columns * self.rows)
         self._ink = bytearray(self.columns * self.rows)
         self.clip(None)
 
@@ -298,6 +315,9 @@ class CellRenderer:
         return left, top, right, bottom
 
     def clip(self, rect: Rect | None) -> None:
+        if rect is None and self._target is None:
+            self._clip = (0, 0, self.columns, self.rows)
+            return
         left, top, right, bottom = (
             (0, 0, self.columns, self.rows) if rect is None else self._box(rect)
         )

@@ -26,7 +26,6 @@ from .popup import Popup
 from .tree import TreeView
 from ._registry import register_control
 
-
 @dataclass(frozen=True)
 class BuiltinControl:
     name: str

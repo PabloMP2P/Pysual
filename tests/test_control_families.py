@@ -50,7 +50,9 @@ class ControlFamilyBoundaryTests(unittest.TestCase):
         self.assertIs(_Choices, ChoicesImplementation)
 
     def test_consumer_subclasses_resolve_inherited_annotations_after_source_moves(self):
-        for name, _, _ in _MOVED_CONTROLS:
+        # TextBox also publishes its module through the widgets facade; its
+        # private cache annotations must resolve for ordinary user subclasses.
+        for name in [entry[0] for entry in _MOVED_CONTROLS] + ["TextBox"]:
             with self.subTest(control=name):
                 base = getattr(pysual, name)
                 subclass = type(f"Client{name}", (base,), {

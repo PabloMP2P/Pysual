@@ -274,6 +274,13 @@ class BundledSVGHost(SVGRenderer):
         return float(cast(float, scale))
 
     @property
+    def metrics_revision(self) -> int:
+        # Older bridges only expose the combined font/viewport generation.
+        revision: object = getattr(self.bridge, "metricsRevision",
+                                   getattr(self.bridge, "resourceRevision", 0))
+        return self._metrics_revision + int(cast(int, revision))
+
+    @property
     def resource_revision(self) -> int:
         revision: object = getattr(self.bridge, "resourceRevision", 0)
         return self._resource_revision + int(cast(int, revision))

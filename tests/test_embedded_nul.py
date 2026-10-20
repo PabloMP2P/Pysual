@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
@@ -141,6 +142,23 @@ class EmbeddedNulPolicyTests(unittest.TestCase):
             send.assert_not_called()
         client.close()
 
+    def test_nonfinite_values_in_container_subclasses_are_rejected_before_startup(self):
+        class Commands(list):
+            pass
+
+        class Fields(dict):
+            pass
+
+        client = NativeClient()
+        self.addCleanup(client.close)
+        with patch.object(client, "_start") as start, patch.object(client, "_request") as send:
+            for value in (Commands([float("nan")]), Fields(number=float("inf")),
+                          [Fields(values=Commands([float("-inf")]))]):
+                with self.subTest(value=value), self.assertRaisesRegex(ValueError, "Out of range float"):
+                    client.request("configure", extra=value)
+            start.assert_not_called()
+            send.assert_not_called()
+
     def test_adapter_records_display_text_and_does_not_send_rejected_services(self):
         class Recorder:
             def __init__(self):
@@ -213,7 +231,7 @@ class NativeWindowEmbeddedNulTests(unittest.TestCase):
             hidden=True, vsync=False, scale=1, resizable=False,
             font_dir=str(PACKAGE / "assets"),
         )
-        self.directory = PACKAGE.parents[1] / "work" / "embedded-nul" / uuid4().hex
+        self.directory = Path(tempfile.gettempdir()) / "pysual-tests" / "embedded-nul" / uuid4().hex
         self.directory.mkdir(parents=True)
         self.output = self.directory / "frame.bmp"
         self.addCleanup(self.cleanup_capture)

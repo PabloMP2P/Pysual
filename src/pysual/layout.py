@@ -2,14 +2,15 @@
 
 from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from math import isfinite
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 
 from ._engine import ui_method
 from .controls import Container, Control
 from .geometry import Rect
 from .host import Host, text_row_height
-from .schema import _LAYOUT_MASK
+from .schema import Dirty, _LAYOUT_MASK
 
 
 class _LimitedMeasure(Protocol):
@@ -25,16 +26,33 @@ class _LimitedMeasure(Protocol):
 _TrackKind = Literal["fixed", "auto", "star"]
 _Size = tuple[float, float]
 _Demand = tuple[int, int, float]
+_NO_METRICS = object()
+
+
+@dataclass(slots=True)
+class _GridPlan:
+    """Owned, disposable placement data for declared fixed/star tracks.
+
+    The revision records structural changes at commit time. Allocated slots
+    depend on tracks and cell assignment; final boxes also depend on each
+    child's dimensions, constraints and margin, and update independently.
+    """
+    revision: int
+    area: Rect
+    # Insertion order supplies full traversal; indices order dirty subsets.
+    order: dict[Control, int]
+    slots: dict[Control, Rect]
+    boxes: dict[Control, Rect]
 
 
 @contextmanager
-def _measurement_rows(c: Control, host: Host) -> Generator[None, None, None]:
+def _measurement_rows(c: Control, host: Host) -> Generator[Control, None, None]:
     """Expose requested measurement metrics without changing arranged geometry."""
     root = c._root()
     previous = root._measurement_row_height
     root._measurement_row_height = text_row_height(host, 0.0)
     try:
-        yield
+        yield root
     finally:
         root._measurement_row_height = previous
 
@@ -42,7 +60,23 @@ def _measurement_rows(c: Control, host: Host) -> Generator[None, None, None]:
 def _size(
     c: Control, host: Host, *, width: float | None = None, height: float | None = None
 ) -> _Size:
-    with _measurement_rows(c, host):
+    # Each query observes its own host state: a custom parent can change
+    # metrics or resources before asking for another child in the same pass.
+    metrics = getattr(host, "metrics_revision", _NO_METRICS)
+    resources = getattr(host, "resource_revision", 0)
+    environment = _measure_environment(host, resources if metrics is _NO_METRICS else metrics)
+    root = c._root()
+    previous_rows = root._measurement_row_height
+    root._measurement_row_height = cast(float, environment[2])
+    try:
+        if metrics is not _NO_METRICS:
+            previous = root._measure_resource_context
+            if previous is None or previous[0] is not host or previous[1] != resources:
+                _refresh_measure_resources(root, host, resources)
+        elif root._measure_resource_context is not None:
+            # A legacy query can switch just one branch to another host. Clear
+            # siblings too before forgetting their resource baseline.
+            _clear_measurements(root)
         if c._measure_cache_host is not host:
             c._measure_cache.clear()
             c._measure_cache_host = host
@@ -54,7 +88,7 @@ def _size(
             ancestors.append((parent, parent._measure_local_revision, parent._rect))
             parent = parent._parent
         key = (
-            c._measure_revision, width, height, _measure_environment(host),
+            c._measure_revision, width, height, environment,
             c.effective_theme, tuple(ancestors),
             c.__dict__.get("measure", type(c).measure),
             c.__dict__.get("measure_available", type(c).measure_available),
@@ -68,7 +102,9 @@ def _size(
             # Hooks may invalidate during measurement. Do not commit that
             # result under an obsolete generation or after a resource change.
             if (not c._measure_uncached and c._measure_revision == key[0]
-                    and _measure_environment(host) == key[3]):
+                    and _measure_environment(host) == key[3]
+                    and (metrics is _NO_METRICS
+                         or getattr(host, "resource_revision", 0) == resources)):
                 entries.insert(0, (key, preferred))
                 del entries[4:]
         w, h = preferred
@@ -85,13 +121,77 @@ def _size(
             ),
         )
 
+    finally:
+        root._measurement_row_height = previous_rows
 
-def _measure_environment(host: Host) -> tuple[object, ...]:
+
+def _measure_environment(host: Host, revision: object = _NO_METRICS) -> tuple[object, ...]:
     """Host facts that can change preferred sizes without property writes."""
+    if revision is _NO_METRICS:
+        revision = getattr(host, "metrics_revision", _NO_METRICS)
+        if revision is _NO_METRICS:
+            revision = getattr(host, "resource_revision", 0)
     return (
-        getattr(host, "resource_revision", 0), getattr(host, "render_scale", 1),
+        revision,
+        getattr(host, "render_scale", 1),
         text_row_height(host, 0.0), tuple(host.size), getattr(host, "viewport", None),
     )
+
+
+def _refresh_measure_resources(
+    root: Control, host: Host, resources: object = _NO_METRICS,
+) -> None:
+    """Invalidate resource-dependent queries and their cached ancestors once.
+
+    Hosts without separate metrics retain the original full environment key.
+    Walk only on a resource transition; do not keep a registry of custom types
+    or instances. Direct _size calls use the same path as runtime layout.
+    """
+    if resources is _NO_METRICS:
+        if not hasattr(host, "metrics_revision"):
+            if root._measure_resource_context is not None:
+                _clear_measurements(root)
+            return
+        resources = getattr(host, "resource_revision", 0)
+    previous = root._measure_resource_context
+    if previous is not None and previous[0] is host and previous[1] == resources:
+        return
+    if previous is not None and previous[0] is not host:
+        _clear_measurements(root)
+    root._measure_resource_context = (host, resources)
+    if previous is None or previous[0] is not host:
+        return
+
+    from ._paint_state import measurement_uses_resources
+
+    nodes: list[Control] = []
+    pending = [root]
+    while pending:
+        control = pending.pop()
+        nodes.append(control)
+        if isinstance(control, Container):
+            pending.extend(control._children)
+    affected: set[Control] = set()
+    for control in reversed(nodes):
+        local = measurement_uses_resources(control)
+        if not local and control not in affected:
+            continue
+        control._measure_revision += 1
+        control._measure_cache.clear()
+        if isinstance(control, Container):
+            # Arrangers can read resources independently of preferred sizes,
+            # including through a captured host. Always run their normal hooks.
+            control._dirty = int(control._dirty) | int(Dirty.MEASURE)
+            if local:
+                control._layout_valid = False
+                control._layout_plan = None
+        # Leaves still remeasure when their parent requests their size. Reuse
+        # placement only when that actual result produces the same geometry;
+        # place() checks the rectangle, clips and all pre-existing layout dirt.
+        parent = control._parent
+        if parent is not None:
+            affected.add(parent)
+            parent._layout_children_dirty.add(control)
 
 
 def _clear_measurements(root: Control) -> None:
@@ -101,17 +201,24 @@ def _clear_measurements(root: Control) -> None:
         c = pending.pop()
         c._measure_cache.clear()
         c._measure_cache_host = None
+        c._measure_resource_context = None
         c._measure_revision += 1
         c._layout_valid = False
         c._layout_measure_host = None
         c._layout_measure_environment = None
+        if isinstance(c, Container):
+            c._layout_plan = None
+            c._layout_children_dirty.clear()
+            c._layout_span = None
         pending.extend(getattr(c, "_children", ()))
 
 
 def _clamp(value: float, minimum: float, maximum: float | None) -> float:
-    if maximum is not None and maximum < minimum:
+    if maximum is None:
+        return max(minimum, value)
+    if maximum < minimum:
         raise ValueError("Maximum size cannot be smaller than minimum")
-    return max(minimum, min(value, maximum if maximum is not None else value))
+    return max(minimum, min(value, maximum))
 
 
 def _grid_cells(
@@ -620,6 +727,55 @@ def _absolute_box(
     return Rect(area.x + left, area.y + top, w, h)
 
 
+def _grid_slots(
+    c: Container,
+    normal: Sequence[Control],
+    area: Rect,
+    spacing: float,
+    measure: _LimitedMeasure,
+) -> Generator[tuple[Control, Rect], None, None]:
+    """Allocate track spans before applying any child-local box constraints."""
+    cells, widths, heights = _grid_tracks(c, normal, measure, area)
+    lefts, tops = [area.x], [area.y]
+    for width in widths:
+        lefts.append(lefts[-1] + width + spacing)
+    for height in heights:
+        tops.append(tops[-1] + height + spacing)
+    for child, (row, col) in cells.items():
+        values = child._values
+        col_span, row_span = values["grid_col_span"], values["grid_row_span"]
+        yield child, Rect(
+            lefts[col], tops[row],
+            sum(widths[col:col + col_span]) + spacing * (col_span - 1),
+            sum(heights[row:row + row_span]) + spacing * (row_span - 1),
+        )
+
+
+def _grid_child_box(child: Control, slot: Rect) -> Rect:
+    """Apply exactly the child-local dependencies of a declared grid box."""
+    values = child._values
+    margin = values["margin"]
+    declared_width, declared_height = values["width"], values["height"]
+    width = declared_width if declared_width is not None else slot.width - margin * 2
+    height = declared_height if declared_height is not None else slot.height - margin * 2
+    return Rect(
+        slot.x + margin, slot.y + margin,
+        _clamp(max(0, width), values["min_width"], values["max_width"]),
+        _clamp(max(0, height), values["min_height"], values["max_height"]),
+    )
+
+
+def _grid_boxes(
+    c: Container,
+    normal: Sequence[Control],
+    area: Rect,
+    spacing: float,
+    measure: _LimitedMeasure,
+) -> dict[Control, Rect]:
+    return {child: _grid_child_box(child, slot)
+            for child, slot in _grid_slots(c, normal, area, spacing, measure)}
+
+
 def _declared_boxes(
     c: Container, area: Rect, measure: _LimitedMeasure
 ) -> dict[Control, Rect]:
@@ -703,37 +859,7 @@ def _declared_boxes(
                 boxes[x] = Rect(area.x + cursor + margin, area.y + margin, w, h)
             cursor += (h if vertical else w) + margin * 2 + spacing
     elif layout == "grid":
-        cells, widths, heights = _grid_tracks(c, normal, measure, area)
-        lefts, tops = [area.x], [area.y]
-        for width in widths:
-            lefts.append(lefts[-1] + width + spacing)
-        for height in heights:
-            tops.append(tops[-1] + height + spacing)
-        for x, (r, col) in cells.items():
-            child = x._values
-            margin = child["margin"]
-            declared_width, declared_height = child["width"], child["height"]
-            col_span, row_span = child["grid_col_span"], child["grid_row_span"]
-            w = (
-                declared_width
-                if declared_width is not None
-                else sum(widths[col : col + col_span])
-                + spacing * (col_span - 1)
-                - margin * 2
-            )
-            h = (
-                declared_height
-                if declared_height is not None
-                else sum(heights[r : r + row_span])
-                + spacing * (row_span - 1)
-                - margin * 2
-            )
-            boxes[x] = Rect(
-                lefts[col] + margin,
-                tops[r] + margin,
-                _clamp(max(0, w), child["min_width"], child["max_width"]),
-                _clamp(max(0, h), child["min_height"], child["max_height"]),
-            )
+        boxes = _grid_boxes(c, normal, area, spacing, measure)
     elif layout == "flow":
         boxes = _flow_boxes(c, normal, area, measure)
     elif layout == "dock":
@@ -786,6 +912,7 @@ def arrange(root: Control, host: Host) -> None:
         _clear_measurements(root)
         root._layout_measure_host = host
         root._layout_measure_environment = environment
+    _refresh_measure_resources(root._root(), host)
     row_height = text_row_height(host, 0.0)
     root._root()._fixed_row_height = row_height
     runtime = getattr(root._root(), "_runtime", None)
@@ -797,63 +924,128 @@ def arrange(root: Control, host: Host) -> None:
     def place(c: Control, rect: Rect, clip: Rect, effect_clip: Rect) -> None:
         intersection = rect.intersect(clip)
         theme = c._fast_theme()
-        if (
+        same_context = (
             c._layout_valid
             and c._rect == rect
             and c._clip == intersection
             and c._paint_clip == effect_clip
             and c._layout_theme == theme
             and c._layout_row_height == row_height
-            and not int(c._dirty) & _LAYOUT_MASK
-        ):
+        )
+        if (same_context and not c._measure_uncached
+                and not int(c._dirty) & _LAYOUT_MASK):
             return
+        # Arrangement can update private drawing state even when the outer
+        # rectangle stays fixed. Every placed control and its placed ancestors
+        # need fresh drawing; clean subtrees return above without advancing.
+        c._paint_revision += 1
+        if c is root and c._parent is not None:
+            # A direct subtree layout does not visit its owning ancestors.
+            # Their painters may still consume the subtree's arranged state.
+            ancestor: Control | None = c._parent
+            while ancestor is not None:
+                ancestor._paint_revision += 1
+                ancestor = ancestor._parent
+            if retained is not None:
+                retained.invalidate(c, Dirty.PAINT)
         if retained is not None:
             retained.layout_changed(c)
         if router is not None and hasattr(router, "layout_control"):
             router.layout_control(c)
         c._rect, c._clip = rect, intersection
-        if c._layout_row_height != row_height:
-            c._paint_revision += 1
         c._layout_row_height = row_height
         c._paint_clip = effect_clip
         c._layout_valid, c._layout_theme = True, theme
         c._dirty = 0
         if not isinstance(c, Container):
             return
-        parent_box = c
-        children = [
-            x for x in parent_box._children
-            if x._values["visible"] and not x._disposed
-        ]
+        pending = tuple(c._layout_children_dirty)
+        c._layout_children_dirty.clear()
+        try:
+            place_children(c, rect, effect_clip, not same_context, pending)
+        except BaseException:
+            # Failed/custom layout is retryable. Never publish a clean tree
+            # after consuming the only path to a descendant that needs work.
+            c._layout_valid = False
+            c._layout_children_dirty.update(pending)
+            c._dirty = int(c._dirty) | _LAYOUT_MASK
+            raise
+
+    def place_children(
+        c: Container, rect: Rect, effect_clip: Rect, context_changed: bool,
+        pending: tuple[Control, ...],
+    ) -> None:
 
         def measure_limited(
             child: Control, *, width: float | None = None, height: float | None = None
         ) -> _Size:
             return _size(child, host, width=width, height=height)
 
-        area = parent_box.content_bounds(rect)
-        normal = [x for x in children if not x._overlay]
-        custom = parent_box.arrange_children(area, measure_limited)
+        area = c.content_bounds(rect)
+        # Arbitrary extension hooks always run on an invalidated path. Only
+        # the framework's declared grid boxes carry the reuse contract below.
+        custom = c.arrange_children(area, measure_limited)
         # A custom arranger may settle its scrollbar gutters while measuring.
         # Clip children to that final viewport in the same layout pass.
-        children_clip = parent_box.content_bounds(rect).intersect(c._clip)
-        children_effect_clip = parent_box._child_effect_clip(
+        children_clip = c.content_bounds(rect).intersect(c._clip)
+        children_effect_clip = c._child_effect_clip(
             rect, children_clip, effect_clip
         )
-        boxes: dict[Control, Rect] = custom if custom is not None else {}
-        if custom is not None:
-            if set(custom) != set(normal):
-                raise ValueError(
-                    "arrange_children must provide every visible non-overlay child"
-                )
+        span = (children_clip, children_effect_clip, row_height)
+        stored = c._values
+        declared_grid = (custom is None and stored["layout"] == "grid"
+                         and "auto" not in stored["column_tracks"]
+                         and "auto" not in stored["row_tracks"])
+        plan = c._layout_plan
+        reusable = (declared_grid and plan is not None
+                    and plan.revision == c._layout_box_revision and plan.area == area)
+        children: Iterable[Control]
+        if reusable:
+            assert plan is not None
+            boxes = plan.boxes
+            # Hooks above may commit additional child geometry in this same
+            # pass. Include those paths while leaving their recorded dirt in
+            # place until the normal follow-up layout settles the hook.
+            if c._layout_children_dirty:
+                pending = tuple(set(pending) | c._layout_children_dirty)
+            for child in pending:
+                slot = plan.slots.get(child)
+                if slot is not None:
+                    boxes[child] = _grid_child_box(child, slot)
+            # No sibling scan, tuple signature, or box dictionary copy on this
+            # path. Dirt has propagated normally; its direct-child set tells
+            # us exactly which branches still require placement.
+            # Preserve tree order for custom hooks that observe earlier
+            # siblings, sorting only changed branches by cached positions.
+            children = (
+                sorted(pending, key=lambda child: plan.order.get(child, len(plan.order)))
+                if not context_changed and not c._measure_uncached and c._layout_span == span
+                else plan.order
+            )
         else:
-            boxes = _declared_boxes(parent_box, area, measure_limited)
+            children = tuple(x for x in c._children
+                             if x._values["visible"] and not x._disposed)
+            plan = None
+            if custom is not None:
+                if set(custom) != {x for x in children if not x._overlay}:
+                    raise ValueError(
+                        "arrange_children must provide every visible non-overlay child"
+                    )
+                boxes = custom
+            elif declared_grid:
+                normal = tuple(x for x in children if not x._overlay)
+                slots = dict(_grid_slots(c, normal, area, stored["spacing"], measure_limited))
+                boxes = {child: _grid_child_box(child, slot) for child, slot in slots.items()}
+                plan = _GridPlan(c._layout_box_revision, area,
+                                 {child: index for index, child in enumerate(children)},
+                                 slots, boxes)
+            else:
+                boxes = _declared_boxes(c, area, measure_limited)
         for x in children:
-            if x not in boxes:
-                boxes[x] = _absolute_box(x, area, measure_limited)
-            b = boxes[x]
+            if x._parent is not c or x._disposed or not x._values["visible"]:
+                continue
+            b = boxes[x] if x in boxes else _absolute_box(x, area, measure_limited)
             if not x._overlay:
-                stored = c._values
                 b = Rect(
                     b.x - (stored["scroll_x"] if "scroll_x" in stored else 0.0),
                     b.y - (stored["scroll_y"] if "scroll_y" in stored else 0.0),
@@ -861,6 +1053,8 @@ def arrange(root: Control, host: Host) -> None:
                     b.height,
                 )
             place(x, b, children_clip, children_effect_clip)
+        c._layout_plan = plan
+        c._layout_span = span
 
     try:
         viewport = Rect(0, 0, *host.size)
@@ -869,6 +1063,7 @@ def arrange(root: Control, host: Host) -> None:
         # The function recurses through its own closure cell. Clear that cell
         # or this layout pass stays reachable until cyclic collection.
         del place
+        del place_children
     runtime = getattr(root._root(), "_runtime", None)
     router = getattr(runtime, "router", None)
     if router is not None:

@@ -1,15 +1,23 @@
 """Retained scene updates stay local and compose like direct tree painting."""
 
+import gc
+import random
+from functools import wraps
+from collections import Counter
 from types import SimpleNamespace
+from weakref import ref
 from unittest.mock import patch
 
 from _ui_testcase import UIOwnerTestCase, ui_timeout
 from test_library import RecordingHost
 
 from pysual import App, Button, Container, Control, Dropdown, Label, Rect, ScrollArea, Style, get_theme
-from pysual import SplitPane, TabControl, TabPage
-from pysual.layout import arrange
+from pysual import ListView, SegmentedControl, SplitPane, TabControl, TabPage, TextBox, dark
+from pysual._paint_state import paint_inputs
+from pysual._text_layout import TextLayoutCache
+from pysual.layout import _clear_measurements, arrange
 from pysual.painting import RetainedPaintTree, paint_tree
+from pysual.render_cache import RenderCache
 from pysual.runtime import Runtime
 from pysual.schema import Dirty
 
@@ -91,7 +99,7 @@ class CountingButton(Button):
 
 class RetainedPaintTests(UIOwnerTestCase):
     def setUp(self):
-        self.app, self.host = App(width=640, height=400), PatchRecordingHost()
+        self.app, self.host = App(width=640, height=400, cache_paint=True), PatchRecordingHost()
         self.runtime = Runtime(self.app, self.host)
         self.app._runtime = self.runtime
         self.retained = self.runtime._retained_paint = RetainedPaintTree(self.host)
@@ -111,6 +119,26 @@ class RetainedPaintTests(UIOwnerTestCase):
         paint_tree(self.app, self.host, self.runtime.router.focus)
         self.assertEqual(retained, tuple(self.host._drawing))
 
+    def test_fixed_row_metric_change_repaints_unchanged_bounds(self):
+        self.host.text_row_height = 16
+        listing = ListView(parent=self.app, width=200, height=128,
+                           items=tuple(f"Row {index}" for index in range(12)))
+        self.frame(layout=True)
+        bounds = listing.bounds
+        self.assertEqual(sum(command[0] == "text" for command in self.host.snapshot()), 8)
+        for row_height, expected_rows in ((32, 4), (16, 8)):
+            with self.subTest(row_height=row_height):
+                self.host.text_row_height = row_height
+                listing.invalidate()
+                self.frame(layout=True)
+                self.assertEqual(listing.bounds, bounds)
+                self.assertIn(self.retained._records[listing].identity, self.host.updates)
+                self.assertEqual(sum(command[0] == "text" for command in self.host.snapshot()),
+                                 expected_rows)
+                self.assert_direct_matches()
+        self.frame()
+        self.assertEqual(self.host.updates, [])
+
     def test_batch_flush_keeps_local_changes_from_custom_invalidate(self):
         class StatusContainer(Container):
             def invalidate(self, affects=Dirty.PAINT):
@@ -123,15 +151,15 @@ class RetainedPaintTests(UIOwnerTestCase):
         parent = StatusContainer(parent=self.app, width=200, height=100)
         child = Button(parent=parent, text="Before", width=100, height=30)
         self.frame(layout=True)
-        before = parent._paint_local_revision
+        before = parent._paint_revision
         parent.update_children({child: {"text": "After"}})
         self.assertEqual(parent.background, "#ff0000")
-        self.assertGreater(parent._paint_local_revision, before)
+        self.assertGreater(parent._paint_revision, before)
         self.assertIn(parent, self.retained._dirty)
         self.frame(layout=True)
         self.assert_direct_matches()
 
-    def test_hover_and_focus_touch_only_changed_controls_without_clean_tree_reads(self):
+    def test_hover_and_focus_touch_changed_controls_and_ancestors_without_clean_tree_reads(self):
         controls = [CountingButton(parent=self.app, text=str(index), width=30, height=24,
                                    left=index % 20 * 31, top=index // 20 * 25)
                     for index in range(160)]
@@ -139,16 +167,24 @@ class RetainedPaintTests(UIOwnerTestCase):
         baseline = [(control._paints, control._theme_reads) for control in controls]
         self.runtime.router._set_hover(controls[31])
         self.frame()
-        self.assertEqual(len(self.host.updates), 1)
+        self.assertEqual(set(self.host.updates), {
+            self.retained._records[controls[31]].identity,
+            self.retained._records[self.app].identity,
+        })
         for index, control in enumerate(controls):
             if index != 31:
                 self.assertEqual((control._paints, control._theme_reads), baseline[index])
         self.runtime.router.set_focus(controls[31])
         self.frame()
-        self.assertEqual(len(self.host.updates), 1)
+        self.assertEqual(set(self.host.updates), {
+            self.retained._records[controls[31]].identity,
+        })
         self.runtime.router.set_focus(controls[32])
         self.frame()
-        self.assertEqual(len(self.host.updates), 2)
+        self.assertEqual(set(self.host.updates), {
+            self.retained._records[controls[31]].identity,
+            self.retained._records[controls[32]].identity,
+        })
         self.assert_direct_matches()
 
     def test_reflow_add_remove_and_visibility_reuse_stable_identity_and_unaffected_bodies(self):
@@ -250,6 +286,28 @@ class RetainedPaintTests(UIOwnerTestCase):
         self.frame()
         self.assertEqual(custom._paints, before)
 
+    def test_enabling_cache_after_restoring_builtin_hook_removes_uncached_admission(self):
+        label = Label(parent=self.app, text="Caption", cache_paint=False,
+                      width=120, height=30)
+        self.frame(layout=True)
+        original = Label.paint
+
+        def custom_paint(self, painter):
+            return original(self, painter)
+
+        with patch.object(Label, "paint", custom_paint):
+            label.invalidate()
+            self.frame()
+            self.frame()
+            self.assertIn(self.retained._records[label].identity, self.host.updates)
+        # Enabling the cache must revoke uncached admission even when restoring
+        # the original implementation makes the control a built-in again.
+        label.cache_paint = True
+        self.frame()
+        self.assert_direct_matches()
+        self.frame()
+        self.assertEqual(self.host.updates, [])
+
     def test_inherited_enabled_and_resource_changes_refresh_descendants(self):
         parent = Container(parent=self.app, width=180, height=100)
         button = CountingButton(parent=parent, text="Child", width=100, height=30)
@@ -282,7 +340,7 @@ class RetainedPaintTests(UIOwnerTestCase):
                     self.assertEqual(outside._paints, outside_paints)
                     self.assert_direct_matches()
 
-    def test_scrollbar_extent_updates_after_child_resize_without_repainting_on_hover(self):
+    def test_scrollbar_updates_with_child_and_preserves_unrelated_bodies(self):
         scroll = ScrollArea(parent=self.app, width=200, height=100)
         child = Button(parent=scroll, text="Child", width=100, height=40)
         outside = CountingButton(parent=self.app, left=250, width=140, height=30)
@@ -297,9 +355,11 @@ class RetainedPaintTests(UIOwnerTestCase):
                 self.assertEqual(outside._paints, outside_paints)
                 self.assertEqual(scroll._scroll_limits[1] > 0, height > 100)
                 self.assert_direct_matches()
+        outside_paints = outside._paints
         self.runtime.router._set_hover(child)
         self.frame()
-        self.assertNotIn(identity, self.host.updates)
+        self.assertIn(identity, self.host.updates)
+        self.assertEqual(outside._paints, outside_paints)
         self.assert_direct_matches()
 
     def test_split_divider_tracks_child_size_constraints_and_visibility(self):
@@ -382,7 +442,7 @@ class RetainedPaintTests(UIOwnerTestCase):
         self.assert_direct_matches()
 
     def test_drag_feedback_follows_children_and_is_removed_on_target_change(self):
-        parent = Container(parent=self.app, width=180, height=100)
+        parent = Container(parent=self.app, width=180, height=100, cache_paint=True)
         Button(parent=parent, text="Child", width=100, height=30)
         other = Button(parent=self.app, text="Other", left=250, width=100, height=30)
         self.frame(layout=True)
@@ -486,6 +546,131 @@ class RetainedPaintTests(UIOwnerTestCase):
         self.assertIn(removed_id, self.host.removed)
         self.assert_direct_matches()
 
+    def test_clean_builtin_body_stays_on_host_and_explicit_invalidation_repaints(self):
+        label = Label(parent=self.app, text="Same", width=80, height=24)
+        self.frame(layout=True)
+        self.assertTrue(self.host.updates)
+        self.frame()
+        self.assertEqual(self.host.updates, [])
+        label.invalidate()
+        self.frame()
+        self.assertIn(self.retained._records[label].identity, self.host.updates)
+        self.assert_direct_matches()
+        label.text = "Changed"
+        self.frame()
+        self.assertTrue(self.host.updates)
+
+    def test_caption_measurement_uses_actual_drawing_demand_and_preserves_custom_styles(self):
+        class CaptionLabel(Label):
+            style_parts = ("caption",)
+
+            def measure(self, host):
+                return 160, 30
+
+            def paint(self, painter):
+                style = painter.style("caption")
+                painter.text(self.text, 0, 0, size=style.font_size,
+                             color=style.foreground, font_family=style.font_family)
+
+        singles, batches = [], []
+        raw_measure = self.host.measure
+
+        def measure(text, size, mono=False):
+            singles.append(text)
+            return raw_measure(text, size, mono)
+
+        def measure_many(texts, size, mono=False):
+            batches.append(tuple(texts))
+            return [raw_measure(text, size, mono) for text in texts]
+
+        from pysual._text_layout import TextLayoutCache
+        self.host._text_layout_cache = TextLayoutCache()
+        self.host.measure, self.host.measure_many = measure, measure_many
+        Label(parent=self.app, text="Builtin", width=160, height=30)
+        CaptionLabel(parent=self.app, text="Custom", top=40, width=160, height=30)
+        arrange(self.app, self.host)
+        singles.clear()
+        batches.clear()
+        self.frame()
+        measured = singles + [text for batch in batches for text in batch]
+        self.assertEqual(measured, ["Builtin"])
+        self.assert_direct_matches()
+
+    def test_inherited_body_repaints_private_custom_focus_state(self):
+        class FocusButton(Button):
+            def _initialize(self):
+                super()._initialize()
+                self._focus_color = "#ff0000"
+
+            def paint_focus(self, painter, /):
+                painter.rect(Rect(0, 0, 12, 12), self._focus_color)
+
+        button = FocusButton(parent=self.app, text="Focus", width=100, height=30)
+        self.frame(layout=True)
+        self.runtime.router.set_focus(button)
+        self.frame()
+        before = self.host.snapshot()
+        button._focus_color = "#00ff00"
+        button.invalidate()
+        self.frame()
+        self.assertIn(self.retained._records[button].identity, self.host.updates)
+        self.assertNotEqual(before, self.host.snapshot())
+        self.assert_direct_matches()
+
+    def test_framework_subclasses_keep_unchanged_bodies_and_repaint_changes(self):
+        from pysual import Hyperlink
+        from pysual._controls.choices import _Choices
+        from pysual.data_grid import _BooleanEditor, _CellEditor
+        from pysual.dates import _CalendarEntry, _CalendarNavButton
+        from pysual.editors import _ColorChannel, _ColorEntry
+
+        cases = (
+            (Hyperlink, {"text": "Before"}, {"text": "After"}),
+            (_CalendarNavButton, {"text": "Before"}, {"text": "After"}),
+            (_ColorChannel, {"value": 0.25}, {"value": 0.75}),
+            (_CalendarEntry, {"text": "Before"}, {"text": "After"}),
+            (_ColorEntry, {"text": "Before"}, {"text": "After"}),
+            (_CellEditor, {"text": "Before"}, {"text": "After"}),
+            (_Choices, {"items": ("First", "Second")}, {"selected_index": 1}),
+            (_BooleanEditor, {"items": ("First", "Second")}, {"selected_index": 1}),
+        )
+        controls = [
+            kind(parent=self.app, top=index * 40, width=160, height=30, **properties)
+            for index, (kind, properties, _change) in enumerate(cases)
+        ]
+        self.frame(layout=True)
+        before = self.host.snapshot()
+        self.frame()
+        self.assertEqual(self.host.updates, [])
+        self.assertEqual(self.host.snapshot(), before)
+        for control, (_kind, _properties, change) in zip(controls, cases):
+            control.update(**change)
+        self.frame(layout=True)
+        self.assertTrue({self.retained._records[control].identity for control in controls}
+                        <= set(self.host.updates))
+        self.assertNotEqual(self.host.snapshot(), before)
+        self.assert_direct_matches()
+
+    def test_inherited_body_repaints_overridden_property_state(self):
+        class CaptionDropdown(Dropdown):
+            def _initialize(self):
+                super()._initialize()
+                self._caption = "Before"
+
+            @property
+            def selected_item(self):
+                return self._caption
+
+        dropdown = CaptionDropdown(parent=self.app, width=160, height=30)
+        self.frame(layout=True)
+        before = self.host.snapshot()
+        dropdown._caption = "After"
+        dropdown.invalidate()
+        self.frame()
+        self.assertIn(self.retained._records[dropdown].identity, self.host.updates)
+        self.assertNotEqual(before, self.host.snapshot())
+        self.assert_direct_matches()
+
     def test_repeated_local_edits_release_reconcile_scratch_without_cyclic_gc(self):
         import gc
 
@@ -508,3 +693,428 @@ class RetainedPaintTests(UIOwnerTestCase):
         finally:
             gc.enable()
             gc.collect()
+
+    def test_cell_edit_repaints_the_retained_body(self):
+        from pysual import DataGrid, GridColumn, GridRow
+
+        grid = DataGrid(
+            parent=self.app,
+            columns=(GridColumn("name", "Name", width=120),),
+            rows=(GridRow("a", ("Before",)),),
+            width=200,
+            height=120,
+        )
+        self.frame(layout=True)
+        before = self.host.snapshot()
+        epoch = grid._visual_epoch
+        grid.set_cell("a", "name", "After")
+        self.assertEqual(grid._visual_epoch, epoch + 1)
+        self.frame()
+        self.assertIn(self.retained._records[grid].identity, self.host.updates)
+        self.assertNotEqual(before, self.host.snapshot())
+        self.assert_direct_matches()
+
+    def test_nonvisual_property_keeps_the_retained_body(self):
+        button = Button(parent=self.app, text="Go", width=80, height=30)
+        self.frame(layout=True)
+        self.assertEqual(button._visual_epoch, 0)
+        button.shortcut = "Ctrl+G"
+        self.assertEqual(button._visual_epoch, 1)
+        self.frame()
+        self.assertEqual(self.host.updates, [])
+
+
+class PaintDependencyTests(UIOwnerTestCase):
+    def fixture(self):
+        app = App(width=640, height=400, reduce_motion=True, cache_paint=True)
+        host = PatchRecordingHost()
+        host._text_layout_cache = TextLayoutCache()
+        runtime = Runtime(app, host)
+        app._runtime = runtime
+        retained = runtime._retained_paint = RetainedPaintTree(host)
+        self.addCleanup(app.destroy)
+        self.addCleanup(setattr, app, "_runtime", None)
+        self.addCleanup(retained.clear)
+        return app, host, runtime, retained
+
+    def test_fitting_changed_captions_only_measure_requested_full_strings(self):
+        app, host, runtime, retained = self.fixture()
+        label = Label(parent=app, text="Initial", width=400, height=30)
+        arrange(app, host)
+        singles, batches = [], []
+        raw = host.measure
+
+        def measure(text, size, mono=False):
+            singles.append(text)
+            return raw(text, size, mono)
+
+        def measure_many(texts, size, mono=False):
+            texts = tuple(texts)
+            batches.append(texts)
+            # Deliberately no backend cache side effect. The shared service must
+            # consume these values instead of asking measure() for them again.
+            return [raw(text, size, mono) for text in texts]
+
+        host.measure, host.measure_many = measure, measure_many
+        for index in range(200):
+            label.text = f"Caption {index}"
+            paint_tree(app, host, retained=retained)
+        measured = singles + [text for batch in batches for text in batch]
+        self.assertEqual(Counter(measured), Counter(f"Caption {index}" for index in range(200)))
+        self.assertFalse(hasattr(host, "_metrics"))
+
+    def test_only_overflowing_caption_requests_truncation_candidates(self):
+        app, host, runtime, retained = self.fixture()
+        Label(parent=app, text="Fits", width=400, height=30)
+        Label(parent=app, text="Overflow caption", width=20, height=30, top=40)
+        arrange(app, host)
+        singles, batches = [], []
+        raw_measure = host.measure
+
+        def measure(text, size, mono=False):
+            singles.append(text)
+            return raw_measure(text, size, mono)
+
+        def measure_many(texts, size, mono=False):
+            texts = tuple(texts)
+            batches.append(texts)
+            return [raw_measure(text, size, mono) for text in texts]
+
+        host.measure, host.measure_many = measure, measure_many
+        paint_tree(app, host, retained=retained)
+        measured = singles + [text for batch in batches for text in batch]
+        self.assertEqual(measured.count("Fits"), 1)
+        self.assertNotIn("Fits…", measured)
+        self.assertIn("O…", measured)
+        before = host.snapshot()
+        paint_tree(app, host)
+        self.assertEqual(before, tuple(host._drawing))
+
+    def test_wrapped_custom_hook_never_inherits_framework_trust(self):
+        app, host, runtime, retained = self.fixture()
+
+        @wraps(Label.paint)
+        def paint(self, painter):
+            self._calls += 1
+            painter.text(str(self._calls), 0, 0)
+
+        class WrappedLabel(Label):
+            pass
+
+        WrappedLabel.paint = paint
+        label = WrappedLabel(parent=app, width=100, height=30, cache_paint=False)
+        label._calls = 0
+        arrange(app, host)
+        for _ in range(3):
+            paint_tree(app, host, retained=retained)
+        self.assertEqual(label._calls, 3)
+
+    def test_custom_inherited_helpers_use_revision_invalidation(self):
+        app, host, runtime, retained = self.fixture()
+
+        class TallRows(ListView):
+            def _row_height(self):
+                return self._private_height
+
+        listing = TallRows(parent=app, items=("one", "two", "three"),
+                           width=120, height=90)
+        listing._private_height = 20
+        arrange(app, host)
+        paint_tree(app, host, retained=retained)
+        before = host.snapshot()
+        listing._private_height = 40
+        listing.invalidate()
+        paint_tree(app, host, retained=retained)
+        self.assertNotEqual(before, host.snapshot())
+        expected = host.snapshot()
+        paint_tree(app, host)
+        self.assertEqual(expected, tuple(host._drawing))
+
+    def test_private_navigation_state_repaints_after_invalidation(self):
+        app, host, runtime, retained = self.fixture()
+        choice = SegmentedControl(parent=app, items=("First", "Second"),
+                                  width=220, height=36)
+        arrange(app, host)
+        choice._hover = True
+        choice._hot_part = 0
+        paint_tree(app, host, retained=retained)
+        before = host.snapshot()
+        choice._hot_part = 1
+        choice.invalidate()
+        paint_tree(app, host, retained=retained)
+        self.assertNotEqual(before, host.snapshot())
+        expected = host.snapshot()
+        paint_tree(app, host)
+        self.assertEqual(expected, tuple(host._drawing))
+
+    def test_instance_editor_hooks_repaint_after_explicit_invalidation(self):
+        app, host, runtime, retained = self.fixture()
+        editor = TextBox(parent=app, text="Input", width=120, height=32)
+        arrange(app, host)
+        paint_tree(app, host, retained=retained)
+        for name in ("_prepare_text", "_text_viewport", "paint_line"):
+            with self.subTest(hook=name):
+                original = getattr(editor, name)
+
+                @wraps(original)
+                def replacement(*args, **kwargs):
+                    return original(*args, **kwargs)
+
+                object.__setattr__(editor, name, replacement)
+                try:
+                    editor.invalidate()
+                    paint_tree(app, host, retained=retained)
+                    self.assertIn(retained._records[editor].identity, host.updates)
+                finally:
+                    object.__delattr__(editor, name)
+                editor.invalidate()
+                paint_tree(app, host, retained=retained)
+                self.assertIn(retained._records[editor].identity, host.updates)
+                paint_tree(app, host, retained=retained)
+                self.assertEqual(host.updates, [])
+
+    def test_dynamic_custom_classes_are_collectable_after_hook_checks(self):
+        references = []
+
+        def create():
+            class DynamicLabel(Label):
+                def paint(self, painter):
+                    # This closure deliberately keeps a reference to its class.
+                    super().paint(painter)
+
+            control = DynamicLabel()
+            self.assertIsInstance(
+                paint_inputs(control, PatchRecordingHost(), None, control.effective_theme)[0], int
+            )
+            control.destroy()
+            references.append(ref(DynamicLabel))
+
+        for _ in range(200):
+            create()
+        gc.collect()
+        self.assertFalse(any(reference() is not None for reference in references))
+
+    def test_keys_do_not_prepare_caret_and_drawing_completes_reveal(self):
+        for composition in ("", "Preview text\nsecond preview row"):
+            with self.subTest(composition=composition):
+                app, host, runtime, retained = self.fixture()
+                host.capabilities = host.capabilities | {"render_surfaces"}
+                editor = TextBox(parent=app, text="A long final line extending beyond the editor",
+                                 multiline=True, width=140, height=48)
+                arrange(app, host)
+                runtime.router.set_focus(editor)
+                editor._caret = editor._anchor = len(editor.text)
+                editor._composition = composition
+                editor._reveal_after_paint = True
+                cache = RenderCache(host)
+                surface_key = cache.paint_key(editor, editor, app.effective_theme)
+                self.assertTrue(editor._reveal_after_paint)
+                segment_key = retained._key(editor, editor)
+                self.assertEqual(surface_key, segment_key)
+                paint_tree(app, host, editor, retained=retained)
+                self.assertFalse(editor._reveal_after_paint)
+                self.assertGreater(editor._scroll_x, 0)
+                self.assertEqual(surface_key, paint_inputs(editor, host, editor,
+                                                         app.effective_theme))
+                before = host.snapshot()
+                paint_tree(app, host, editor)
+                self.assertEqual(before, tuple(host._drawing))
+
+    def test_replacing_builtin_hook_repaints_each_invalidation(self):
+        app, host, runtime, retained = self.fixture()
+        label = Label(parent=app, text="Body", width=120, height=32)
+        arrange(app, host)
+        paint_tree(app, host, retained=retained)
+        original = Label.paint
+        calls = []
+
+        @wraps(original)
+        def replaced(self, painter):
+            calls.append(self)
+            original(self, painter)
+
+        try:
+            Label.paint = replaced
+            for _ in range(3):
+                label.invalidate()
+                paint_tree(app, host, retained=retained)
+            self.assertEqual(calls, [label] * 3)
+        finally:
+            Label.paint = original
+
+    def test_measurement_callback_replacement_does_not_publish_stale_drawing(self):
+        app, host, runtime, retained = self.fixture()
+        editor = TextBox(parent=app, text="A long caption needing caret preparation",
+                         width=100, height=40)
+        arrange(app, host)
+        runtime.router.set_focus(editor)
+        host._text_layout_cache.clear()
+        original, raw_measure = TextBox.paint, host.measure
+        measured = []
+
+        @wraps(original)
+        def replaced(self, painter):
+            return original(self, painter)
+
+        def measure(text, size, mono=False):
+            measured.append(text)
+            TextBox.paint = replaced
+            return raw_measure(text, size, mono)
+
+        host.measure = measure
+        try:
+            paint_tree(app, host, editor, retained=retained)
+            self.assertTrue(measured)
+            expected = host.snapshot()
+            paint_tree(app, host, editor)
+            self.assertEqual(expected, tuple(host._drawing))
+        finally:
+            TextBox.paint = original
+
+    def test_legacy_private_layout_key_cannot_add_a_cache_contract(self):
+        app, host, runtime, retained = self.fixture()
+
+        class CustomLabel(Label):
+            def _paint_layout_key(self):
+                raise AssertionError("Private helper names must not enroll cache dependencies")
+
+        label = CustomLabel(parent=app, text="Custom", width=100, height=30)
+        arrange(app, host)
+        self.assertIsInstance(retained._key(label, None).state, int)
+        paint_tree(app, host, retained=retained)
+        expected = host.snapshot()
+        paint_tree(app, host)
+        self.assertEqual(expected, tuple(host._drawing))
+
+    def test_user_registration_keeps_uncached_custom_callbacks(self):
+        from pysual import register_control
+        from pysual._registry import _registrations
+
+        calls = []
+
+        class RegisteredLabel(Label):
+            @wraps(Label.paint)
+            def paint(self, painter):
+                calls.append(self)
+                return super().paint(painter)
+
+        register_control(RegisteredLabel, name="paint_dependency_test", factory=False)
+        self.addCleanup(_registrations.pop, "paint_dependency_test")
+        app, host, runtime, retained = self.fixture()
+        label = RegisteredLabel(parent=app, text="Custom", cache_paint=False,
+                                width=120, height=32)
+        arrange(app, host)
+        for _ in range(3):
+            paint_tree(app, host, retained=retained)
+        self.assertEqual(calls, [label] * 3)
+
+    def test_reinstalling_builtin_catalog_keeps_replacement_callbacks(self):
+        from pysual._catalog import install_builtin_controls
+
+        app, host, runtime, retained = self.fixture()
+        label = Label(parent=app, text="Original", width=120, height=32)
+        arrange(app, host)
+        paint_tree(app, host, retained=retained)
+        original = Label.paint
+        calls = []
+
+        @wraps(original)
+        def replaced(self, painter):
+            calls.append(self)
+            return original(self, painter)
+
+        try:
+            Label.paint = replaced
+            install_builtin_controls()
+            for _ in range(3):
+                label.invalidate()
+                paint_tree(app, host, retained=retained)
+            self.assertEqual(calls, [label] * 3)
+        finally:
+            Label.paint = original
+
+
+class IncrementalPaintTests(UIOwnerTestCase):
+    def fixture(self, grid_type=Container):
+        app = App(width=640, height=400, reduce_motion=True, theme=dark(), cache_paint=True)
+        host = PatchRecordingHost()
+        grid = grid_type(parent=app, layout="grid", columns=3,
+                         width=600, height=360, spacing=3)
+        labels = [Label(parent=grid, text=f"Cell {index}") for index in range(12)]
+        runtime = Runtime(app, host)
+        app._runtime = runtime
+        retained = runtime._retained_paint = RetainedPaintTree(host)
+        self.addCleanup(app.destroy)
+        self.addCleanup(setattr, app, "_runtime", None)
+        self.addCleanup(retained.clear)
+        return app, grid, labels, host, retained
+
+    def assert_equivalent(self, actual, reference):
+        app, grid, labels, host, retained = actual
+        other, other_grid, other_labels, other_host, _ = reference
+        arrange(app, host)
+        paint_tree(app, host, retained=retained, layout_changed=True)
+
+        # This reference discards layout history, then paints every body without
+        # a retained planner or surface cache. Disabling cache_measure alone
+        # would not bypass an incorrectly reused placement plan.
+        _clear_measurements(other)
+        arrange(other, other_host)
+        paint_tree(other, other_host)
+        self.assertEqual(host.snapshot(), tuple(other_host._drawing))
+        for control, expected in zip((app, grid, *labels), (other, other_grid, *other_labels)):
+            self.assertEqual(control.bounds, expected.bounds)
+            self.assertEqual(control._clip, expected._clip)
+            self.assertEqual(control._paint_clip, expected._paint_clip)
+
+    def test_mixed_mutations_match_fresh_layout_and_direct_drawing(self):
+        actual, reference = self.fixture(), self.fixture()
+        randomizer = random.Random(5402)
+        self.assert_equivalent(actual, reference)
+        for step in range(72):
+            operation = step % 12
+            index = randomizer.randrange(len(actual[2]))
+            amount = randomizer.randrange(1, 8)
+            for app, grid, labels, host, _ in (actual, reference):
+                child = labels[index]
+                if operation == 0:
+                    child.text = f"Changed {step}: café λ " * amount
+                elif operation == 1:
+                    child.update(width=35 + amount * 3, height=18 + amount, margin=amount / 2)
+                elif operation == 2:
+                    child.visible = not child.visible
+                elif operation == 3:
+                    grid.padding = amount
+                elif operation == 4:
+                    grid.column_tracks = ("auto", "*", "2*") if step % 24 == 4 else ()
+                elif operation == 5:
+                    host.size = (640 + amount * 10, 400 + amount * 5)
+                    host.resource_revision += 1
+                elif operation == 6:
+                    app.theme = dark().derive(font_size=12 + amount)
+                elif operation == 7:
+                    child.invalidate(Dirty.MEASURE)
+                elif operation == 8:
+                    labels.append(Label(parent=grid, text=f"New {step}"))
+                elif operation == 9:
+                    labels.pop().destroy()
+                elif operation == 10:
+                    grid.update(spacing=amount, width=550 + amount * 5)
+                else:
+                    grid.update_children({labels[0]: {"text": f"Batch {step}", "margin": amount},
+                                          labels[1]: {"visible": True, "width": None}})
+            with self.subTest(step=step, operation=operation):
+                self.assert_equivalent(actual, reference)
+
+    def test_custom_content_bounds_keeps_descendant_dependencies(self):
+        class ContentGutter(Container):
+            def content_bounds(self, bounds):
+                text = self.children[0].text if self.children else ""
+                return super().content_bounds(bounds).inset(len(text) % 11)
+
+        actual, reference = self.fixture(ContentGutter), self.fixture(ContentGutter)
+        self.assert_equivalent(actual, reference)
+        for text in ("a", "a much longer caption", "", "漢字 café"):
+            for fixture in (actual, reference):
+                fixture[2][0].text = text
+            self.assert_equivalent(actual, reference)

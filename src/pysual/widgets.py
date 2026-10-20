@@ -7,7 +7,7 @@ file does not mention them in executable code.
 
 from __future__ import annotations
 
-from typing import ClassVar as ClassVar, Literal as Literal
+from typing import Callable as Callable, ClassVar as ClassVar, Literal as Literal
 
 from .controls import Control as Control, Container as Container
 from .events import ChangeEvent as ChangeEvent, ClosingEvent as ClosingEvent, Event as Event

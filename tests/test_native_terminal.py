@@ -10,6 +10,7 @@ from pathlib import Path
 import random
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from uuid import uuid4
@@ -98,7 +99,7 @@ class NativeTerminalTests(unittest.TestCase):
         self.assert_snapshot_rejection_preserves_session()
 
     def test_capture_preserves_unicode_directory_and_filename(self):
-        directory = ROOT / 'work' / 'terminal-captures' / ('résumé-' + uuid4().hex)
+        directory = Path(tempfile.gettempdir()) / "pysual-tests" / 'terminal-captures' / ('résumé-' + uuid4().hex)
         directory.mkdir(parents=True)
         output = directory / 'capturé.ansi'
         self.addCleanup(directory.rmdir)
