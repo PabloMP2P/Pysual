@@ -458,7 +458,7 @@ class NativeHost(NativeServices):
         services = _CAPTION_SERVICES.get(type(self))
         return services is not None and all(
             getattr(getattr(self, name), "__func__", None) is method
-            for name, method in zip(("measure", "measure_many", "text", "icon"), services)
+            for name, method in services
         )
 
     def _resolve_captions(self, *, _retry: bool = False) -> None:
@@ -904,8 +904,12 @@ class NativeTermTextHost(NativeHost):
         return super().measure_many(tuple(safe_text(text) for text in texts), size, mono)
 
 
+# Capture every host service used by caption text and icon strokes.
 _CAPTION_SERVICES = {
-    kind: (kind.measure, kind.measure_many, kind.text, kind.icon)
+    kind: tuple(
+        (name, getattr(kind, name))
+        for name in ("measure", "measure_many", "text", "icon", "lines", "line")
+    )
     for kind in (NativeHost, NativeTermTextHost)
 }
 

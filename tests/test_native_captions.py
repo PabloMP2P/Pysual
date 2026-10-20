@@ -176,6 +176,45 @@ class NativeCaptionTests(UIOwnerTestCase):
             self.assertFalse(any(isinstance(command, Caption) for command in host._commands))
             self.assertTrue(host._request.call_count)
 
+    def test_scoped_icon_stroke_overrides_are_applied_before_presentation(self):
+        for method in ("lines", "line"):
+            for scope in ("instance", "class"):
+                with self.subTest(method=method, scope=scope):
+                    host = self.host()
+                    control = Button(text="Go", icon="plus")
+                    self.addCleanup(control.destroy)
+                    bounds = Rect(11, 23, 100, 40)
+                    control._rect = control._clip = control._paint_clip = bounds
+                    calls = []
+                    original_lines, original_line = NativeHost.lines, NativeHost.line
+
+                    def red_lines(owner, points, color, width=1):
+                        calls.append("lines")
+                        original_lines(owner, points, "#ff0000", width)
+
+                    def red_line(owner, x1, y1, x2, y2, color, width=1):
+                        calls.append("line")
+                        original_line(owner, x1, y1, x2, y2, "#ff0000", width)
+
+                    owner = host if scope == "instance" else NativeHost
+                    replacement = red_lines if method == "lines" else red_line
+                    if scope == "instance":
+                        replacement = MethodType(replacement, host)
+                    fallback = (patch.object(owner, "lines", None)
+                                if method == "line" else nullcontext())
+                    host.begin("#000000")
+                    with patch.object(owner, method, replacement), fallback:
+                        control.paint(Painter(host, bounds, dark(), control))
+                    # The drawing customization has ended before submission.
+                    self.assertEqual(calls, [method, method])
+                    host.present()
+                    self.assertEqual(calls, [method, method])
+                    strokes = [command for command in host._commands
+                               if command[0] in ("line", "lines")]
+                    self.assertEqual([command[0] for command in strokes], [method, method])
+                    self.assertEqual([command[-2] for command in strokes],
+                                     ["#ff0000", "#ff0000"])
+
     def test_changed_metric_environment_discards_inflight_batch_results(self):
         host = self.host()
         unit = 8
