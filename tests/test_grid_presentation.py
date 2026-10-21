@@ -12,7 +12,7 @@ from unittest.mock import patch
 from test_library import RecordingHost, eventually
 
 from pysual import App, DataGrid, GridColumn, GridRow, Rect, Style, Theme
-from pysual.data_grid import _display, _parse_number
+from pysual.data_grid import _display, _measure_places, _parse_number
 from pysual.host import Input
 from pysual.icons import draw_icon
 from pysual.layout import arrange
@@ -50,6 +50,129 @@ class ColumnPresentationTests(unittest.TestCase):
             "12 kg",
         )
         self.assertEqual(_display(1.0, GridColumn("raw", "Raw", kind="number")), "1.0")
+
+    def test_number_columns_default_to_right_alignment(self):
+        number = GridColumn("n", "Number", kind="number")
+        self.assertEqual(number.align, "right")
+        self.assertEqual(GridColumn("name", "Name").align, "left")
+        self.assertEqual(GridColumn("flag", "Flag", kind="bool").align, "left")
+        self.assertEqual(replace(number, align="left").align, "left")
+        self.assertEqual(replace(number, align="center").align, "center")
+
+        class PositionedHost(RecordingHost):
+            def text(self, text, x, y, color, size, mono=False):
+                self.positions.append((text, x, y, size))
+                super().text(text, x, y, color, size, mono)
+
+        host, app = PositionedHost(), App(width=400, height=200)
+        host.positions = []
+        self.addCleanup(app.destroy)
+        grid = app.data_grid(
+            columns=(
+                GridColumn("name", "Name", width=120),
+                GridColumn("n", "Number", kind="number", width=120),
+            ),
+            rows=(GridRow("a", ("Hi", 1.5)), GridRow("b", ("Yo", 2))),
+            width=280,
+            height=140,
+        )
+        arrange(app, host)
+        paint_tree(app, host)
+        for text, column, fraction in (
+            ("Name", 0, 0),
+            ("Hi", 0, 0),
+            ("Yo", 0, 0),
+            ("Number", 1, 1),
+            ("1.5", 1, 1),
+            ("2.0", 1, 1),
+        ):
+            matches = [item for item in host.positions if item[0] == text]
+            self.assertEqual(len(matches), 1)
+            _, x, _, size = matches[0]
+            spare = 104 - host.measure(text, size)[0]
+            self.assertAlmostEqual(x, grid.bounds.x + column * 120 + 8 + spare * fraction)
+
+    def test_plain_number_columns_share_decimal_places(self):
+        column = GridColumn("n", "Number", kind="number", prefix="$")
+        grid = DataGrid(
+            columns=(column,),
+            rows=(
+                GridRow("a", (1,)),
+                GridRow("b", (-1.5,)),
+                GridRow("c", (2.25,)),
+                GridRow("d", (None,)),
+            ),
+            selected_key="a",
+        )
+        self.addCleanup(grid.destroy)
+        self.assertEqual(
+            [
+                _display(row.cells[0], column, places=grid._decimal_places()[0])
+                for row in grid.rows
+            ],
+            ["$1.00", "$-1.50", "$2.25", ""],
+        )
+        self.assertEqual(grid.selected_cell_text, "$1.00")
+
+        grid.columns = (GridColumn("n", "Number", kind="number"),)
+        grid.rows = (GridRow("a", (-2,)), GridRow("b", (10,)))
+        self.assertEqual(grid.selected_cell_text, "-2")
+        grid.selected_key = "b"
+        self.assertEqual(grid.selected_cell_text, "10")
+
+        grid.columns = (replace(column, format_spec=".1f", prefix=""),)
+        grid.rows = (GridRow("a", (1,)), GridRow("b", (1.25,)))
+        grid.selected_key = "a"
+        self.assertEqual(grid.selected_cell_text, "1.0")
+
+        grid.columns = (GridColumn("n", "Number", kind="number"),)
+        grid.rows = (GridRow("a", (1.5,)), GridRow("b", (1e-20,)))
+        self.assertEqual(grid.selected_cell_text, "1.5")
+        grid.selected_key = "b"
+        self.assertEqual(grid.selected_cell_text, "1e-20")
+        grid.set_cell("b", "n", 2.25)
+        grid.selected_key = "a"
+        self.assertEqual(grid.selected_cell_text, "1.50")
+        grid.selected_key = "b"
+        self.assertEqual(grid.selected_cell_text, "2.25")
+        huge = 10**20
+        grid.rows = (GridRow("a", (huge,)), GridRow("b", (1.5,)))
+        grid.selected_key = "a"
+        self.assertEqual(grid.selected_cell_text, f"{huge}.0")
+        grid.selected_key = "b"
+        self.assertEqual(grid.selected_cell_text, "1.5")
+        grid.rows = (GridRow("a", (1e-7,)),)
+        grid.selected_key = "a"
+        self.assertEqual(grid.selected_cell_text, "0.0000001")
+
+    def test_one_number_edit_updates_only_the_shared_decimal_count(self):
+        grid = DataGrid(
+            columns=(GridColumn("n", "Number", kind="number"),),
+            rows=(
+                GridRow("a", (1,)),
+                GridRow("b", (1.5,)),
+                GridRow("c", (2.25,)),
+            ),
+            selected_key="c",
+        )
+        self.addCleanup(grid.destroy)
+        self.assertEqual(grid.selected_cell_text, "2.25")
+        with patch("pysual.data_grid._measure_places", wraps=_measure_places) as measure:
+            grid.set_cell("a", "n", 1.234)
+            self.assertEqual(measure.call_count, 0)
+            self.assertEqual(grid.selected_cell_text, "2.250")
+            grid.selected_key = "b"
+            self.assertEqual(grid.selected_cell_text, "1.500")
+            grid.columns = (replace(grid.columns[0], width=200),)
+            self.assertEqual(grid.selected_cell_text, "1.500")
+            self.assertEqual(measure.call_count, 0)
+            grid.set_cell("a", "n", 1)
+            self.assertEqual(measure.call_count, 0)
+            grid.selected_key = "c"
+            self.assertEqual(grid.selected_cell_text, "2.25")
+            self.assertEqual(measure.call_count, 1)
+            grid.selected_key = "b"
+            self.assertEqual(grid.selected_cell_text, "1.50")
 
     def test_invalid_presentation_is_rejected_before_paint(self):
         for options in (

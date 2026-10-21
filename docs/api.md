@@ -273,6 +273,15 @@ Create immutable `GridColumn` and `GridRow` records with unique, stable keys.
 Cell positions follow the column tuple; number and boolean columns validate
 their cell types. Use tuples for both records and cells.
 
+Number columns are right-aligned unless `align` is set. Text and boolean columns
+stay left-aligned. A number column without `format_spec` shows every value with
+the same number of decimal places: the most fractional digits any value in that
+column needs, including trailing zeros. Blank cells stay empty. When every value
+is an integer, the column shows no decimal point. An explicit `format_spec` is
+used as given. If any value needs more than 16 fractional digits, that column
+keeps each value's ordinary number text. The cell editor shows the stored number;
+copying a cell copies the text shown in the grid.
+
 The following recipe runs without opening a window. Inside an app's `build()`,
 assign the grid to `self.grid` to adopt it, as in the
 [dashboard example](../examples/dashboard.py).

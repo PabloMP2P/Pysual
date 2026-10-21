@@ -33,7 +33,9 @@ class GridColumn:
     width: float = 140
     kind: Literal["text", "number", "bool"] = "text"
     editable: bool = False
-    align: Literal["left", "center", "right"] = "left"
+    # None means right for numbers and left for text and booleans. Construction
+    # stores that choice, so align is never None afterward.
+    align: Literal["left", "center", "right"] | None = None
     format_spec: str = ""
     prefix: str = ""
     suffix: str = ""
@@ -58,7 +60,11 @@ class GridColumn:
             raise ValueError(
                 "GridColumn kind is text/number/bool; editable is a boolean"
             )
-        if self.align not in ("left", "center", "right"):
+        if self.align is None:
+            object.__setattr__(
+                self, "align", "right" if self.kind == "number" else "left"
+            )
+        elif self.align not in ("left", "center", "right"):
             raise ValueError("GridColumn.align must be left, center, or right")
         if not isinstance(self.format_spec, str) or (
             self.format_spec
@@ -192,13 +198,93 @@ def _validate_data(
                     ) from error
 
 
-def _display(value: CellValue, column: GridColumn | None = None) -> str:
+# Shared fixed decimals stop here. A longer fractional part keeps each value's
+# ordinary text so one tiny number cannot widen the whole column.
+_MAX_SHARED_DECIMALS = 16
+
+
+def _fraction_digits(value: int | float) -> int:
+    """Fractional digits of the shortest round-trip form, in fixed-point terms."""
+    if type(value) is int:
+        return 0
+    text = str(value)
+    marker = text.find("e")
+    if marker < 0:
+        marker = text.find("E")
+    if marker >= 0:
+        mantissa = text[:marker]
+        power = int(text[marker + 1:])
+        point = mantissa.find(".")
+        fractional = 0 if point < 0 else len(mantissa) - point - 1
+        return max(0, fractional - power)
+    point = text.find(".")
+    return 0 if point < 0 else len(text) - point - 1
+
+
+def _plain_number(value: int | float, places: int) -> str:
+    """Fixed decimals, including trailing zeros. Integers stay exact."""
+    if places <= 0:
+        return str(value)
+    # The f format converts through float and can change large integers.
+    if type(value) is int:
+        return str(value) + "." + ("0" * places)
+    return format(value, f".{places}f")
+
+
+def _measure_places(
+    columns: tuple[GridColumn, ...], rows: tuple[GridRow, ...]
+) -> tuple[int | None, ...]:
+    """One decimal count per plain number column, or None when it cannot be shared."""
+    places: list[int | None] = []
+    for index, column in enumerate(columns):
+        if column.kind != "number" or column.format_spec:
+            places.append(None)
+            continue
+        best = 0
+        share = True
+        for row in rows:
+            value = row.cells[index]
+            if type(value) is not int and type(value) is not float:
+                continue
+            digits = _fraction_digits(value)
+            if digits > _MAX_SHARED_DECIMALS:
+                share = False
+                break
+            if digits > best:
+                best = digits
+        places.append(best if share else None)
+    return tuple(places)
+
+
+def _place_signature(
+    columns: tuple[GridColumn, ...],
+) -> tuple[tuple[str, str, str], ...]:
+    return tuple((column.key, column.kind, column.format_spec) for column in columns)
+
+
+def _display(
+    value: CellValue, column: GridColumn | None = None, *, places: int | None = None,
+) -> str:
     if value is None:
         return ""
     if column is None:
         return str(value)
-    text = format(value, column.format_spec) if column.format_spec else str(value)
+    if column.format_spec:
+        text = format(value, column.format_spec)
+    elif places is not None and column.kind == "number" and (
+        type(value) is int or type(value) is float
+    ):
+        text = _plain_number(value, places)
+    else:
+        text = str(value)
     return column.prefix + text + column.suffix
+
+
+def _column_align(column: GridColumn) -> Literal["left", "center", "right"]:
+    align = column.align
+    if align is None:
+        return "right" if column.kind == "number" else "left"
+    return align
 
 
 def _aligned_x(
@@ -211,7 +297,8 @@ def _aligned_x(
     *,
     trailing: float = 0,
 ) -> float:
-    if column.align == "left":
+    align = _column_align(column)
+    if align == "left":
         return x + 8
     spare = max(
         0,
@@ -220,7 +307,7 @@ def _aligned_x(
         - trailing
         - painter.measure(text, size=size, font_family=font_family)[0],
     )
-    return x + 8 + spare * (0.5 if column.align == "center" else 1)
+    return x + 8 + spare * (0.5 if align == "center" else 1)
 
 
 def _parse_number(text: str, column: GridColumn | None = None) -> int | float | None:
@@ -354,6 +441,9 @@ class DataGrid(Control):
     _contained_style_parts: ClassVar[frozenset[str]] = frozenset(
         ("header", "cell", "scrollbar", "track", "thumb")
     )
+    _transient_fields: ClassVar[dict[str, Callable[[], object]]] = {
+        "_places": lambda: None,
+    }
 
     def _initialize(self) -> None:
         super()._initialize()
@@ -372,6 +462,10 @@ class DataGrid(Control):
         ] | None = None
         self._last_click: tuple[str | None, str, str, float, float, float] | None = None
         self._popup: _CellPopup | None = None
+        # (rows, columns, per-column decimal counts). None defers the scan.
+        self._places: tuple[
+            tuple[GridRow, ...], tuple[GridColumn, ...], tuple[int | None, ...]
+        ] | None = None
         self._rebuild()
 
     def _validation_copy(self, values: Mapping[str, object]) -> DataGrid:
@@ -479,13 +573,79 @@ class DataGrid(Control):
             self._popup.dismiss()
         self._popup = None
 
+    def _decimal_places(self) -> tuple[int | None, ...]:
+        rows, columns = self.rows, self.columns
+        cached = self._places
+        if cached is not None and cached[0] is rows and (
+            cached[1] is columns
+            or _place_signature(cached[1]) == _place_signature(columns)
+        ):
+            if cached[1] is not columns:
+                self._places = rows, columns, cached[2]
+            return cached[2]
+        measured = _measure_places(columns, rows)
+        self._places = rows, columns, measured
+        return measured
+
+    def _retarget_places(
+        self, old_rows: tuple[GridRow, ...], index: int, old: CellValue, new: CellValue,
+    ) -> None:
+        """Keep the shared decimal count when one edit cannot change it."""
+        cached = self._places
+        rows, columns = self.rows, self.columns
+        if (
+            cached is None
+            or cached[0] is not old_rows
+            or cached[1] is not columns
+            or index >= len(cached[2])
+        ):
+            self._places = None
+            return
+        places = cached[2]
+        column = columns[index]
+        if column.kind != "number" or column.format_spec:
+            self._places = rows, columns, places
+            return
+        current = places[index]
+        old_digits = (
+            _fraction_digits(old) if type(old) is int or type(old) is float else 0
+        )
+        new_digits = (
+            _fraction_digits(new) if type(new) is int or type(new) is float else 0
+        )
+        if current is None:
+            # Another value may still need the ordinary text. Measure only when
+            # this edit might have removed the last value past the shared limit.
+            if old_digits > _MAX_SHARED_DECIMALS and new_digits <= _MAX_SHARED_DECIMALS:
+                self._places = None
+            else:
+                self._places = rows, columns, places
+            return
+        if new_digits > _MAX_SHARED_DECIMALS:
+            updated = (*places[:index], None, *places[index + 1 :])
+        elif new_digits > current:
+            updated = (*places[:index], new_digits, *places[index + 1 :])
+        elif old_digits == current and new_digits < current:
+            self._places = None
+            return
+        else:
+            updated = places
+        self._places = rows, columns, updated
+
     def _changed(self, field: Field, old: object, value: object) -> None:
         if field.name == "rows" and self._pending_cell is not None:
             replacement, column, order, positions, user_edit = self._pending_cell
             self._pending_cell = None
+            previous_row = self._by_key[replacement.key]
             selected = self.selected_key
             previous_position = self._positions.get(selected) if selected is not None else None
             self._by_key[replacement.key] = replacement
+            self._retarget_places(
+                cast(tuple[GridRow, ...], old),
+                column,
+                previous_row.cells[column],
+                replacement.cells[column],
+            )
             if order is None:
                 self._order[self._positions[replacement.key]] = replacement
             else:
@@ -516,6 +676,10 @@ class DataGrid(Control):
             "selected_column",
         ):
             self._last_click = None
+        # A width-only column replacement keeps the cached counts. Decimal
+        # places depend on the cell values, not on column width or titles.
+        if field.name == "rows":
+            self._places = None
         if self._applying_data:
             if self._pending_order is not None:
                 self._by_key, self._order, self._positions = self._pending_order
@@ -964,7 +1128,11 @@ class DataGrid(Control):
         if row is None:
             return None
         column = self.columns[self.selected_column]
-        return _display(row.cells[self.selected_column], column)
+        return _display(
+            row.cells[self.selected_column],
+            column,
+            places=self._decimal_places()[self.selected_column],
+        )
 
     def set_cell(
         self,
@@ -1082,6 +1250,7 @@ class DataGrid(Control):
             ),
         )
         self._painted_cells = 0
+        places = self._decimal_places()
         with p._clipped(Rect(0, header_height, width, height)):
             for row_index in range(first, end):
                 row = self._order[row_index]
@@ -1091,7 +1260,7 @@ class DataGrid(Control):
                 p.surface(Rect(0, y, width, row_height), style)
                 for i, column, x in visible_columns:
                     text = p.elide(
-                        single_line(_display(row.cells[i], column)),
+                        single_line(_display(row.cells[i], column, places=places[i])),
                         column.width - 16,
                         size=style.font_size,
                         font_family=style.font_family,
