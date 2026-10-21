@@ -139,14 +139,24 @@ class GridEditEvent(UiEvent):
     new_value: CellValue
 
 
+_MAX_COLUMNS = 640
+_MAX_ROWS = 2_000_000
+_MAX_CELLS = 200_000_000
+
+
 def _validate_data(
     columns: tuple[GridColumn, ...],
     rows: tuple[GridRow, ...],
     previous_rows: tuple[GridRow, ...] = (),
 ) -> None:
-    if len(columns) > 64 or len(rows) > 20_000 or len(columns) * len(rows) > 200_000:
+    if (
+        len(columns) > _MAX_COLUMNS
+        or len(rows) > _MAX_ROWS
+        or len(columns) * len(rows) > _MAX_CELLS
+    ):
         raise ValueError(
-            "DataGrid supports at most 64 columns, 20,000 rows and 200,000 cells"
+            f"DataGrid supports at most {_MAX_COLUMNS} columns, "
+            f"{_MAX_ROWS:,} rows and {_MAX_CELLS:,} cells"
         )
     if not isfinite(sum(float(column.width) for column in columns)):
         raise ValueError("Combined column widths must remain finite")
@@ -562,13 +572,15 @@ class DataGrid(Control):
         This is synchronous bounded preparation, with the same limits as set_data.
         """
         self._check_live()
-        self._schema["rows"].validate(rows)
         if (
-            len(rows) > 20_000
+            len(rows) > _MAX_ROWS
             or not isinstance(remove, tuple)
             or any(not isinstance(key, str) for key in remove)
         ):
-            raise ValueError("Use at most 20,000 rows and a tuple of removal keys")
+            raise ValueError(
+                f"Use at most {_MAX_ROWS:,} rows and a tuple of removal keys"
+            )
+        self._schema["rows"].validate(rows)
         updates = {row.key: row for row in rows}
         removed = set(remove)
         if len(updates) != len(rows) or len(removed) != len(remove):

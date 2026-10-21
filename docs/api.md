@@ -228,7 +228,7 @@ fully supported across platforms.
 
 Collections paint visible rows. DataGrid accepts immutable `GridColumn` and
 `GridRow` records, with keyed updates, sorting, editing, and column resizing.
-Its limits are 20,000 rows, 64 columns, and 200,000 cells; it is an in-memory
+Its limits are 2,000,000 rows, 640 columns, and 200,000,000 cells; it is an in-memory
 control rather than a remote data provider. LineChart supports up to eight
 series and 20,000 points total with bounded drawable geometry. Its axes adapt
 label precision to the visible range and show a shared offset or exponent when

@@ -112,7 +112,7 @@ class Dashboard(App):
         self.refresh()
 
     def add_account_on_click(self, event):
-        if len(self._source) >= 20_000:
+        if len(self._source) >= 2_000_000:
             return
         row = GridRow(
             str(len(self._source)),

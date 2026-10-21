@@ -43,8 +43,9 @@ from ._engine import (
 
 _UNVALIDATED = object()
 _PERSISTENT_RECORDS: set[type] = set()
-# 200,000 scalar grid cells + three visited values per row + outer collection.
-_MAX_RECORD_VALUES = 300_000
+# DataGrid: 200,000,000 cells + three visited values per 2,000,000 rows
+# + the outer collection (206,000,001). The cap stays above that count.
+_MAX_RECORD_VALUES = 210_000_000
 _RECORD_NAMES = frozenset(
     (
         "pysual.tree.TreeNode",

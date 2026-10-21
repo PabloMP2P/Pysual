@@ -9,8 +9,9 @@ from unittest.mock import patch
 
 from test_library import RecordingHost, eventually
 
+import pysual.schema as schema
 from pysual import App, DataGrid, GridColumn, GridRow
-from pysual.data_grid import _validate_data
+from pysual.data_grid import _MAX_CELLS, _MAX_COLUMNS, _MAX_ROWS, _validate_data
 from pysual.host import Input
 from pysual.layout import arrange
 from pysual.painting import paint_tree
@@ -281,13 +282,63 @@ class GridDataTests(unittest.TestCase):
                 ((GridRow("a", (2,)),), ("a",)),
                 ((), ("missing",)),
                 ((), ("a", "a")),
-                (tuple(GridRow(str(i), (i,)) for i in range(20_001)), ()),
+                ((GridRow("bound", (0,)),) * (_MAX_ROWS + 1), ()),
             ):
                 with self.assertRaises((ValueError, TypeError)):
                     grid.update_rows(rows, remove=remove)
                 self.assertIs(grid.rows, before)
         finally:
             grid.destroy()
+
+    def test_column_row_and_cell_limits_scale_together(self):
+        self.assertEqual(
+            (_MAX_COLUMNS, _MAX_ROWS, _MAX_CELLS), (640, 2_000_000, 200_000_000)
+        )
+        # The codec counts the outer collection, the row record, its key, the
+        # cells tuple, and one value per cell.
+        self.assertGreaterEqual(
+            schema._MAX_RECORD_VALUES, 1 + 3 * _MAX_ROWS + _MAX_CELLS
+        )
+        sample = tuple(GridRow(str(index), (index, "a", None)) for index in range(2))
+        # Two rows with three cells visit 1 + 3 * 2 + 6 values.
+        field = DataGrid._schema["rows"]
+        original = schema._MAX_RECORD_VALUES
+        try:
+            schema._MAX_RECORD_VALUES = 13
+            self.assertEqual(field.decode(field.encode(sample)), sample)
+            schema._MAX_RECORD_VALUES = 12
+            with self.assertRaisesRegex(ValueError, "12 values"):
+                field.encode(sample)
+        finally:
+            schema._MAX_RECORD_VALUES = original
+        wide = tuple(GridColumn(str(index), "Column") for index in range(_MAX_COLUMNS))
+        _validate_data(wide, (GridRow("only", ("",) * _MAX_COLUMNS),))
+        _validate_data((), tuple(GridRow(str(index), ()) for index in range(20_001)))
+        shared = ("",) * 64
+        _validate_data(
+            tuple(GridColumn(str(index), "Column") for index in range(64)),
+            tuple(GridRow(str(index), shared) for index in range(3_126)),
+        )
+        message = "640 columns, 2,000,000 rows and 200,000,000 cells"
+        with self.assertRaisesRegex(ValueError, message):
+            _validate_data((*wide, GridColumn("extra", "Extra")), ())
+        with self.assertRaisesRegex(ValueError, message):
+            _validate_data((), (GridRow("bound", ()),) * (_MAX_ROWS + 1))
+        over_cells = _MAX_CELLS // _MAX_COLUMNS + 1
+        self.assertLessEqual(over_cells, _MAX_ROWS)
+        self.assertGreater(_MAX_COLUMNS * over_cells, _MAX_CELLS)
+        with self.assertRaisesRegex(ValueError, message):
+            _validate_data(wide, (GridRow("bound", ()),) * over_cells)
+
+        grid = DataGrid(
+            columns=(GridColumn("value", "Value", kind="number"),), rows=()
+        )
+        self.addCleanup(grid.destroy)
+        grid.update_rows(tuple(GridRow(str(index), (index,)) for index in range(20_001)))
+        self.assertEqual(len(grid.rows), 20_001)
+        with self.assertRaisesRegex(ValueError, "2,000,000 rows"):
+            grid.update_rows((GridRow("bound", (0,)),) * (_MAX_ROWS + 1))
+        self.assertEqual(len(grid.rows), 20_001)
 
     def test_set_data_validates_replacement_cells_once_before_sorting(self):
         grid = DataGrid(
