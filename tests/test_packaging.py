@@ -159,6 +159,17 @@ def test_release_workflow_matches_the_pypi_publisher():
     assert "build_pinned_sdl.sh" in linux
 
 
+def test_release_notes_match_package_version():
+    init = (ROOT / "src/pysual/__init__.py").read_text(encoding="utf-8")
+    match = re.search(r'^__version__ = "([^"]+)"$', init, re.MULTILINE)
+    assert match
+    version = match.group(1)
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8").splitlines()
+    assert changelog[2].startswith(f"## {version} — ")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert f"[{version} release notes](" in readme
+
+
 def test_readme_file_links_are_absolute():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     links = re.findall(r"\]\(([^)]+)\)", readme)

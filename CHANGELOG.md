@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.3 — 2026-10-21
+
+DataGrid accepts up to 2,000,000 rows, 640 columns, and 200,000,000 cells, and
+remains an in-memory control. Layout, painting, text measurement, and hit
+testing reuse work whose inputs are unchanged. A host can separate font and
+metric changes from image-resource changes. Native caption measurements are
+batched, and unchanged native and SVG output is reused.
+
+`Painter.caption` draws vertically centered text with an optional leading icon.
+Set `measure_resources=False` when a custom control's size depends on metrics
+and its declared inputs, and the host exposes `metrics_revision`.
+
+### Fixes
+
+- Draw a text selection only while the editor is focused.
+- Remeasure chart axes and truncated text when `Painter.measure` is overridden.
+- Keep scoped icon stroke overrides on deferred native captions.
+
 ## 0.1.2 — 2026-10-16
 
 Published releases install with `pip install pysual`. Windows x64, Linux x64,
