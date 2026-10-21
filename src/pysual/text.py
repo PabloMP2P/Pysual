@@ -1257,7 +1257,7 @@ class TextBox(Control):
                 left = max(a, starts[i]) - starts[i]
                 right = min(b, starts[i] + len(line)) - starts[i]
             fixed = self._fixed_line(source_row, line, mono=mono)
-            if right > left:
+            if focused and right > left:
                 display_left = tabs.display_offset(left) if tabs else left
                 display_right = tabs.display_offset(right) if tabs else right
                 x = (
