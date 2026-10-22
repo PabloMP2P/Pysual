@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.1.4 — 2026-10-22
+
+`App.choose_path()` opens a system dialog and returns the selected absolute
+filesystem path. Cancellation returns `None`. The call selects a path and does
+not read, create, or write the file or folder. `directory=True` selects a
+folder, and together with `save=True` selects a folder to save into.
+`extensions` limits a file dialog to those suffixes. `all_files=True` permits
+any file type. The owning window suspends input while the dialog is open.
+
+Desktop windows and the live web host use the operating-system dialog on the
+machine running Python, so a live web path belongs to that machine. A terminal
+uses a system dialog when one is available. The Python terminal renderer asks
+for the path in the terminal when no system dialog is available. The native
+terminal renderer requires a desktop dialog provider. Missing or failed dialog
+services raise `CapabilityError`. A packaged browser app does not advertise
+`path_dialogs`. `open_text_file()` and `save_text_file()` still move UTF-8 text
+on every backend.
+
+Number columns in a DataGrid are right-aligned unless `align` is set. Without
+`format_spec`, every value in the column uses the same number of decimal
+places: the most fractional digits any value needs, including trailing zeros.
+Blank cells stay empty. An all-integer column shows no decimal point. An
+explicit `format_spec` is used as given. A column with a value that needs more
+than 16 fractional digits keeps each value's ordinary number text.
+
 ## 0.1.3 — 2026-10-21
 
 DataGrid accepts up to 2,000,000 rows, 640 columns, and 200,000,000 cells, and
