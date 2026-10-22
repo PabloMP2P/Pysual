@@ -770,6 +770,7 @@ class WindowLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "open_url": lambda: window.open_url("https://example.org"),
             "open_text_file": window.open_text_file,
             "save_text_file": lambda: window.save_text_file("text"),
+            "choose_path": window.choose_path,
         }
         for phase in ("created", "open", "closed"):
             if phase == "open":
@@ -790,6 +791,7 @@ class WindowLifecycleTests(unittest.IsolatedAsyncioTestCase):
             lambda: window.write_session("draft", 123),
             lambda: window.open_url("relative/path"),
             lambda: window.save_text_file("text", suggested_name="../file.txt"),
+            lambda: window.choose_path(suggested_name="../file.txt"),
         )
         for operation in operations:
             with self.assertRaises(ValueError):

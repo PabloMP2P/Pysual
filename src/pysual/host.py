@@ -1,9 +1,11 @@
 """The only platform substitution boundary; no concrete controls or runtime."""
 
+import os
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from math import isfinite
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, overload
 
 from .errors import PysualError
@@ -59,6 +61,146 @@ def validate_session_text(text: str | None) -> None:
         not isinstance(text, str) or len(text.encode("utf-8")) > MAX_SESSION_BYTES
     ):
         raise ValueError("Session text must be UTF-8 and at most 8 MiB")
+
+
+_ILLEGAL_FILENAME_CHARACTERS = frozenset('/\\:*?"<>|')
+
+
+def _control_character(value: str) -> bool:
+    return any(ord(character) < 32 or ord(character) == 127 for character in value)
+
+
+_EXTENSION = re.compile(r"\.[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*\Z")
+
+
+@dataclass(frozen=True)
+class PathDialog:
+    """Validated options for one system open, save, or folder dialog."""
+
+    save: bool
+    directory: bool
+    suggested_name: str
+    title: str
+    initial_directory: str | None
+    extensions: tuple[str, ...] = ()
+    all_files: bool = False
+
+
+def _normalize_extension(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("extensions must be file suffixes such as '.txt' or '.md'")
+    text = value.strip().lower()
+    if text.startswith("*"):
+        text = text[1:]
+    if text and not text.startswith("."):
+        text = "." + text
+    if not text or len(text) > 32 or _EXTENSION.fullmatch(text) is None:
+        raise ValueError("extensions must be file suffixes such as '.txt' or '.md'")
+    return text
+
+
+def _normalize_extensions(extensions: object) -> tuple[str, ...]:
+    if isinstance(extensions, str) or not isinstance(extensions, Sequence):
+        raise ValueError("extensions must be file suffixes such as '.txt' or '.md'")
+    values = cast(Sequence[object], extensions)
+    if len(values) > 32:
+        raise ValueError("extensions accept at most 32 suffixes")
+    unique: list[str] = []
+    for item in values:
+        suffix = _normalize_extension(item)
+        if suffix not in unique:
+            unique.append(suffix)
+    return tuple(unique)
+
+
+def matches_extension(name: str, extensions: tuple[str, ...]) -> bool:
+    """True when ``name`` has one of the suffixes, or no suffixes were requested."""
+    if not extensions:
+        return True
+    lowered = name.lower()
+    return any(lowered.endswith(suffix) for suffix in extensions)
+
+
+def ensure_allowed_extension(
+    path: Path, *, save: bool, extensions: tuple[str, ...], all_files: bool = False
+) -> Path:
+    """Keep a matching name. A bare save name receives the first suffix."""
+    if all_files or matches_extension(path.name, extensions):
+        return path
+    if save and "." not in path.name:
+        return path.with_name(path.name + extensions[0])
+    raise ValueError("Choose a file ending in " + ", ".join(extensions))
+
+
+def prepare_path_dialog(
+    *,
+    save: bool = False,
+    directory: bool = False,
+    suggested_name: str = "",
+    title: str = "",
+    initial_directory: str | None = None,
+    extensions: Sequence[str] = (),
+    all_files: bool = False,
+) -> PathDialog:
+    """Reject dialog options that cannot be shown safely on every desktop."""
+    if type(save) is not bool or type(directory) is not bool or type(all_files) is not bool:
+        raise ValueError("save, directory, and all_files must be booleans")
+    if (
+        not isinstance(suggested_name, str)
+        or len(suggested_name) > 255
+        or (
+            bool(suggested_name)
+            and (
+                suggested_name in (".", "..")
+                or not suggested_name.strip()
+                or suggested_name.endswith((" ", "."))
+                or _control_character(suggested_name)
+                or any(
+                    character in _ILLEGAL_FILENAME_CHARACTERS
+                    for character in suggested_name
+                )
+            )
+        )
+    ):
+        raise ValueError(
+            "suggested_name must be a file name, without directories or reserved characters"
+        )
+    if not isinstance(title, str) or len(title) > 120 or _control_character(title):
+        raise ValueError("title must be at most 120 characters without control characters")
+    initial: str | None = None
+    if initial_directory is not None:
+        if (
+            not isinstance(initial_directory, str)
+            or not initial_directory.strip()
+            or "\0" in initial_directory
+            or (os.name == "nt" and _control_character(initial_directory))
+            or len(initial_directory) > 32767
+        ):
+            raise ValueError("initial_directory must be an existing folder")
+        candidate = Path(initial_directory).expanduser()
+        try:
+            is_directory = candidate.is_dir()
+        except (OSError, ValueError) as exc:
+            raise ValueError("initial_directory must be an existing folder") from exc
+        if not is_directory:
+            raise ValueError("initial_directory must be an existing folder")
+        initial = os.path.abspath(candidate)
+        if len(initial) > 32767:
+            raise ValueError("initial_directory must be an existing folder")
+    suffixes = _normalize_extensions(extensions)
+    if directory and suffixes:
+        raise ValueError("extensions apply to file dialogs, not folder selection")
+    if directory and all_files:
+        raise ValueError("all_files applies to file dialogs, not folder selection")
+    if (
+        suggested_name
+        and suffixes
+        and not all_files
+        and "." in suggested_name
+        and not matches_extension(suggested_name, suffixes)
+    ):
+        raise ValueError("suggested_name must use one of the allowed extensions")
+    return PathDialog(save, directory, suggested_name, title, initial, suffixes, all_files)
 
 
 @dataclass(frozen=True)
@@ -415,6 +557,19 @@ class Host(Protocol):
     async def save_text_file(
         self, text: str, suggested_name: str, location: str | None
     ) -> TextFile | None: ...
+    # Optional "path_dialogs". None means the user cancelled. A packaged
+    # browser does not advertise it: the page cannot reveal a filesystem path.
+    async def choose_path(
+        self,
+        *,
+        save: bool = False,
+        directory: bool = False,
+        suggested_name: str = "",
+        title: str = "",
+        initial_directory: str | None = None,
+        extensions: Sequence[str] = (),
+        all_files: bool = False,
+    ) -> str | None: ...
     async def read_session(self, key: str) -> str | None: ...
     async def write_session(self, key: str, text: str | None) -> None: ...
     async def open_url(self, url: str) -> None: ...

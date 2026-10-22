@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import webbrowser
+from collections.abc import Sequence
 from pathlib import Path
 
 from ..host import CapabilityError, TextFile, validate_session_key, validate_session_text
@@ -21,14 +22,59 @@ class NativeServices:
     _session_lock: asyncio.Lock
     _session_app_id: str | None
 
+    def _path_dialog_owner_pid(self) -> int | None:
+        """A native window process, when this host can own a system dialog."""
+        return None
+
+    def _accept_path_dialog(self) -> bool:
+        if getattr(self, "_closed", False):
+            return False
+        active = getattr(self, "_active", None)
+        return True if active is None else bool(active)
+
+    def cancel_path_dialog(self) -> None:
+        """Close a system dialog this host opened. Another host's dialog stays."""
+        _files.cancel_dialog(self)
+
+    async def choose_path(
+        self,
+        *,
+        save: bool = False,
+        directory: bool = False,
+        suggested_name: str = "",
+        title: str = "",
+        initial_directory: str | None = None,
+        extensions: Sequence[str] = (),
+        all_files: bool = False,
+    ) -> str | None:
+        path = await _files.choose_path(
+            save,
+            suggested_name,
+            directory=directory,
+            title=title,
+            initial_directory=initial_directory,
+            extensions=extensions,
+            all_files=all_files,
+            owner=self,
+            owner_process_id=self._path_dialog_owner_pid(),
+            accept=self._accept_path_dialog,
+        )
+        return None if path is None else str(path)
+
     async def open_text_file(self) -> TextFile | None:
-        path = await _files.choose_path()
+        path = await _files.choose_path(
+            owner=self, owner_process_id=self._path_dialog_owner_pid(),
+            accept=self._accept_path_dialog,
+        )
         return await _files.read_text(path) if path is not None else None
 
     async def save_text_file(
         self, text: str, suggested_name: str, location: str | None
     ) -> TextFile | None:
-        path = location or await _files.choose_path(True, suggested_name)
+        path = location or await _files.choose_path(
+            True, suggested_name, owner=self,
+            owner_process_id=self._path_dialog_owner_pid(), accept=self._accept_path_dialog,
+        )
         return await _files.write_text(path, text) if path is not None else None
 
     async def read_session(self, key: str) -> str | None:

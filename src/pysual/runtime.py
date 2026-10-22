@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import sys
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from collections import deque
 from concurrent.futures import Future
+from contextlib import contextmanager
 from dataclasses import dataclass
 from math import inf
 from time import perf_counter
@@ -93,6 +94,8 @@ class Runtime:
         self._backend_name: BackendName | None = None
         self._owned: set[Runtime] = set()
         self._native_blockers: set[Runtime] = set()
+        self._path_dialog_active = False
+        self._pending_input: deque[Input] = deque()
         self._owner_previous_focus: Control | None = None
         self._modal = modal
         self.presentation: Presentation
@@ -126,6 +129,64 @@ class Runtime:
     @property
     def modal(self) -> SubWindow | None:
         return self._modality.active
+
+    def _discard_dialog_input(self) -> None:
+        # Keep lifecycle and rendering events while dropping interaction that
+        # arrived before/during the dialog, including a partially read batch.
+        retained = [
+            event for event in self._pending_input
+            if event.kind in (
+                "error", "resource_error", "repaint", "close", "resize",
+                "viewport", "suspend", "resume",
+            )
+        ]
+        self._pending_input.clear()
+        self._pending_input.extend(retained)
+
+    @contextmanager
+    def path_dialog(self) -> Generator[None, None, None]:
+        """Suspend this opening's interaction while a host chooser is active."""
+        if self._native_blockers:
+            raise LifecycleError("Open the file dialog from the active modal window")
+        previous = self.router.focus
+        self._path_dialog_active = True
+        try:
+            self._discard_dialog_input()
+            if self.popup is not None:
+                self.popup.dismiss(restore_focus=False)
+            self.router.cancel_capture(clear_focus=True)
+            self.router.set_focus(None)
+            self.router._set_hover(None)
+            self.hints.clear()
+            self.invalidate()
+            yield
+        finally:
+            failure = sys.exception()
+            try:
+                if self.app._runtime is self and self._host_open and not self._stop.is_set():
+                    # A chooser may complete before the pump has consumed the
+                    # last host batch. Never replay those clicks or keystrokes.
+                    try:
+                        self._pending_input.extend(self.host.poll())
+                    finally:
+                        self._discard_dialog_input()
+                    if (
+                        self.router.focus is None and not self._native_blockers
+                        and previous is not None and not previous._disposed
+                        and self.router._visible(previous)
+                        and self._modality.allowed(previous)
+                    ):
+                        self.router.set_focus(previous, reveal=False)
+                    self.invalidate()
+            except Exception as error:
+                if failure is None:
+                    # A host failure belongs to the opening. In particular it
+                    # must not turn an already committed save into a failure.
+                    self.dispatcher._record_error(error)
+                else:
+                    failure.add_note(f"File dialog cleanup also failed: {error}")
+            finally:
+                self._path_dialog_active = False
 
     def diagnostics(self, *, include_native: bool = False) -> RenderDiagnostics:
         check_ui_thread()
@@ -609,7 +670,7 @@ class Runtime:
         from ._engine import critical_phase
 
         engine = get_engine()
-        pending: deque[Input] = deque()
+        pending = self._pending_input
         while not self._stop.is_set():
             self._wake_event.clear()
             self.dispatcher.raise_errors()
@@ -622,7 +683,8 @@ class Runtime:
                               or self.dispatcher.pending >= handler_budget):
                     break
                 event = pending.popleft()
-                self.hints.observe(event)
+                if not self._path_dialog_active:
+                    self.hints.observe(event)
                 if event.kind == "error":
                     raise RuntimeError(event.text)
                 elif event.kind == "resource_error":
@@ -637,7 +699,10 @@ class Runtime:
                     self.invalidate()
                 elif event.kind in ("suspend", "resume"):
                     self._suspend(event.kind == "suspend")
-                elif not self.suspended and not self._native_blockers:
+                elif (
+                    not self.suspended and not self._native_blockers
+                    and not self._path_dialog_active
+                ):
                     self._process_input(event)
             # Share the dispatcher's bounded slice so queued worker writes
             # can join this frame without monopolizing the owner thread.

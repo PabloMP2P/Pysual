@@ -37,6 +37,12 @@ async def services(target: TerminalHost) -> None:
     await target.clipboard_write("Copied text")
     assert_type(await target.open_text_file(), TextFile | None)
     assert_type(await target.save_text_file("Text", "file.txt", None), TextFile | None)
+    assert_type(
+        await target.choose_path(
+            save=True, directory=False, suggested_name="notes.txt", extensions=(".txt", ".md"),
+        ),
+        str | None,
+    )
     assert_type(await target.read_session("document"), str | None)
     await target.write_session("document", None)
     await target.open_url("https://example.com")

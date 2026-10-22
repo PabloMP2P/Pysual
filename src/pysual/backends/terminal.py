@@ -1,7 +1,7 @@
 """Terminal presentation with an optional C renderer and a pure Python fallback."""
 
 import os
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -127,6 +127,17 @@ class TerminalHost:
         async def save_text_file(
             self, text: str, suggested_name: str, location: str | None,
         ) -> TextFile | None: ...
+        async def choose_path(
+            self,
+            *,
+            save: bool = False,
+            directory: bool = False,
+            suggested_name: str = "",
+            title: str = "",
+            initial_directory: str | None = None,
+            extensions: Sequence[str] = (),
+            all_files: bool = False,
+        ) -> str | None: ...
         async def read_session(self, key: str) -> str | None: ...
         async def write_session(self, key: str, text: str | None) -> None: ...
         async def open_url(self, url: str) -> None: ...

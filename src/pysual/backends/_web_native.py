@@ -468,6 +468,8 @@ class LiveSVGHost(SVGRenderer, NativeServices):
     snapshots, while interaction requires the running Python application.
     Sessions use the existing durable Python store, independent of localhost's
     ephemeral port. Clipboard, file picking/downloads and URLs use the browser.
+    Choosing a filesystem path uses the local system dialog, because the page
+    cannot reveal one.
     """
 
     _error_prefix = "web"
@@ -481,6 +483,7 @@ class LiveSVGHost(SVGRenderer, NativeServices):
             "image_fit",
             "text_composition",
             "text_files",
+            "path_dialogs",
             "render_surfaces",
             "scene_patches",
             "session_storage",
@@ -965,6 +968,7 @@ class LiveSVGHost(SVGRenderer, NativeServices):
     def close(self) -> None:
         with self._condition:
             self._closed = True
+            self.cancel_path_dialog()
             self._wake = self._wake_loop = self._wake_token = None
             for loop, future in self._pending.values():
 

@@ -354,6 +354,19 @@ class BundledSVGHost(SVGRenderer):
         except Exception as exc:
             raise CapabilityError(f"Browser file export failed: {exc}") from exc
 
+    async def choose_path(
+        self,
+        *,
+        save: bool = False,
+        directory: bool = False,
+        suggested_name: str = "",
+        title: str = "",
+        initial_directory: str | None = None,
+        extensions: Sequence[str] = (),
+        all_files: bool = False,
+    ) -> str | None:
+        raise CapabilityError("The browser does not expose filesystem paths")
+
     async def _service_call(
         self,
         invoke: Callable[[int], Awaitable[object]],

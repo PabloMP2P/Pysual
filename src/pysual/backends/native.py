@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import threading
 from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -106,7 +107,8 @@ class NativeHost(NativeServices):
     backend: str = "window"
     capabilities: frozenset[str] = frozenset({
         "clipboard", "host_resize", "images", "image_fit", "tinted_images",
-        "text_composition", "session_storage", "open_url", "text_files", "native_animation",
+        "text_composition", "session_storage", "open_url", "text_files",
+        "path_dialogs", "native_animation",
     })
 
     def __init__(
@@ -169,6 +171,12 @@ class NativeHost(NativeServices):
         if client is None:
             return {}
         return cast(dict[str, int | str | bool | None], client.diagnostics)
+
+    def _path_dialog_owner_pid(self) -> int | None:
+        if sys.platform != "win32" or self.backend != "window" or self.hidden or self._closed:
+            return None
+        pid = self.diagnostics.get("pid")
+        return pid if type(pid) is int and pid > 0 else None
 
     def set_wake_callback(self, callback: Callable[[], None] | None) -> None:
         """Bind on the asyncio owner; invalidate any previous owner's wake."""
@@ -861,6 +869,7 @@ class NativeHost(NativeServices):
             if self._closed:
                 return
             self._closed = True
+            self.cancel_path_dialog()
             self._wake = self._wake_loop = None
             self._wake_token = None
             self._events.clear()

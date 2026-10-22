@@ -6,7 +6,7 @@ updates changed runs only and never requests or emits a graphics protocol.
 """
 
 import asyncio
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -15,7 +15,10 @@ from typing import TYPE_CHECKING, cast
 from .._text_layout import TextLayoutCache
 from ..geometry import Rect
 from ..graphemes import boundaries
-from ..host import CapabilityError, Input, TextFile
+from ..host import (
+    CapabilityError, Input, PathDialog, TextFile, ensure_allowed_extension,
+    prepare_path_dialog,
+)
 from . import _files
 from ._term_cells import RGB, Cell, CellRenderer, safe_text
 from ._term_images import AsyncImageCache
@@ -159,7 +162,28 @@ class _FilePrompt:
     confirmed: bool = False
     busy: bool = False
     cancelled: bool = False
-    operation: asyncio.Task[bool] | asyncio.Task[TextFile] | None = None
+    operation: (
+        asyncio.Task[bool] | asyncio.Task[TextFile] | asyncio.Task[str | None] | None
+    ) = None
+    title: str = ""
+
+
+def _prompt_title(request: PathDialog) -> str:
+    if request.title:
+        return request.title
+    if request.directory:
+        return "Choose a destination folder" if request.save else "Choose a folder"
+    return "Save file" if request.save else "Open file"
+
+
+def _prompt_seed(request: PathDialog) -> str:
+    if request.directory:
+        seed = request.initial_directory or ""
+    elif request.initial_directory and request.suggested_name:
+        seed = str(Path(request.initial_directory) / request.suggested_name)
+    else:
+        seed = request.suggested_name or request.initial_directory or ""
+    return safe_text(seed).replace("\n", "").replace("\t", "")[:4096]
 
 
 class TermTextHost(TerminalSession):
@@ -168,13 +192,16 @@ class TermTextHost(TerminalSession):
     One emulator column represents eight logical units and one row sixteen.
     Terminal font settings own the physical font and DPI. ``color`` can select
     an explicit ANSI depth; automatic selection honors a nonempty NO_COLOR.
-    Files use an in-terminal path prompt, including in SSH or headless shells.
+    Text files use an in-terminal path prompt, including over SSH. Choosing a
+    path uses the system dialog when a desktop session can show one, and the
+    same prompt otherwise.
     """
 
     backend = "terminal"
     renderer = "python"
     capabilities = TerminalSession.capabilities | {
-        "text_files", "images", "tinted_images", "image_fit", "render_surfaces",
+        "text_files", "path_dialogs", "images", "tinted_images", "image_fit",
+        "render_surfaces",
     }
     PROBE = b"\x1b[18t\x1b[?u"
     GEOMETRY_QUERY = b"\x1b[18t"
@@ -199,6 +226,7 @@ class TermTextHost(TerminalSession):
         self._renderer = CellRenderer(1, 1, monochrome=self.color == "none")
         self._last_cells: tuple[Cell, ...] | None = None
         self._prompt: _FilePrompt | None = None
+        self._modal_dialog = False
         self._file_lock = asyncio.Lock()
         self._generation = 0
         self.metrics_revision = 0
@@ -504,7 +532,7 @@ class TermTextHost(TerminalSession):
             self._renderer.resource_revision += 1
             self._repaint()
         result = super().poll()
-        if self._prompt is None:
+        if self._prompt is None and not self._modal_dialog:
             return result
         retained: list[Input] = []
         for event in result:
@@ -513,7 +541,7 @@ class TermTextHost(TerminalSession):
                 self._prompt = None
             if event.kind in ("close", "viewport", "resource_error", "repaint", "blur"):
                 retained.append(event)
-            else:
+            elif self._prompt is not None:
                 self._prompt_input(event)
         return retained
 
@@ -606,7 +634,9 @@ class TermTextHost(TerminalSession):
         pane.rect(Rect(0, 0, width * 8, height * 16), "", 0, "#8aa6c9", 1)
         padding = 2 if width > 8 else 0
         available = max(1, width - 2 * padding)
-        title = "Save UTF-8 text file" if prompt.save else "Open UTF-8 text file"
+        title = prompt.title or (
+            "Save UTF-8 text file" if prompt.save else "Open UTF-8 text file"
+        )
         status = (
             "Working... Esc cancels"
             if prompt.busy
@@ -736,6 +766,135 @@ class TermTextHost(TerminalSession):
                     self._prompt = None
                     self._repaint()
 
+    def _dialog_open(self, generation: int) -> bool:
+        return self._active and generation == self._generation
+
+    async def choose_path(
+        self,
+        *,
+        save: bool = False,
+        directory: bool = False,
+        suggested_name: str = "",
+        title: str = "",
+        initial_directory: str | None = None,
+        extensions: Sequence[str] = (),
+        all_files: bool = False,
+    ) -> str | None:
+        request = prepare_path_dialog(
+            save=save,
+            directory=directory,
+            suggested_name=suggested_name,
+            title=title,
+            initial_directory=initial_directory,
+            extensions=extensions,
+            all_files=all_files,
+        )
+        if _files.dialog_available():
+            return await self._system_path(request)
+        return await self._ask_path(request)
+
+    async def _system_path(self, request: PathDialog) -> str | None:
+        generation = self._generation
+        async with self._file_lock:
+            if not self._dialog_open(generation):
+                raise CapabilityError("Open the terminal host before choosing a file")
+            self._modal_dialog = True
+            try:
+                path = await _files.choose_path(
+                    request.save,
+                    request.suggested_name,
+                    directory=request.directory,
+                    title=request.title,
+                    initial_directory=request.initial_directory,
+                    extensions=request.extensions,
+                    all_files=request.all_files,
+                    owner=self,
+                    accept=lambda: self._dialog_open(generation),
+                )
+            finally:
+                # Closing and reopening replaces the file lock. A previous
+                # opening may still be reaping its cancelled dialog process.
+                if generation == self._generation:
+                    self._modal_dialog = False
+            if path is None or not self._dialog_open(generation):
+                return None
+            return str(path)
+
+    async def _ask_path(self, request: PathDialog) -> str | None:
+        generation = self._generation
+        async with self._file_lock:
+            if not self._dialog_open(generation):
+                raise CapabilityError("Open the terminal host before choosing a file")
+            loop = asyncio.get_running_loop()
+            value = _prompt_seed(request)
+            prompt = _FilePrompt(
+                request.save and not request.directory,
+                value,
+                len(value),
+                cast("asyncio.Future[str | None]", loop.create_future()),
+                selected=bool(value),
+                title=_prompt_title(request),
+            )
+            self._prompt = prompt
+            self._repaint()
+            try:
+                while True:
+                    chosen = await prompt.answer
+                    if chosen is None or prompt.cancelled:
+                        return None
+                    prompt.busy = True
+                    self._repaint()
+                    try:
+                        adjusted = ensure_allowed_extension(
+                            Path(chosen).expanduser(),
+                            save=request.save,
+                            extensions=request.extensions,
+                            all_files=request.all_files,
+                        )
+                        if str(adjusted) != chosen:
+                            prompt.value = str(adjusted)
+                            prompt.cursor = len(prompt.value)
+                            prompt.selected = False
+                        verdict_task = asyncio.create_task(
+                            asyncio.to_thread(
+                                _files.classify_typed_path,
+                                adjusted,
+                                save=request.save,
+                                directory=request.directory,
+                            )
+                        )
+                        prompt.operation = verdict_task
+                        verdict = await verdict_task
+                        if prompt.cancelled:
+                            return None
+                        if verdict == "confirm" and not prompt.confirmed:
+                            prompt.confirm, prompt.busy = True, False
+                            prompt.answer = cast(
+                                "asyncio.Future[str | None]", loop.create_future()
+                            )
+                            self._repaint()
+                            continue
+                        if verdict not in (None, "confirm"):
+                            raise ValueError(verdict or "The path is not available")
+                        return str(_files.chosen_path(str(adjusted)))
+                    except asyncio.CancelledError:
+                        if prompt.cancelled:
+                            return None
+                        raise
+                    except (OSError, UnicodeError, ValueError) as exc:
+                        prompt.error = safe_text(str(exc)).replace("\n", " ")[:512]
+                        prompt.confirm = prompt.confirmed = prompt.busy = False
+                        prompt.answer = cast(
+                            "asyncio.Future[str | None]", loop.create_future()
+                        )
+                        self._repaint()
+                    finally:
+                        prompt.operation = None
+            finally:
+                if self._prompt is prompt:
+                    self._prompt = None
+                    self._repaint()
+
     async def open_text_file(self) -> TextFile | None:
         return await self._text_file(save=False)
 
@@ -750,6 +909,8 @@ class TermTextHost(TerminalSession):
 
     def _close_target(self) -> None:
         self._generation += 1
+        self._modal_dialog = False
+        _files.cancel_dialog(self)
         self._cancel_prompt()
         self._prompt = None
         self._last_cells = None

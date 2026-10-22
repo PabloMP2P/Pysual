@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, ClassVar, Literal
 
 from ._engine import call, call_async, call_opening, caller_side, check_origin
@@ -19,6 +21,7 @@ from .host import (
     TextFile,
     Viewport,
     native_frame_count,
+    prepare_path_dialog,
     read_native_stats,
     validate_session_key,
     validate_session_text,
@@ -393,6 +396,66 @@ class Window(Container, metaclass=_ControlMeta):
             raise ValueError("suggested_name must be a filename, without directories")
         return await self._file_operation("save", text, suggested_name, location)
 
+    async def choose_path(
+        self,
+        *,
+        save: bool = False,
+        directory: bool = False,
+        suggested_name: str = "",
+        title: str = "",
+        initial_directory: str | None = None,
+        extensions: Sequence[str] = (),
+        all_files: bool = False,
+    ) -> str | None:
+        """Show a system dialog and return the chosen absolute path.
+
+        ``save=True`` asks for a file destination. ``directory=True`` asks for a
+        folder; together they ask for a folder to save into. ``extensions``
+        limits a file dialog to those suffixes, for example ``(".txt", ".md")``.
+        ``all_files=True`` permits any file type. The
+        first suffix is added to a saved name that has none, unless all files
+        are allowed; some system dialogs reopen to confirm the completed
+        filename. Cancellation returns None. Selecting a path does not read,
+        create, or write the file or folder. Desktop windows and the live web
+        host use the operating-system dialog on the machine running Python.
+        A terminal uses that dialog when available, and the Python terminal
+        otherwise asks for the path itself. A packaged browser app does not
+        advertise ``path_dialogs``.
+        """
+        dialog = prepare_path_dialog(
+            save=save,
+            directory=directory,
+            suggested_name=suggested_name,
+            title=title,
+            initial_directory=initial_directory,
+            extensions=extensions,
+            all_files=all_files,
+        )
+        self._check_live()
+        if self._runtime is None:
+            raise LifecycleError("This window is not open")
+        if "path_dialogs" not in self.capabilities:
+            raise CapabilityError("This host does not provide path dialogs")
+        if self._file_busy:
+            raise LifecycleError("Finish the current file operation first")
+        runtime = self._runtime
+        self._file_busy = True
+        try:
+            with runtime.path_dialog():
+                path = await runtime.host.choose_path(
+                    save=dialog.save,
+                    directory=dialog.directory,
+                    suggested_name=dialog.suggested_name,
+                    title=dialog.title,
+                    initial_directory=dialog.initial_directory,
+                    extensions=dialog.extensions,
+                    all_files=dialog.all_files,
+                )
+            return path if self._runtime is runtime and not runtime._stop.is_set() else None
+        finally:
+            if self._runtime is runtime:
+                self._file_busy = False
+
     async def _file_operation(
         self,
         operation: Literal["open", "save"],
@@ -407,16 +470,27 @@ class Window(Container, metaclass=_ControlMeta):
             raise CapabilityError("This host does not provide text file services")
         if self._file_busy:
             raise LifecycleError("Finish the current file operation first")
+        runtime = self._runtime
         self._file_busy = True
         try:
-            host = self._runtime.host
-            if operation == "open":
-                return await host.open_text_file()
-            if text is None or suggested_name is None:
-                raise TypeError("save requires text and a suggested name")
-            return await host.save_text_file(text, suggested_name, location)
+            host = runtime.host
+            scope = (
+                runtime.path_dialog()
+                if operation == "open" or location is None else nullcontext()
+            )
+            with scope:
+                if operation == "open":
+                    result = await host.open_text_file()
+                else:
+                    if text is None or suggested_name is None:
+                        raise TypeError("save requires text and a suggested name")
+                    result = await host.save_text_file(text, suggested_name, location)
+            # A completed write remains successful even if its opening closed
+            # while the filesystem worker was committing it.
+            return result
         finally:
-            self._file_busy = False
+            if self._runtime is runtime:
+                self._file_busy = False
 
     def destroy(self) -> None:
         check_ui_thread()

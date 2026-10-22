@@ -907,8 +907,46 @@ sprites and animated rectangles run in C; arbitrary Python animation handlers
 continue to use Python.
 
 `app.capabilities` reports optional services such as clipboard, text files,
-session storage, URL opening, and composition. Handle unsupported/denied
-operations explicitly. Browser file operations require user interaction.
+path dialogs, session storage, URL opening, and composition. Handle
+unsupported or denied operations explicitly. Browser file operations require
+user interaction.
+
+`choose_path()` shows a system dialog and returns the selected filesystem
+path. Cancellation returns `None`. It only selects a path: it does not read,
+create, or write the selected file or folder:
+
+```python
+document = await app.choose_path(extensions=(".txt", ".md"))
+notes = await app.choose_path(
+    save=True, suggested_name="notes.txt", extensions=(".txt",),
+)
+folder = await app.choose_path(directory=True)
+anything = await app.choose_path(extensions=(".txt", ".md"), all_files=True)
+```
+
+`directory=True` selects a folder. Together with `save=True`, it selects a
+folder to save into. `extensions` limits a file dialog to those suffixes.
+`all_files=True` permits any file type: Windows and Linux add an all-files
+filter, while macOS displays all file types. A saved name with no suffix
+receives the first suffix, unless all files are allowed. Some system dialogs
+reopen with the completed filename for confirmation, including any overwrite
+prompt, before returning the path.
+`title` and `initial_directory` are optional, and the result is absolute.
+
+The owning Pysual window suspends input while the dialog is open. On Windows,
+the system dialog is modal to its native owner; other applications remain
+usable. Closing the owner or cancelling the request dismisses the dialog.
+
+Desktop windows and the live web host use the operating-system dialog on
+the machine running Python. For a live web host, the path therefore belongs
+to the server's filesystem. A terminal uses a system dialog when available;
+the Python terminal renderer otherwise asks for the path in the terminal.
+The native terminal renderer requires a desktop dialog provider. Missing or
+failed system dialog services raise `CapabilityError`. A packaged browser
+app does not advertise `path_dialogs`, because the browser does not reveal a
+filesystem path. `open_text_file()` and `save_text_file()` remain the way to
+move UTF-8 text on every backend.
+
 Measure Python scene updates, native presentation, and end-to-end input latency
 separately; cached presentation counts are not physical display refresh rates.
 
