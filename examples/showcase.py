@@ -547,6 +547,7 @@ class Showcase(App):
                 parent=self.workspace,
                 text="Multiline editing\nSelect, copy, paste and undo.\nTab indents; Ctrl+Tab moves focus.",
                 multiline=True,
+                word_wrap=True,
                 monospace=True,
                 line_numbers=True,
                 auto_indent=True,

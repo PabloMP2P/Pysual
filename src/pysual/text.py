@@ -22,6 +22,7 @@ from ._engine import TaskHandle
 from .graphemes import boundaries, floor_boundary, is_boundary, previous_boundary, next_boundary
 from ._scrolling import Scrollbar, can_scroll, scrollbar, handle_scrollbars, paint_scrollbars
 from ._text_display import single_line
+from ._text_wrap import wrap_line
 from .host import Host, Input
 
 _Snapshot = tuple[str, int, int]
@@ -81,6 +82,38 @@ def _word_kind(char: str) -> str:
     return "space" if char.isspace() else "word" if char.isalnum() or char == "_" else "punct"
 
 
+class _FragmentStops:
+    """A visual fragment retains its logical line's tab/password offsets."""
+
+    def __init__(self, stops: _TabStops | _MaskStops, start: int, end: int) -> None:
+        self.stops, self.start, self.end = stops, start, end
+        self.origin = stops.display_offset(start)
+
+    def display_offset(self, offset: int) -> int:
+        return self.stops.display_offset(self.start + offset) - self.origin
+
+    def source_offset(self, column: int) -> int:
+        return max(0, min(self.end, self.stops.source_offset(column + self.origin)) - self.start)
+
+    def expand(self, start: int = 0, end: int | None = None) -> str:
+        return self.stops.expand(self.start + start, self.end if end is None else self.start + end)
+
+
+class _WrappedRow(NamedTuple):
+    text: str
+    start: int
+    source_row: int | None
+    column: int
+    stops: _FragmentStops | None
+    logical_row: int
+
+
+class _WrappedLayout(NamedTuple):
+    rows: list[_WrappedRow]
+    lines: list[str]
+    starts: list[int]
+
+
 class _TextPaintView(NamedTuple):
     lines: Sequence[str]
     starts: Sequence[int]
@@ -122,11 +155,14 @@ class TextBox(Control):
         "_preferred_column": lambda: None,
         "_tab_maps": OrderedDict,
         "_tab_map_chars": lambda: 0,
+        "_wrap_cache": dict,
     }
     cache_paint: bool = prop(default=True)
     text: str = prop(default="", affects=Dirty.PAINT, changed="changed")
     placeholder: str = prop(default="")
     multiline: bool = prop(default=False, affects=Dirty.MEASURE)
+    word_wrap: bool = prop(default=False, affects=Dirty.MEASURE | Dirty.PAINT,
+                           doc="Wrap long lines when multiline is enabled")
     read_only: bool = prop(default=False)
     password: bool = prop(default=False)
     monospace: bool = prop(default=False, affects=Dirty.MEASURE | Dirty.PAINT)
@@ -180,7 +216,7 @@ class TextBox(Control):
         # Equal widths share the maximum until their last measured line leaves.
         self._width_counts: Counter[float] = Counter()
         self._reveal_after_paint = True
-        self._text_viewport_metrics: tuple[float, float, float, float, bool, int] | None = None
+        self._text_viewport_metrics: tuple[object, ...] | None = None
         self._composition = ""
         self._line_cache: _Lines | None = None
         self._pending_line_cache: tuple[str, _EditSlice | None] | None = None
@@ -202,8 +238,19 @@ class TextBox(Control):
         self._selection_pointer: Input | None = None
         self._selection_task: TaskHandle | None = None
         self._selection_token: object | None = None
+        self._wrap_cache: dict[tuple[object, ...], _WrappedLayout] = {}
+        self._caret_upstream = False
 
     def _changed(self, field: Field, old: object, value: object) -> None:
+        if field.name in ("text", "word_wrap", "multiline", "tab_size", "password",
+                          "monospace", "font_size", "font_family", "line_numbers"):
+            self._wrap_cache.clear()
+            self._caret_upstream = False
+            if field.name != "text":
+                self._preferred_column = None
+                self._reveal_after_paint = True
+            if self.word_wrap and self.multiline:
+                self._scroll_x = 0.0
         if field.name == "text" or (field.name in ("enabled", "visible") and not value):
             self._stop_selection_scroll()
         if field.name in ("text", "tab_size", "password"):
@@ -292,6 +339,7 @@ class TextBox(Control):
         ):
             raise ValueError("Selection offsets must be within the document")
         self._anchor, self._caret = floor_boundary(self.text, start), floor_boundary(self.text, end)
+        self._caret_upstream = False
         self._edit_group = None
         self._last_click = self._word_drag = None
         self._preferred_column = None
@@ -320,6 +368,7 @@ class TextBox(Control):
         if row < 0 or type(x) not in (int, float) or not isfinite(x) or x < 0:
             raise ValueError("View scroll offsets must be finite and nonnegative")
         self._anchor, self._caret = floor_boundary(self.text, anchor), floor_boundary(self.text, caret)
+        self._caret_upstream = False
         self._edit_group = None
         self._last_click = self._word_drag = None
         self._preferred_column = None
@@ -337,6 +386,7 @@ class TextBox(Control):
         self._edit_group = None
         self._last_click = self._word_drag = None
         self._caret = self._anchor = 0
+        self._caret_upstream = False
         self._scroll = 0
         self._wheel = 0.0
         self._scroll_x = 0
@@ -438,6 +488,7 @@ class TextBox(Control):
         if not is_boundary(self.text, caret):
             caret = next_boundary(self.text, caret)
         self._caret = self._anchor = caret
+        self._caret_upstream = False
         self._edit_group = (group, caret, now) if group is not None else None
         self._ensure_caret()
         self._notify_history()
@@ -468,6 +519,7 @@ class TextBox(Control):
         self._remember(destination, previous)
         self._caret = floor_boundary(self.text, min(caret, len(self.text)))
         self._anchor = floor_boundary(self.text, min(anchor, len(self.text)))
+        self._caret_upstream = False
         self._ensure_caret()
         self._notify_history()
         self.invalidate()
@@ -528,10 +580,104 @@ class TextBox(Control):
             self._line_cache = (lines, starts)
         return self._line_cache
 
+    def _wrapping(self) -> bool:
+        return self.word_wrap and self.multiline
+
+    def _previewing(self) -> bool:
+        runtime = getattr(self._root(), "_runtime", None)
+        return bool(self._composition and runtime is not None and runtime.router.focus is self)
+
+    def _wrapped_layout(self, host: Host | None = None, *, preview: bool = False) -> _WrappedLayout:
+        runtime = getattr(self._root(), "_runtime", None)
+        host = host or (runtime.host if runtime is not None else self._measure_host)
+        style = resolve_style(self)
+        mono = self.monospace or style.font_family == "mono"
+        width = max(0, self._text_viewport().right - self._text_left() - 14)
+        composition = self._normalize_text(self._composition, True) if preview else ""
+        a, b = self.selection_range
+        key = (id(host), getattr(host, "resource_revision", 0), style.font_size,
+               mono, self.password, self.tab_size, width, self.text, composition,
+               a if composition else 0, b if composition else 0)
+        cached = self._wrap_cache.get(key)
+        if cached is not None:
+            return cached
+        lines, starts = self._lines()
+        first = stop = delta = 0
+        if composition:
+            first = bisect.bisect_right(starts, a) - 1
+            last = bisect.bisect_right(starts, b) - 1
+            replacement = (lines[first][:a - starts[first]] + composition
+                           + lines[last][b - starts[last]:]).split("\n")
+            lines = lines[:first] + replacement + lines[last + 1:]
+            stop = first + len(replacement)
+            delta = last + 1 - stop
+            positions: list[int] = []
+            offset = 0
+            for line in lines:
+                positions.append(offset)
+                offset += len(line) + 1
+            starts = positions
+        advance = host.measure("M", style.font_size, True)[0] if host is not None else style.font_size * 0.6
+        rows: list[_WrappedRow] = []
+        for index, (line, offset) in enumerate(zip(lines, starts)):
+            stops = self._tab_map(line)
+            fixed = self._fixed_line(None, line, mono=mono)
+
+            def measure(start: int, end: int) -> float:
+                if fixed:
+                    return ((stops.display_offset(end) - stops.display_offset(start))
+                            if stops else end - start) * advance
+                display = stops.expand(start, end) if stops else line[start:end]
+                return host.measure(display, style.font_size, mono)[0] if host is not None else len(display) * advance
+
+            source_row = None if composition and first <= index < stop else (
+                index + delta if composition and index >= stop else index)
+            for start, end in wrap_line(line, width, measure, break_on_whitespace=not self.password):
+                rows.append(_WrappedRow(line[start:end], offset + start, source_row,
+                                        start, _FragmentStops(stops, start, end) if stops else None, index))
+        layout = _WrappedLayout(rows, [row.text for row in rows], [row.start for row in rows])
+        # Retain both scrollbar widths and a composition preview without
+        # rebuilding the document on every paint. Resizes keep this bounded.
+        if len(self._wrap_cache) >= 4:
+            self._wrap_cache.pop(next(iter(self._wrap_cache)))
+        self._wrap_cache[key] = layout
+        return layout
+
+    def _display_lines(self) -> _Lines:
+        if self._wrapping():
+            layout = self._wrapped_layout()
+            return layout.lines, layout.starts
+        return self._lines()
+
+    def _display_row_count(self) -> int:
+        if self._wrapping():
+            return len(self._wrapped_layout(preview=self._previewing()).rows)
+        return self.line_count
+
+    def _caret_row(self, lines: Sequence[str], starts: Sequence[int]) -> int:
+        row = bisect.bisect_right(starts, self._caret) - 1
+        if (self._wrapping() and self._caret_upstream and row > 0
+                and starts[row - 1] + len(lines[row - 1]) == self._caret):
+            row -= 1
+        return row
+
+    def _display_stops(self, row: int, line: str) -> _TabStops | _MaskStops | _FragmentStops | None:
+        return self._wrapped_layout().rows[row].stops if self._wrapping() else self._tab_map(line)
+
+    def _display_word_span(self, row: int, line: str, column: int, start: int) -> tuple[int, int]:
+        if self._wrapping():
+            fragment = self._wrapped_layout().rows[row]
+            assert fragment.source_row is not None
+            line = self._lines()[0][fragment.source_row]
+            column += fragment.column
+            start -= fragment.column
+        a, b = self._word_span(line, column)
+        return start + a, start + b
+
     def _ensure_caret(self) -> None:
         self._reveal_after_paint = True
-        _, starts = self._lines()
-        row = bisect.bisect_right(starts, self._caret) - 1
+        lines, starts = self._display_lines()
+        row = self._caret_row(lines, starts)
         capacity = self._page_rows()
         self._scroll = max(0, min(self._scroll, row))
         if row >= self._scroll + capacity:
@@ -551,7 +697,10 @@ class TextBox(Control):
         )
 
     def _clamp_scroll(self, host: Host | None = None) -> None:
-        self._scroll = max(0, min(self._scroll, self.line_count - self._page_rows()))
+        self._scroll = max(0, min(self._scroll, self._display_row_count() - self._page_rows()))
+        if self._wrapping():
+            self._scroll_x = 0.0
+            return
         # Zero is valid for every document extent. Keep ordinary edits bounded
         # to visible-row measurement until horizontal scrolling needs a bound.
         if self._scroll_x <= 0:
@@ -621,6 +770,8 @@ class TextBox(Control):
         return self._extent_cache
 
     def _horizontal_limit(self, host: Host | None = None) -> float:
+        if self._wrapping():
+            return 0.0
         width = self._document_width(host)
         if width is None:
             return self._scroll_x if self.text else 0.0
@@ -630,6 +781,12 @@ class TextBox(Control):
     def _sync_scrollbars(self, host: Host | None = None) -> None:
         if not self.multiline:
             self._scroll_axes = (False, False)
+            return
+        if self._wrapping():
+            self._scroll_x = 0.0
+            self._scroll_axes = (False, False)
+            if len(self._wrapped_layout(host, preview=self._previewing()).rows) > self._page_rows():
+                self._scroll_axes = (False, True)
             return
         width = self._document_width(host)
         padding = resolve_style(self).padding
@@ -652,7 +809,7 @@ class TextBox(Control):
         bars: list[Scrollbar] = []
         if vertical:
             bar = scrollbar(Rect(x + area.right, y, min(12, self._rect.width), area.height),
-                            self.line_count, self._page_rows(), self._scroll)
+                            self._display_row_count(), self._page_rows(), self._scroll)
             if bar is not None:
                 bars.append(bar)
         if horizontal:
@@ -777,10 +934,11 @@ class TextBox(Control):
         return start, end
 
     def _pointer_columns(
-        self, row: int | None, line: str, x: float, host: Host, size: float, mono: bool
+        self, row: int | None, line: str, x: float, host: Host, size: float, mono: bool,
+        stops: _TabStops | _MaskStops | _FragmentStops | None = None,
     ) -> tuple[int, int]:
         """Return the nearest insertion boundary and the grapheme under x."""
-        tabs = self._tab_map(line)
+        tabs = stops or self._tab_map(line)
         if self._fixed_line(row, line, mono=mono):
             advance = max(host.measure("M", size, True)[0], 0.001)
             column = max(0, int(x / advance))
@@ -792,7 +950,7 @@ class TextBox(Control):
         else:
             display = tabs.expand() if tabs else line
             context = (getattr(host, "resource_revision", 0), size, mono,
-                       self.password, self.tab_size, line)
+                       self.password, self.tab_size, line, display)
             widths: OrderedDict[int, float]
             if len(line) <= 65536:
                 if self._hit_host is not host or self._hit_context != context:
@@ -835,7 +993,7 @@ class TextBox(Control):
         offset = self._scroll_x if e.shift else self._scroll
         limit = (
             self._horizontal_limit() if e.shift
-            else max(0, self.line_count - self._page_rows())
+            else max(0, self._display_row_count() - self._page_rows())
         )
         if not can_scroll(offset, limit, e.delta):
             self._wheel = 0.0
@@ -857,7 +1015,7 @@ class TextBox(Control):
         x, y = event.x - self._rect.x, event.y - self._rect.y
         return (
             (self.multiline and ((y < 0 and self._scroll > 0)
-             or (y >= area.bottom and self._scroll < max(0, self.line_count - self._page_rows()))))
+             or (y >= area.bottom and self._scroll < max(0, self._display_row_count() - self._page_rows()))))
             or (x < 0 and self._scroll_x > 0)
             or (x >= area.right and self._scroll_x < self._horizontal_limit())
         )
@@ -911,6 +1069,9 @@ class TextBox(Control):
         if e.kind in ("blur", "pointer_cancel", "pointer_up", "key_down", "text", "composition", "wheel"):
             self._stop_selection_scroll()
         before = (self._caret, self._anchor, self._scroll, self._scroll_x, self._composition)
+        affinity_before = self._caret_upstream
+        if self._wrapping():
+            self._sync_scrollbars()
         if (e.kind in ("blur", "pointer_down", "pointer_cancel", "composition", "wheel")
                 or (e.kind == "pointer_move" and self._pressed)
                 or (e.kind == "key_down" and (
@@ -974,7 +1135,7 @@ class TextBox(Control):
             runtime = getattr(self._root(), "_runtime", None)
             if runtime is None:
                 return
-            lines, starts = self._lines()
+            lines, starts = self._display_lines()
             style = resolve_style(self)
             size = style.font_size
             assert size is not None
@@ -993,9 +1154,12 @@ class TextBox(Control):
                 + self._scroll_x
             )
             mono = self.monospace or style.font_family == "mono"
-            col, word_col = self._pointer_columns(row, line, x, runtime.host, size, mono)
+            col, word_col = self._pointer_columns(
+                None if self._wrapping() else row, line, x, runtime.host, size, mono,
+                self._display_stops(row, line))
             self._preferred_column = None
             self._caret = starts[row] + col
+            self._caret_upstream = self._wrapping() and col == len(line)
             if e.kind == "pointer_down":
                 previous, self._last_click = self._last_click, None
                 self._word_drag = None
@@ -1006,17 +1170,17 @@ class TextBox(Control):
                             and previous[3:] == (e.button, e.pointer_kind)
                             and 0 <= now - previous[0] <= 0.4
                             and abs(e.x - previous[1]) <= 8 and abs(e.y - previous[2]) <= 8):
-                        start, end = self._word_span(line, word_col)
-                        self._anchor, self._caret = starts[row] + start, starts[row] + end
+                        self._anchor, self._caret = self._display_word_span(row, line, word_col, starts[row])
+                        self._caret_upstream = False
                         self._word_drag = self._anchor, self._caret
                     elif e.button == 1:
                         self._last_click = now, e.x, e.y, e.button, e.pointer_kind
             elif self._word_drag is not None:
-                start, end = self._word_span(line, word_col)
+                start, end = self._display_word_span(row, line, word_col, starts[row])
                 first, last = self._word_drag
-                start, end = starts[row] + start, starts[row] + end
                 self._anchor, self._caret = (
                     (last, start) if start < first else (first, max(last, end)))
+                self._caret_upstream = False
             elif self._caret != self._anchor:
                 self._last_click = None
             self._ensure_caret()
@@ -1041,6 +1205,7 @@ class TextBox(Control):
                 return
             if e.ctrl:
                 self._preferred_column = None
+                self._caret_upstream = False
                 if key in ("Home", "End"):
                     self._caret = 0 if key == "Home" else len(self.text)
                 else:
@@ -1059,6 +1224,7 @@ class TextBox(Control):
                 return
             elif key in ("ArrowLeft", "ArrowRight"):
                 self._preferred_column = None
+                self._caret_upstream = key == "ArrowLeft" and self._wrapping()
                 if not e.shift and self._caret != self._anchor:
                     self._caret = (
                         min(self._caret, self._anchor)
@@ -1072,15 +1238,17 @@ class TextBox(Control):
                         else next_boundary(self.text, self._caret)
                     )
             elif key in ("Home", "End", "ArrowUp", "ArrowDown", "PageUp", "PageDown"):
-                lines, starts = self._lines()
-                row = bisect.bisect_right(starts, self._caret) - 1
+                lines, starts = self._display_lines()
+                row = self._caret_row(lines, starts)
                 col = self._caret - starts[row]
                 if key == "Home":
                     self._preferred_column = None
                     self._caret = starts[row]
+                    self._caret_upstream = False
                 elif key == "End":
                     self._preferred_column = None
                     self._caret = starts[row] + len(lines[row])
+                    self._caret_upstream = self._wrapping()
                 else:
                     style = resolve_style(self)
                     mono = self.monospace or style.font_family == "mono"
@@ -1093,7 +1261,7 @@ class TextBox(Control):
                         context = (host, style.font_size, getattr(host, "resource_revision", 0),
                                    self.password, self.tab_size)
                     if self._preferred_column is None or self._preferred_column[0] != context:
-                        tabs = self._tab_map(lines[row])
+                        tabs = self._display_stops(row, lines[row])
                         if host is None or mono:
                             preferred = tabs.display_offset(col) if tabs else col
                         else:
@@ -1107,9 +1275,10 @@ class TextBox(Control):
                     )
                     if context is not None and host is not None:
                         column, _ = self._pointer_columns(
-                            row, lines[row], preferred, host, style.font_size, mono)
+                            None if self._wrapping() else row, lines[row], preferred,
+                            host, style.font_size, mono, self._display_stops(row, lines[row]))
                     else:
-                        tabs = self._tab_map(lines[row])
+                        tabs = self._display_stops(row, lines[row])
                         column = (
                             tabs.source_offset(cast(int, preferred)) if tabs
                             else min(cast(int, preferred), len(lines[row]))
@@ -1118,6 +1287,7 @@ class TextBox(Control):
                     self._caret = starts[row] + floor_boundary(
                         lines[row], self._caret - starts[row]
                     )
+                    self._caret_upstream = self._wrapping() and column == len(lines[row])
             elif key == "Enter" and self.multiline:
                 insertion = min(self._caret, self._anchor)
                 prefix = self.text[
@@ -1143,7 +1313,8 @@ class TextBox(Control):
             if not e.shift:
                 self._anchor = self._caret
             self._ensure_caret()
-        if before != (self._caret, self._anchor, self._scroll, self._scroll_x, self._composition):
+        if (before != (self._caret, self._anchor, self._scroll, self._scroll_x, self._composition)
+                or affinity_before != self._caret_upstream):
             self.invalidate()
 
     def paint(self, p: Painter, /) -> None:
@@ -1224,6 +1395,9 @@ class TextBox(Control):
         )
 
     def _paint_text(self, p: Painter, s: ResolvedStyle, viewport: Rect) -> None:
+        if self._wrapping():
+            self._paint_wrapped_text(p, s, viewport)
+            return
         view = self._prepare_text(p, s, viewport)
         (lines, starts, a, b, focused, composition, preview_start, preview_stop,
          preview_delta, row, caret_x, advance, mono, text_left, lh, padding, size
@@ -1305,6 +1479,80 @@ class TextBox(Control):
             if self.line_numbers:
                 p.rect(Rect(1, y, text_left - 6, lh), s.fill)
                 p.text(str(i + 1), 5, y, size=size, color=t.muted, mono=True)
+
+    def _paint_wrapped_text(self, p: Painter, s: ResolvedStyle, viewport: Rect) -> None:
+        """Paint visual rows while decoration and selections keep source offsets."""
+        mono = self.monospace or s.font_family == "mono"
+        lh, padding, size = self._line_height(), s.padding, s.font_size
+        metrics = (viewport.width, viewport.height, lh, padding, mono, self.tab_size,
+                   size, getattr(p.host, "resource_revision", 0), self.word_wrap)
+        if self._text_viewport_metrics is not None and metrics != self._text_viewport_metrics:
+            self._reveal_after_paint = True
+        self._text_viewport_metrics = metrics
+        runtime = getattr(self._root(), "_runtime", None)
+        focused = runtime is not None and runtime.router.focus is self
+        composition = self._normalize_text(self._composition, True) if focused else ""
+        layout = self._wrapped_layout(p.host, preview=bool(composition))
+        a, b = self.selection_range
+        if composition:
+            caret = a + len(composition)
+            row = bisect.bisect_right(layout.starts, caret) - 1
+        else:
+            caret = self._caret
+            row = self._caret_row(layout.lines, layout.starts)
+        capacity = self._page_rows()
+        self._scroll = max(0, min(self._scroll, len(layout.rows) - capacity))
+        if focused and self._reveal_after_paint:
+            self._scroll = min(self._scroll, row)
+            if row >= self._scroll + capacity:
+                self._scroll = row - capacity + 1
+        self._scroll_x = 0.0
+        self._reveal_after_paint = False
+        text_left = self._text_left()
+        t = p.theme.tokens
+        if not self.text and self.placeholder and not focused:
+            y = padding
+            available = max(0, viewport.right - text_left - 14)
+            for line in self.placeholder.split("\n"):
+                for start, end in wrap_line(line, available, lambda start, end: p.measure(
+                        line[start:end], size=size, mono=self.monospace)[0]):
+                    p.text(line[start:end], text_left, y, color=t.muted, size=size, mono=self.monospace)
+                    y += lh
+                    if y >= viewport.bottom:
+                        return
+        first = self._scroll + max(0, floor((p._clip.y - self._rect.y - padding) / lh))
+        end = min(len(layout.rows), self._scroll + max(
+            0, ceil((p._clip.bottom - self._rect.y - padding) / lh)))
+        for index in range(first, end):
+            fragment = layout.rows[index]
+            line, stops = fragment.text, fragment.stops
+            y = padding + (index - self._scroll) * lh
+
+            def width(column: int) -> float:
+                prefix = stops.expand(0, column) if stops else line[:column]
+                return p.measure(prefix, size=size, mono=self.monospace)[0]
+
+            if focused and not composition:
+                left = max(a, fragment.start) - fragment.start
+                right = min(b, fragment.start + len(line)) - fragment.start
+                if right > left:
+                    x = width(left)
+                    p.rect(Rect(text_left + x, y, width(right) - x, lh), t.selection)
+            display = stops.expand() if self.password and stops is not None else line
+            if fragment.source_row is None:
+                display = stops.expand() if stops else line
+                TextBox.paint_line(self, p, display, text_left, y, index, s)
+            else:
+                self.paint_line_fragment(p, display, text_left, y, fragment.source_row, s, fragment.column)
+            if focused and index == row:
+                # A soft row retains its trailing separators in source space;
+                # those spaces may extend beyond the wrapping edge.
+                caret_x = min(width(caret - fragment.start), max(0, viewport.right - text_left - 14))
+                p.caret(text_left + caret_x, y, lh, t.accent)
+            if self.line_numbers:
+                p.rect(Rect(1, y, text_left - 6, lh), s.fill)
+                if fragment.column == 0:
+                    p.text(str(fragment.logical_row + 1), 5, y, size=size, color=t.muted, mono=True)
 
     def paint_line_fragment(
         self,

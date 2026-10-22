@@ -226,6 +226,36 @@ and Unicode grapheme boundaries. Clipboard and composition availability depend
 on the host. Complex shaping, bidi layout, and missing-font fallback are not
 fully supported across platforms.
 
+Set `word_wrap=True` on a `Label` or multiline `TextBox` to wrap text at the
+available width. Both default to `word_wrap=False`: a single-line Label uses
+an ellipsis when it is too wide, and a TextBox scrolls horizontally. Wrapping
+preserves explicit `\n` line breaks and the stored `text`; soft line breaks are
+only part of the display. Words that cannot fit on a line break at Unicode
+grapheme boundaries.
+
+```python
+from pysual import Label, TextBox
+
+description = Label(
+    text="This description wraps to fit the label.\nA new paragraph starts here.",
+    width=240,
+    word_wrap=True,
+)
+notes = TextBox(
+    text="This editable paragraph wraps as you type or resize the editor.",
+    width=320,
+    height=160,
+    multiline=True,
+    word_wrap=True,
+)
+```
+
+A wrapped Label displays lines without an ellipsis. A wrapped TextBox scrolls
+vertically when needed and has no horizontal scrollbar. `word_wrap` only takes
+effect on a TextBox when `multiline=True`; a single-line editor keeps its usual
+behavior. The property can also be changed after construction, for example
+`notes.word_wrap = False`.
+
 Collections paint visible rows. DataGrid accepts immutable `GridColumn` and
 `GridRow` records, with keyed updates, sorting, editing, and column resizing.
 Its limits are 2,000,000 rows, 640 columns, and 200,000,000 cells; it is an in-memory
