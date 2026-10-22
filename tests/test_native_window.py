@@ -683,9 +683,19 @@ class NativeWindowTests(unittest.TestCase):
         animation[-1]["duration"] = 10
         animation[-1]["loop"] = True
         self.submit(commands)
+        before = self.client.request("stats")
         self.client.request("configure", reduce_motion=True)
         self.assertEqual(self.capture()[25][105], (255, 0, 0))
-        self.assertFalse(self.client.request("stats")["animating"])
+        # Capture draws the endpoint without presenting it. Reduced motion stays
+        # pending until that settled frame is shown, and a follow-up request can
+        # land inside the host's short present delay.
+        deadline = time.monotonic() + 3
+        settled = self.client.request("stats")
+        while settled["animating"] and time.monotonic() < deadline:
+            time.sleep(.01)
+            settled = self.client.request("stats")
+        self.assertGreater(settled["frames"], before["frames"])
+        self.assertFalse(settled["animating"])
 
     def test_vsync_readback_and_unicode_font_metrics(self):
         self.assertEqual(self.info["vsync"], 0)
