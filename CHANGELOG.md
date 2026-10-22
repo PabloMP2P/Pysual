@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.5 — 2026-10-23
+
+`word_wrap=True` on a `Label` or multiline `TextBox` wraps text at the available
+width. Both controls default to `word_wrap=False`: a Label that is too wide
+uses an ellipsis, and a TextBox scrolls horizontally. Wrapping keeps explicit
+`\n` line breaks and the stored `text`. Soft line breaks exist only in the
+display. A word that cannot fit breaks at Unicode grapheme boundaries.
+
+A wrapped Label shows its lines without an ellipsis. A wrapped TextBox scrolls
+vertically and has no horizontal scrollbar. On a TextBox, `word_wrap` applies
+when `multiline=True`. The property can be changed after construction.
+
 ## 0.1.4 — 2026-10-22
 
 `App.choose_path()` opens a system dialog and returns the selected absolute
