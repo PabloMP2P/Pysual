@@ -1,6 +1,7 @@
 """A system picker returns one exact, absolute filesystem path."""
 
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -51,6 +52,10 @@ class PosixSelectedPathTests(unittest.TestCase):
                         self.assertEqual(actual, selected)
                         self.assertEqual(actual.read_text(encoding="utf-8"), "unchanged")
 
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"),
+        "requires a Linux filesystem that stores non-UTF-8 names",
+    )
     def test_linux_filesystem_bytes_round_trip_without_utf8_replacement(self):
         with tempfile.TemporaryDirectory() as folder:
             raw = os.fsencode(folder) + b"/raw-\xff.txt"
