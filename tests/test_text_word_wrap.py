@@ -339,6 +339,7 @@ class TextWordWrapTests(UIOwnerTestCase):
         arrange(editor, host)
         editor._wrapped_layout(host)
         self.assertTrue(editor._wrap_cache)
+        self.assertTrue(editor._wrap_line_cache)
         for restore in (copy.deepcopy, lambda control: pickle.loads(pickle.dumps(control))):
             clone = restore(editor)
             self.addCleanup(clone.destroy)
@@ -346,6 +347,7 @@ class TextWordWrapTests(UIOwnerTestCase):
             self.assertEqual(clone.text, editor.text)
             self.assertEqual(clone.selection_range, editor.selection_range)
             self.assertEqual(clone._wrap_cache, {})
+            self.assertEqual(clone._wrap_line_cache, {})
             self.assertIsNone(clone._measure_host)
 
     def test_vertical_scrollbar_uses_visual_rows_and_horizontal_wheel_is_disabled(self):
@@ -362,3 +364,120 @@ class TextWordWrapTests(UIOwnerTestCase):
         self.assertEqual(entry.capture_view_state()[2],
                          len(entry._display_lines()[0]) - entry._page_rows())
         self.assertEqual(entry.capture_view_state()[3], 0)
+
+    def assert_cold_wrap_matches(self, entry, host, *, preview=False):
+        def signature(layout):
+            return [(row.text, row.start, row.source_row, row.column, row.logical_row,
+                     None if row.stops is None else (
+                         row.stops.expand(),
+                         [row.stops.display_offset(i) for i in boundaries(row.text)],
+                         [row.stops.source_offset(i)
+                          for i in range(row.stops.display_offset(len(row.text)) + 1)]))
+                    for row in layout.rows]
+
+        cached = entry._wrapped_layout(host, preview=preview)
+        with patch.object(entry, "_wrap_cache", {}), patch.object(entry, "_wrap_line_cache", {}):
+            cold = entry._wrapped_layout(host, preview=preview)
+        self.assertEqual(cached.lines, cold.lines)
+        self.assertEqual(cached.starts, cold.starts)
+        self.assertEqual(signature(cached), signature(cold))
+
+    def test_local_edits_only_wrap_changed_lines_at_both_scrollbar_widths(self):
+        for count in (20, 200):
+            with self.subTest(lines=count):
+                app, entry, host, runtime = self.entry(
+                    "\n".join(f"row {i} alpha beta gamma" for i in range(count)), height=70)
+                for row in (0, count // 2, count - 1):
+                    entry.select(entry._lines()[1][row] + 2, entry._lines()[1][row] + 2)
+                    with patch("pysual.text.wrap_line", wraps=wrap_line) as wrap:
+                        runtime.router.process(Input("text", text="X"))
+                        paint_tree(app, host)
+                        self.assertEqual(wrap.call_count, 2)
+                        self.assertEqual({call.args[0] for call in wrap.call_args_list},
+                                         {entry._lines()[0][row]})
+                        self.assertEqual(len({call.args[1] for call in wrap.call_args_list}), 2)
+                    self.assert_cold_wrap_matches(entry, host)
+                with patch("pysual.text.wrap_line", wraps=wrap_line) as wrap:
+                    runtime.router.process(Input("text", text="split\njoined"))
+                    paint_tree(app, host)
+                    self.assertEqual(wrap.call_count, 4)
+                self.assert_cold_wrap_matches(entry, host)
+
+    def test_cached_wraps_preserve_offsets_and_maps_across_edits_and_history(self):
+        source = "first words\n\nabcde\tfghij e\u0301👩🏽‍💻\nrepeat words\nrepeat words\nlast\n"
+        for password in (False, True):
+            for start, end, inserted in ((1, 1, "X"), (15, 15, "\nnew\n"),
+                                         (11, 13, ""), (3, 43, "replaced\ttext")):
+                with self.subTest(password=password, edit=(start, end, inserted)):
+                    app, entry, host, _ = self.entry(source, password=password, height=70)
+                    entry.select(start, end)
+                    entry.replace_selection(inserted)
+                    for action in (lambda: None, entry.undo, entry.redo):
+                        action()
+                        paint_tree(app, host)
+                        self.assert_cold_wrap_matches(entry, host)
+                    entry.text = "new first\n" + source
+                    paint_tree(app, host)
+                    self.assert_cold_wrap_matches(entry, host)
+
+    def test_composition_reuses_unaffected_lines_without_changing_committed_geometry(self):
+        app, entry, host, runtime = self.entry(
+            "\n".join(f"row {i}\talpha e\u0301 beta" for i in range(20)), height=70)
+        entry.select(entry._lines()[1][5] + 2, entry._lines()[1][7] + 3)
+        before = entry.text, entry.selection_range, entry._undo[:], entry._redo[:]
+        for preview in ("one\ttwo\nthree", "longer\tpreview\nnext", ""):
+            with patch("pysual.text.wrap_line", wraps=wrap_line) as wrap:
+                runtime.router.process(Input("composition", text=preview))
+                paint_tree(app, host)
+                self.assertLessEqual(wrap.call_count, 4)
+            self.assert_cold_wrap_matches(entry, host, preview=bool(preview))
+            self.assert_cold_wrap_matches(entry, host)
+            self.assertEqual((entry.text, entry.selection_range, entry._undo, entry._redo), before)
+
+    def test_wrap_line_cache_releases_replaced_lines_and_bounds_resize_contexts(self):
+        app, entry, host, _ = self.entry("same words\n" * 20, height=70)
+        entry._wrap_cache.clear()
+        entry._wrap_line_cache.clear()
+        with patch("pysual.text.wrap_line", wraps=wrap_line) as wrap:
+            entry._wrapped_layout(host)
+            self.assertEqual(wrap.call_count, 2)  # One repeated line and the trailing empty line.
+        paint_tree(app, host)
+        for _ in range(12):
+            entry.replace_selection("X")
+            paint_tree(app, host)
+            for lines in entry._wrap_line_cache.values():
+                self.assertEqual(set(lines), set(entry._lines()[0]))
+        for width in range(100, 200, 10):
+            entry.width = width
+            arrange(app, host)
+            paint_tree(app, host)
+            self.assertLessEqual(len(entry._wrap_cache), 4)
+            self.assertLessEqual(len(entry._wrap_line_cache), 4)
+            self.assert_cold_wrap_matches(entry, host)
+
+    def test_line_cache_reflows_for_metric_changes_and_scrollbar_transitions(self):
+        app, entry, host, _ = self.entry(
+            "abcde\tfghij e\u0301👩🏽‍💻 alpha beta\n" * 8, height=70)
+        for name, value in (("password", True), ("password", False), ("tab_size", 8),
+                            ("font_size", 15), ("monospace", False), ("font_family", "mono"),
+                            ("line_numbers", True)):
+            setattr(entry, name, value)
+            arrange(app, host)
+            paint_tree(app, host)
+            self.assert_cold_wrap_matches(entry, host)
+        host.resource_revision = 1
+        host.measure = lambda text, size, mono=False: (len(text) * size * 2, size * 1.2)
+        entry.invalidate()
+        paint_tree(app, host)
+        self.assert_cold_wrap_matches(entry, host)
+        # Crossing the line-number digit boundary changes the wrapping width.
+        entry.select(len(entry.text), len(entry.text))
+        entry.replace_selection("\n")
+        paint_tree(app, host)
+        self.assertEqual(entry.line_count, 10)
+        self.assert_cold_wrap_matches(entry, host)
+        for text in ("short", "many words\n" * 20):
+            entry.text = text
+            paint_tree(app, host)
+            self.assertEqual(entry._scroll_axes, (False, text != "short"))
+            self.assert_cold_wrap_matches(entry, host)

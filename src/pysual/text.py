@@ -99,6 +99,11 @@ class _FragmentStops:
         return self.stops.expand(self.start + start, self.end if end is None else self.start + end)
 
 
+class _WrappedLine(NamedTuple):
+    spans: list[tuple[int, int]]
+    stops: _TabStops | _MaskStops | None
+
+
 class _WrappedRow(NamedTuple):
     text: str
     start: int
@@ -156,6 +161,7 @@ class TextBox(Control):
         "_tab_maps": OrderedDict,
         "_tab_map_chars": lambda: 0,
         "_wrap_cache": dict,
+        "_wrap_line_cache": dict,
     }
     cache_paint: bool = prop(default=True)
     text: str = prop(default="", affects=Dirty.PAINT, changed="changed")
@@ -239,6 +245,7 @@ class TextBox(Control):
         self._selection_task: TaskHandle | None = None
         self._selection_token: object | None = None
         self._wrap_cache: dict[tuple[object, ...], _WrappedLayout] = {}
+        self._wrap_line_cache: dict[tuple[object, ...], dict[str, _WrappedLine]] = {}
         self._caret_upstream = False
 
     def _changed(self, field: Field, old: object, value: object) -> None:
@@ -247,6 +254,7 @@ class TextBox(Control):
             self._wrap_cache.clear()
             self._caret_upstream = False
             if field.name != "text":
+                self._wrap_line_cache.clear()
                 self._preferred_column = None
                 self._reveal_after_paint = True
             if self.word_wrap and self.multiline:
@@ -595,9 +603,9 @@ class TextBox(Control):
         width = max(0, self._text_viewport().right - self._text_left() - 14)
         composition = self._normalize_text(self._composition, True) if preview else ""
         a, b = self.selection_range
-        key = (id(host), getattr(host, "resource_revision", 0), style.font_size,
-               mono, self.password, self.tab_size, width, self.text, composition,
-               a if composition else 0, b if composition else 0)
+        context = (id(host), getattr(host, "resource_revision", 0), style.font_size,
+                   mono, self.password, self.tab_size, width)
+        key = (*context, self.text, composition, a if composition else 0, b if composition else 0)
         cached = self._wrap_cache.get(key)
         if cached is not None:
             return cached
@@ -618,21 +626,31 @@ class TextBox(Control):
                 offset += len(line) + 1
             starts = positions
         advance = host.measure("M", style.font_size, True)[0] if host is not None else style.font_size * 0.6
+        # Line-relative spans and display maps survive edits and preview changes.
+        # Absolute offsets and source-row identities are rebuilt below.
+        previous = self._wrap_line_cache.get(context, {})
+        current: dict[str, _WrappedLine] = {}
         rows: list[_WrappedRow] = []
         for index, (line, offset) in enumerate(zip(lines, starts)):
-            stops = self._tab_map(line)
-            fixed = self._fixed_line(None, line, mono=mono)
+            wrapped = current.get(line) or previous.get(line)
+            if wrapped is None:
+                stops = self._tab_map(line)
+                fixed = self._fixed_line(None, line, mono=mono)
 
-            def measure(start: int, end: int) -> float:
-                if fixed:
-                    return ((stops.display_offset(end) - stops.display_offset(start))
-                            if stops else end - start) * advance
-                display = stops.expand(start, end) if stops else line[start:end]
-                return host.measure(display, style.font_size, mono)[0] if host is not None else len(display) * advance
+                def measure(start: int, end: int) -> float:
+                    if fixed:
+                        return ((stops.display_offset(end) - stops.display_offset(start))
+                                if stops else end - start) * advance
+                    display = stops.expand(start, end) if stops else line[start:end]
+                    return host.measure(display, style.font_size, mono)[0] if host is not None else len(display) * advance
 
+                wrapped = _WrappedLine(
+                    wrap_line(line, width, measure, break_on_whitespace=not self.password), stops)
+            current[line] = wrapped
+            stops = wrapped.stops
             source_row = None if composition and first <= index < stop else (
                 index + delta if composition and index >= stop else index)
-            for start, end in wrap_line(line, width, measure, break_on_whitespace=not self.password):
+            for start, end in wrapped.spans:
                 rows.append(_WrappedRow(line[start:end], offset + start, source_row,
                                         start, _FragmentStops(stops, start, end) if stops else None, index))
         layout = _WrappedLayout(rows, [row.text for row in rows], [row.start for row in rows])
@@ -641,6 +659,11 @@ class TextBox(Control):
         if len(self._wrap_cache) >= 4:
             self._wrap_cache.pop(next(iter(self._wrap_cache)))
         self._wrap_cache[key] = layout
+        # Replace, rather than accumulate, line entries after each rebuild. Keep
+        # at most four recent width/font/host contexts, just like whole layouts.
+        if context not in self._wrap_line_cache and len(self._wrap_line_cache) >= 4:
+            self._wrap_line_cache.pop(next(iter(self._wrap_line_cache)))
+        self._wrap_line_cache[context] = current
         return layout
 
     def _display_lines(self) -> _Lines:
