@@ -396,6 +396,39 @@ class GridDataTests(unittest.TestCase):
         finally:
             grid.destroy()
 
+    def test_scrollbar_gutter_is_reserved_only_while_overflowing(self):
+        app, host = App(width=500, height=400), RecordingHost()
+        self.addCleanup(app.destroy)
+        grid = DataGrid(parent=app, left=10, top=10, width=220, height=160)
+        arrange(app, host)
+        header = grid._header_height()
+
+        def axes():
+            return tuple(bar.axis for bar in grid._scrollbars())
+
+        self.assertEqual(axes(), ())
+        self.assertAlmostEqual(grid._viewport(), (220, 160 - header))
+
+        grid.columns = (GridColumn("name", "Name", 80),)
+        grid.rows = (GridRow("a", ("A",)),)
+        self.assertEqual(axes(), ())
+        self.assertAlmostEqual(grid._viewport()[0], 220)
+
+        grid.rows = tuple(GridRow(str(i), (str(i),)) for i in range(40))
+        self.assertEqual(axes(), (1,))
+        self.assertAlmostEqual(grid._viewport()[0], 208)
+        self.assertAlmostEqual(grid._viewport()[1], 160 - header)
+
+        grid.rows = (GridRow("a", ("A",)),)
+        grid.columns = (GridColumn("name", "Name", 400),)
+        self.assertEqual(axes(), (0,))
+        self.assertAlmostEqual(grid._viewport()[0], 220)
+        self.assertAlmostEqual(grid._viewport()[1], 160 - header - 12)
+
+        grid.rows = tuple(GridRow(str(i), (str(i),)) for i in range(40))
+        self.assertEqual(axes(), (1, 0))
+        self.assertAlmostEqual(grid._viewport(), (208, 160 - header - 12))
+
     def test_paint_is_limited_by_viewport_and_outer_clip(self):
         app, host = App(width=500, height=300), RecordingHost()
         try:
@@ -913,11 +946,11 @@ class GridRuntimeTests(AsyncUIOwnerTestCase):
         )
         self.assertEqual(grid.sort_key, "name")
         self.assertEqual(grid.selected_key, "99")
-        thumb = grid._thumbs()[0]
+        thumb = next(bar.thumb for bar in grid._scrollbars() if bar.axis == 1)
         await self.inputs(
-            Input("pointer_down", box.x + thumb.x + 3, box.y + thumb.y + 3),
-            Input("pointer_move", box.x + thumb.x + 3, box.y + grid.header_height + 3),
-            Input("pointer_up", box.x + thumb.x + 3, box.y + grid.header_height + 3),
+            Input("pointer_down", thumb.x + 3, thumb.y + 3),
+            Input("pointer_move", thumb.x + 3, box.y + grid.header_height + 3),
+            Input("pointer_up", thumb.x + 3, box.y + grid.header_height + 3),
         )
         self.assertEqual(grid._scroll, 0)
         self.assertIsNone(grid._drag)

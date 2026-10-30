@@ -314,8 +314,11 @@ class FixedCollectionRowsTests(unittest.TestCase):
         self.assertEqual((grid.selected_key, grid._scroll), ("6", 3))
         grid.handle_input(Input("key_down", key="End"))
         self.assertEqual((grid.selected_key, grid._scroll), ("19", 16))
-        vertical, _ = grid._thumbs()
-        self.assertAlmostEqual(vertical.bottom, 16 + 64)
+        vertical = next(bar for bar in grid._scrollbars() if bar.axis == 1)
+        self.assertAlmostEqual(
+            vertical.thumb.bottom - grid.bounds.y,
+            grid._header_height() + grid._viewport()[1],
+        )
 
     def test_grid_boolean_editor_sizes_its_three_choices_with_host_rows(self):
         app = self.app()

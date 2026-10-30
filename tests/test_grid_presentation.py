@@ -311,6 +311,7 @@ class ColumnPresentationTests(unittest.TestCase):
                             host.positions = []
                             with patch("pysual.painting.draw_icon", wraps=draw_icon) as icon:
                                 paint_tree(app, host)
+                            shown = grid._scroll_x
                             self.assertEqual(len(host.positions), 1)
                             title, x, _, font_size = host.positions[0]
                             self.assertTrue(title.endswith("…"))
@@ -323,10 +324,10 @@ class ColumnPresentationTests(unittest.TestCase):
                             text_width = host.measure(title, font_size)[0]
                             self.assertLessEqual(text_width, available)
                             self.assertAlmostEqual(
-                                x, grid.bounds.x - scroll + 8
+                                x, grid.bounds.x - shown + 8
                                 + (available - text_width) * fraction,
                             )
-                            self.assertAlmostEqual(marker_x, 140 - scroll - 8 - marker_size)
+                            self.assertAlmostEqual(marker_x, 140 - shown - 8 - marker_size)
                             self.assertAlmostEqual(marker_y, (grid._header_height() - marker_size) / 2)
 
 

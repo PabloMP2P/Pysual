@@ -233,6 +233,17 @@ class SurfaceThemeTests(unittest.TestCase):
         self.assertTrue(any(args[3] and args[3].startswith(neon.glow[:7])
                             for args in painted["neon"]))
 
+    def test_platform_grid_header_stays_inside_the_outlined_field(self):
+        for name in ("windows", "windows_dark", "macos", "macos_dark"):
+            with self.subTest(theme=name):
+                theme = get_theme(name)
+                header = theme.resolve("DataGrid", "header")
+                body = theme.resolve("DataGrid")
+                self.assertNotEqual(header.fill, theme.tokens.background)
+                self.assertEqual(header.border, theme.tokens.border)
+                self.assertGreater(body.border_width, 0)
+                self.assert_text_contrast(header.foreground, header)
+
     def test_platform_scrollbars_and_calendar_navigation_use_secondary_roles(self):
         from pysual import CalendarEditor, DataGrid, ListView, ScrollArea, TreeView
         from pysual.painting import _style_kinds, resolve_style

@@ -1734,6 +1734,20 @@ def _platform_theme(name: str) -> Theme:
                                           shadow_blur=2), "segment", "selected")
     else:
         rule("SegmentedControl", replace(accent, radius=3, fill_end=accent.fill), "segment", "selected")
+    # The shared light title bar matches the window. A grid header in that color
+    # covers the field outline and reads as a hole in the top of the control.
+    rule(
+        "DataGrid",
+        Style(
+            fill=t.raised if night else input_fill,
+            foreground=t.foreground,
+            border=t.border,
+            border_width=0,
+            radius=0,
+            shadow="#00000000",
+        ),
+        "header",
+    )
     # Selection uses the same readable accent pair in lists, trees and tables.
     for kind, part in (("TreeView", "row"), ("DataGrid", "cell")):
         rule(kind, replace(selection, fill=t.accent if mac else t.selection,
