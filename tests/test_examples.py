@@ -16,7 +16,7 @@ from pysual.host import Input
 from test_library import RecordingHost
 
 
-@pytest.mark.parametrize('name', ['hello', 'custom_control', 'catalog_controls', 'theme_gallery'])
+@pytest.mark.parametrize('name', ['hello', 'custom_control', 'catalog_controls', 'theme_gallery', 'stepper'])
 @pytest.mark.parametrize('flag,code', [('--help', 0), ('--unknown-option', 2)])
 def test_small_examples_parse_arguments_before_opening(name, flag, code):
     root = Path(__file__).resolve().parents[1]
@@ -60,6 +60,7 @@ def test_dashboard_displays_actual_filtered_revenue():
     ('hello', 'Hello'), ('dashboard', 'Dashboard'),
     ('showcase', 'Showcase'), ('custom_control', 'Demo'),
     ('catalog_controls', 'Demo'), ('theme_gallery', 'ThemeGallery'),
+    ('stepper', 'Demo'),
 ])
 def test_examples_open_paint_and_close(module, name):
     cls = getattr(importlib.import_module(f'examples.{module}'), name)
@@ -461,6 +462,205 @@ def test_showcase_small_window_settings_scroll_and_preserve_edits():
                    and app.sidebar.scroll_y == 0)
         assert app.lab_entry is entry
         assert entry.text == 'Keep this edit while resizing'
+    finally:
+        app.close()
+        app.wait(timeout=5)
+        app.destroy()
+
+
+def click_step_indicator(app, wizard, index):
+    def click():
+        app._runtime._arrange_scene()
+        headers, _ = wizard._geometry(wizard.content_bounds(wizard.bounds))
+        header = headers[index]
+        x, y = header.x + 28, header.y + header.height / 2
+        assert app._runtime.router.hit(app, x, y) is wizard
+        for kind in ('pointer_down', 'pointer_up'):
+            app._runtime._process_input(Input(kind, x=x, y=y))
+    call(click)
+
+
+def replace_step_text(app, entry, text):
+    def edit():
+        app._runtime._arrange_scene()
+        x, y = entry.bounds.x + 12, entry.bounds.y + entry.bounds.height / 2
+        assert app._runtime.router.hit(app, x, y) is entry
+        for kind in ('pointer_down', 'pointer_up'):
+            app._runtime._process_input(Input(kind, x=x, y=y))
+        app._runtime._process_input(Input('key_down', key='a', ctrl=True))
+        app._runtime._process_input(Input('key_up', key='a', ctrl=True))
+        app._runtime._process_input(Input('text', text=text) if text else Input('key_down', key='Backspace'))
+    call(edit)
+    assert entry.text == text
+
+
+@pytest.mark.parametrize('page', ['Step', 'Stepper'])
+def test_showcase_stepper_validates_navigates_and_disposes_its_specimen(page):
+    from examples.showcase import Showcase
+    from pysual import Label, Stepper, TextBox
+
+    app = Showcase(reduce_motion=True)
+
+    def wait_until(predicate):
+        deadline = time.monotonic() + 5
+        while not call(predicate) and time.monotonic() < deadline:
+            time.sleep(.005)
+        assert call(predicate)
+
+    try:
+        app.run(backend=RecordingHost())
+        app.animate.checked = False
+        app.catalog.selected_index = app._pages.index(page)
+        wait_until(lambda: any(isinstance(child, Stepper) for child in app.workspace.children))
+        wizard = next(child for child in app.workspace.children if isinstance(child, Stepper))
+        account, preferences, review = wizard.steps
+        assert all(step.children for step in wizard.steps)
+        assert preferences.optional
+        name_entry = next(child for child in account.children if isinstance(child, TextBox))
+        note_entry = next(child for child in preferences.children if isinstance(child, TextBox))
+        assert wizard.children == wizard.steps and not account.error
+        replace_step_text(app, name_entry, '   ')
+        assert not account.error and not account.completed
+        click_step_indicator(app, wizard, 1)
+        wait_until(lambda: account.error == 'Enter a workspace name')
+        assert wizard.selected_index == 0 and not account.completed
+        replace_step_text(app, name_entry, 'Zoë’s workspace')
+        wait_until(lambda: account.completed and not account.error)
+        assert wizard.selected_index == 0  # Repairing feedback does not navigate.
+        click_step_indicator(app, wizard, 1)
+        wait_until(lambda: wizard.selected_index == 1)
+        assert account.completed and not account.error
+        replace_step_text(app, note_entry, 'Keep this note')
+        click_step_indicator(app, wizard, 0)
+        wait_until(lambda: wizard.selected_index == 0)
+        assert name_entry.text == 'Zoë’s workspace'
+        replace_step_text(app, name_entry, '   ')
+        wait_until(lambda: not account.completed and account.error == 'Enter a workspace name')
+        assert not wizard.can_select(1)
+        assert wizard.selected_index == 0
+        replace_step_text(app, name_entry, 'Zoë’s workspace')
+        wait_until(lambda: account.completed and not account.error)
+        click_step_indicator(app, wizard, 1)
+        wait_until(lambda: wizard.selected_index == 1)
+        assert account.completed and not account.error
+        assert note_entry.text == 'Keep this note'
+        replace_step_text(app, note_entry, '')
+        click_step_indicator(app, wizard, 2)
+        wait_until(lambda: wizard.selected_index == 2 and any(
+            isinstance(child, Label) and child.text == 'Workspace: Zoë’s workspace'
+            for child in review.children))
+        assert not preferences.completed
+        assert [child.text for child in review.children if isinstance(child, Label)] == [
+            'Workspace: Zoë’s workspace', 'No note added.',
+        ]
+        assert not review.completed
+        app.catalog.selected_index = app._pages.index('Overview')
+        wait_until(lambda: wizard._disposed)
+        assert all(control._disposed for control in (name_entry, note_entry, account, preferences, review))
+        app.catalog.selected_index = app._pages.index(page)
+        wait_until(lambda: any(isinstance(child, Stepper) for child in app.workspace.children))
+        replacement = next(child for child in app.workspace.children if isinstance(child, Stepper))
+        assert replacement is not wizard and replacement.selected_index == 0
+    finally:
+        app.close()
+        app.wait(timeout=5)
+        app.destroy()
+
+
+@pytest.mark.parametrize('orientation', ['horizontal', 'vertical'])
+def test_stepper_example_validates_navigation_and_repairs_errors_live(orientation):
+    from examples.stepper import Demo
+
+    app = Demo(reduce_motion=True)
+
+    def wait_until(predicate):
+        deadline = time.monotonic() + 5
+        while not call(predicate) and time.monotonic() < deadline:
+            time.sleep(.005)
+        assert call(predicate)
+
+    try:
+        app.run(backend=RecordingHost())
+        assert app.wizard.children == app.wizard.steps
+        assert app.reset_form.parent is app
+        app.orientation_choice.selected_index = int(orientation == 'vertical')
+        wait_until(lambda: app.wizard.orientation == orientation)
+        for width in (375, 860):
+            app.width = width
+            wait_until(lambda: app.bounds.width == width and all(
+                control._clip == control.bounds for control in (*app.settings.children, app.reset_form)))
+            assert app.linear_choice.bounds.width == 140
+            assert app.linear_choice.bounds.right <= app.bounds.right - app.padding
+            assert app.reset_form.bounds.bottom <= app.bounds.bottom - app.padding
+        click_step_indicator(app, app.wizard, 0)
+        assert not app.account.error  # Selecting the current step does not validate it.
+        click_step_indicator(app, app.wizard, 1)
+        wait_until(lambda: app.account.error == 'Enter a workspace name')
+        assert app.wizard.selected_index == 0 and not app.account.completed
+        replace_step_text(app, app.name_entry, 'Zoë’s workspace')
+        wait_until(lambda: app.account.completed and not app.account.error)
+        assert app.wizard.selected_index == 0
+        click_step_indicator(app, app.wizard, 1)
+        wait_until(lambda: app.wizard.selected_index == 1)
+        assert app.account.completed and not app.account.error
+        replace_step_text(app, app.note_entry, 'Retained note')
+        click_step_indicator(app, app.wizard, 0)
+        wait_until(lambda: app.wizard.selected_index == 0)
+        assert app.name_entry.text == 'Zoë’s workspace'
+        replace_step_text(app, app.name_entry, '   ')
+        wait_until(lambda: not app.account.completed and app.account.error == 'Enter a workspace name')
+        assert not app.wizard.can_select(1)
+        assert app.wizard.selected_index == 0
+        replace_step_text(app, app.name_entry, 'Updated workspace')
+        wait_until(lambda: app.account.completed and not app.account.error)
+        click_step_indicator(app, app.wizard, 1)
+        wait_until(lambda: app.wizard.selected_index == 1)
+        assert app.account.completed and not app.account.error
+        assert app.note_entry.text == 'Retained note'
+        click_step_indicator(app, app.wizard, 2)
+        wait_until(lambda: app.wizard.selected_index == 2 and app.summary.text == 'Workspace: Updated workspace')
+        assert not app.preferences.completed  # An optional step may still be skipped.
+        assert app.summary.text == 'Workspace: Updated workspace'
+        assert app.note_summary.text == 'Retained note'
+        assert not app.review.completed
+        app.reset_form.activate()
+        wait_until(lambda: app.wizard.selected_index == 0 and not app.name_entry.text
+                   and not app.note_entry.text)
+        assert all(not step.completed and not step.error for step in app.wizard.steps)
+        assert app.wizard.orientation == orientation and app.wizard.linear
+        app.linear_choice.checked = False
+        wait_until(lambda: not app.wizard.linear)
+        click_step_indicator(app, app.wizard, 1)
+        wait_until(lambda: app.wizard.selected_index == 1)
+        assert not app.account.completed and not app.account.error
+        click_step_indicator(app, app.wizard, 2)
+        wait_until(lambda: app.wizard.selected_index == 0 and app.account.error == 'Enter a workspace name')
+        # Review's explicit prerequisite still applies without linear flow.
+        replace_step_text(app, app.name_entry, 'Ready for review')
+        wait_until(lambda: app.account.completed and not app.account.error)
+        click_step_indicator(app, app.wizard, 2)
+        wait_until(lambda: app.wizard.selected_index == 2 and app.summary.text == 'Workspace: Ready for review')
+        assert app.account.completed and not app.account.error
+        assert app.note_summary.text == 'No note added.'
+        click_step_indicator(app, app.wizard, 0)
+        wait_until(lambda: app.wizard.selected_index == 0)
+        replace_step_text(app, app.name_entry, '')
+        wait_until(lambda: not app.account.completed and app.account.error == 'Enter a workspace name')
+        click_step_indicator(app, app.wizard, 1)
+        wait_until(lambda: app.wizard.selected_index == 1)
+        # This destination has no prerequisites in nonlinear mode, despite Account's error.
+        click_step_indicator(app, app.wizard, 2)
+        wait_until(lambda: app.wizard.selected_index == 0 and app.account.error == 'Enter a workspace name')
+        assert not app.account.completed
+        replace_step_text(app, app.name_entry, 'Valid after reset')
+        wait_until(lambda: app.account.completed and not app.account.error)
+        click_step_indicator(app, app.wizard, 2)
+        wait_until(lambda: app.wizard.selected_index == 2 and app.summary.text == 'Workspace: Valid after reset')
+        assert app.account.completed and not app.account.error
+        assert not app.preferences.completed and not app.review.completed
+        app.reset_form.activate()
+        wait_until(lambda: app.wizard.selected_index == 0 and not app.name_entry.text)
+        assert not app.wizard.linear and app.wizard.orientation == orientation
     finally:
         app.close()
         app.wait(timeout=5)

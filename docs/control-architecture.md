@@ -34,6 +34,7 @@ The system has three levels:
 | `fields.py`, `dates.py` | Composed search fields and calendar content with date-picker presentation. |
 | `_controls/indicators.py`, `navigation.py` | Interval selection, circular progress, segmented choices, breadcrumbs, and pagination. |
 | `cards.py`, `feedback.py` | Exclusive choice cards, expandable content, semantic status badges, actionable alerts, and bounded meters. |
+| `steppers.py` | Indicator navigation, awaited application validation, and explicit prerequisites between owned steps. |
 | `widgets.py`, `selection.py` | Stable public import facades, not places to add implementation bodies. |
 
 Moved classes retain their public imports and `__module__` names, preserving
@@ -229,8 +230,24 @@ Thirteen ideas are implemented in the library and exercised together in
 | `AlertBanner` | A persistent message owns matched action/dismiss hit regions and keyboard commands without changing the event router. |
 | `Meter` | A measured level shares numeric bounds, optional ordered thresholds, and bounded segmented or continuous drawing. |
 
-All 43 built-in types are discoverable, with the same 30 historical factory
-aliases. The thirteen new controls are registered without Container aliases. Existing application
+`Step` and `Stepper`, demonstrated in [`examples/stepper.py`](../examples/stepper.py),
+extend these contracts to a multi-step form. `Step` owns ordinary child controls;
+`Stepper` owns selection, visibility, and header gestures. Pointer and keyboard
+navigation await the destination's prerequisites, running their `validating`
+handlers even when previously completed. A failed check selects the relevant
+step and shows its error. Subsequent field edits rerun that rule automatically,
+keeping feedback current without per-field handlers. `requires` stores actual
+Step references alongside the linear progression rules, without depending on
+catalog names. Applications can also await
+`Step.validate()` directly for other checks. Selecting the final indicator only
+selects its content; saving and submitting belong to the application. Direct
+navigation and `Step.set_validation` remain available. The control uses the
+existing event, modality, focus, and ownership contracts. `Step` and `Stepper`
+reuse `ScrollArea`: step content scrolls, and a vertical Stepper scrolls its
+headings with the active content when the available height is too small.
+
+All 45 built-in types are discoverable, with the same 30 historical factory
+aliases. The fifteen new controls are registered without Container aliases. Existing application
 members named `rating`, `search_field`, or `date_picker` remain available.
 They work with direct constructors, `Container.create`, and (for controls whose
 inputs are schema properties) blueprints. No backend or input-router branches

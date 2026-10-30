@@ -496,6 +496,29 @@ class Theme:
                 result.update(foreground=t.muted)
                 if state == "disabled":
                     result.update(fill=t.surface if selected else "#00000000")
+        if "Stepper" in kinds and part not in ("track", "thumb"):
+            result.update(fill="#00000000", foreground=t.foreground,
+                          radius=0, border_width=0)
+            if part == "header" and state in ("hover", "pressed"):
+                result.update(fill=t.selection)
+            if part in ("description", "connector"):
+                result.update(foreground=t.border if part == "connector" else t.muted)
+            if part == "description":
+                result.update(font_size=12)
+            if part == "indicator":
+                fill = t.accent if selected else t.muted
+                result.update(fill=fill, radius=12, font_size=12,
+                              foreground=_readable_ink(t.accent_text, fill, t.background))
+            if part == "error":
+                result.update(fill=t.danger, foreground=t.danger, font_size=12)
+            if state == "disabled":
+                if part != "error":
+                    result.update(foreground=t.muted)
+                if part == "indicator":
+                    result.update(fill=t.border,
+                                  foreground=_readable_ink(t.muted, t.border, t.foreground))
+                elif part == "header":
+                    result.update(fill="#00000000")
         if "ChoiceCard" in kinds:
             active = checked or selected
             result.update(fill=t.selection if active else t.surface,
@@ -952,6 +975,16 @@ def _content_rules(t: Tokens, panel: Style, field: Style) -> list[Rule]:
     # Explicitly clear Button fallback effects on every interactive state.
     quiet = Style(shadow="#00000000", glow_width=0, highlight="#00000000",
                   inner_border="#00000000", bevel="none", pattern="none")
+    # Steppers retain semantic colors from their tokens in every theme family.
+    # Clear inherited panel decoration so the connectors and circles stay light.
+    for part in ("body", "header", "label", "description", "connector"):
+        rule("Stepper", part, replace(quiet, fill="#00000000", fill_end="#00000000",
+                                      radius=0, border_width=0))
+    for state in ("hover", "pressed"):
+        rule("Stepper", "header", Style(fill=t.selection, fill_end=t.selection), state)
+    rule("Stepper", "header", Style(fill="#00000000", fill_end="#00000000"), "disabled")
+    for part in ("indicator", "error"):
+        rule("Stepper", part, replace(quiet, border_width=0, radius=12))
     card = replace(
         panel, foreground=t.foreground, border_width=panel.border_width or 1,
         fill_end=panel.fill_end or panel.fill,

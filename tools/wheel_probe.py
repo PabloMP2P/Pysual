@@ -14,8 +14,9 @@ def main(kind):
     from pysual import (
         AlertBanner, App, Badge, Breadcrumb, ChoiceCard, CircularProgress,
         Container, Disclosure, Image, Label, Meter, Pagination,
-        RangeSlider, SegmentedControl, image_source, registered_controls,
+        RangeSlider, SegmentedControl, Step, Stepper, image_source, registered_controls,
     )
+    from pysual._catalog import BUILTIN_CONTROLS
     from pysual._png import encode_png
     from pysual.backends._native_client import native_executable
     from pysual.backends.native import NativeHost
@@ -53,6 +54,18 @@ def main(kind):
 
     # The installed catalog must include the new focused family modules and
     # their public exports without adding reserved factory names to containers.
+    expected = {entry.name: entry.control_type for entry in BUILTIN_CONTROLS}
+    assert len(expected) == len(BUILTIN_CONTROLS), "Duplicate built-in catalog names"
+    catalog = dict(registered_controls())
+    assert catalog == expected, catalog
+    factories = dict(registered_controls(factories_only=True))
+    assert factories == {entry.name: entry.control_type for entry in BUILTIN_CONTROLS
+                         if entry.legacy_factory}, factories
+    for entry in BUILTIN_CONTROLS:
+        assert getattr(pysual, entry.control_type.__name__) is entry.control_type
+    assert catalog["step"] is Step and catalog["stepper"] is Stepper
+    assert {"Step", "Stepper"}.issubset(pysual.__all__)
+    assert not {"step", "stepper"}.intersection(factories)
     panel = Container()
     try:
         interval = panel.create(RangeSlider, value=(20, 80))
@@ -74,8 +87,19 @@ def main(kind):
         meter = panel.create(Meter, value=50, warning_at=75, danger_at=90)
         meter.set_range(0, 80)
         assert (meter.value, meter.warning_at, meter.danger_at) == (50, 75, 80)
-        assert len(registered_controls()) == 43
-        assert len(registered_controls(factories_only=True)) == 30
+        wizard = panel.create(Stepper)
+        account = wizard.create(Step, title="Account")
+        review = wizard.create(Step, title="Review")
+        content = account.create(Label, text="Installed step content")
+        assert wizard.steps == (account, review)
+        assert wizard.selected_step is account and account.visible and not review.visible
+        assert not wizard.next()  # Linear navigation waits for application validation.
+        account.completed = True
+        assert wizard.next() and wizard.selected_step is review
+        assert review.visible and not account.visible
+        assert wizard.previous() and wizard.selected_step is account
+        assert account.visible and not review.visible
+        assert content.parent is account and content.text == "Installed step content"
         children = panel.children
     finally:
         panel.destroy()

@@ -104,9 +104,10 @@ need no application Python server. See [Web delivery](https://github.com/PabloMP
 
 ## Included
 
-- 43 catalog controls: editable grids, virtual lists/trees, tabs, menus, dialogs,
+- 45 catalog controls: editable grids, virtual lists/trees, tabs, menus, dialogs,
   text and value editors, charts, range selection, navigation, choice cards,
-  disclosure groups, badges, actionable alerts, meters, and progress.
+  disclosure groups, horizontal/vertical steppers, badges, actionable alerts,
+  meters, and progress.
 - Five layout modes, nine theme families in light and dark (18 themes), 44 icons, bundled fonts, shadows, gradients,
   surfaces, interaction motion, and custom painting.
 - Unicode text editing, selection, clipboard where supported, undo/redo,
@@ -124,6 +125,7 @@ need no application Python server. See [Web delivery](https://github.com/PabloMP
 | [custom_control.py](https://github.com/PabloMP2P/Pysual/blob/main/examples/custom_control.py) | Observable properties and portable drawing |
 | [composite_control.py](https://github.com/PabloMP2P/Pysual/blob/main/examples/composite_control.py) | Reusable compound controls with independent child state and handlers |
 | [catalog_controls.py](https://github.com/PabloMP2P/Pysual/blob/main/examples/catalog_controls.py) | Thirteen catalog ideas in a responsive review workspace with collapsible filters, review plans, status feedback, and live theme switching |
+| [stepper.py](https://github.com/PabloMP2P/Pysual/blob/main/examples/stepper.py) | A multi-step form with horizontal/vertical layouts, optional steps, validation, and linear/non-linear navigation |
 
 Choose Modern, Windows, macOS, Terminal, Win31, WinXP, Macintosh, Analog arcade,
 or Neon. Each has a light and dark version with its own control surfaces,

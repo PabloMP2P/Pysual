@@ -633,6 +633,17 @@ class DataGrid(Control):
         self._places = rows, columns, updated
 
     def _changed(self, field: Field, old: object, value: object) -> None:
+        self._update_data_state(field, old, value)
+        super()._changed(field, old, value)
+        # Rows have no public changed event, but enclosing form controls still
+        # need committed data changes. A custom event already forwards these.
+        if field.name == "rows" and not field.definition.changed and self._parent is not None:
+            self._parent._descendant_changed(ChangeEvent(
+                source=self, old_value=old, new_value=value,
+                property_name=field.name, origin=self._origin,
+            ))
+
+    def _update_data_state(self, field: Field, old: object, value: object) -> None:
         if field.name == "rows" and self._pending_cell is not None:
             replacement, column, order, positions, user_edit = self._pending_cell
             self._pending_cell = None
@@ -665,7 +676,6 @@ class DataGrid(Control):
                 if self._popup is not None and self._popup.is_open:
                     # Rows only dirty paint; request layout for a moved editor.
                     self._popup.reposition()
-            super()._changed(field, old, value)
             return
         if field.name in (
             "columns",
@@ -687,7 +697,6 @@ class DataGrid(Control):
                 self._resize = self._resize_columns = None
                 self._close_editor()
                 self._reveal()
-            super()._changed(field, old, value)
             return
         if field.name in (
             "columns",
@@ -715,7 +724,6 @@ class DataGrid(Control):
             "sort_descending",
         ):
             self._reveal()
-        super()._changed(field, old, value)
 
     def set_data(
         self, *, columns: tuple[GridColumn, ...], rows: tuple[GridRow, ...]
@@ -1200,6 +1208,7 @@ class DataGrid(Control):
             )
             positions = {item.key: i for i, item in enumerate(order)}
         self._pending_cell = replacement, index, order, positions, origin == "user"
+        previous_origin, self._origin = self._origin, origin
         try:
             if customized:
                 self._apply_validated({"rows": candidate})
@@ -1209,6 +1218,7 @@ class DataGrid(Control):
                 self._changed(self._schema["rows"], rows, candidate)
         finally:
             self._pending_cell = None
+            self._origin = previous_origin
         self.edited.emit(
             GridEditEvent(
                 source=self,

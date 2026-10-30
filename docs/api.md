@@ -164,7 +164,7 @@ Terminal and Web own their cell/device scale; use automatic scale or `1` there.
 | Values | `CheckBox`, `Toggle`, `RadioButton`, `Slider`, `ProgressBar`, `NumericInput`, `ColorPicker` |
 | Text and selection | `TextBox`, `Dropdown`, `ComboBox`, `ListView`, `TreeView` |
 | Data | `DataGrid`, `LineChart`, `DonutChart` |
-| Composition | `Container`, `GroupBox`, `ScrollArea`, `TabControl`, `TabPage`, `SplitPane`, `SubWindow`, `Popup` |
+| Composition | `Container`, `GroupBox`, `ScrollArea`, `TabControl`, `TabPage`, `Step`, `Stepper`, `SplitPane`, `SubWindow`, `Popup` |
 | Commands | `Menu`, `MenuBar` |
 
 Controls expose validated properties. Ordinary assignments invalidate the
@@ -871,6 +871,113 @@ arrows and Home/End work from the keyboard. `changed` carries page numbers.
 On filtering, use `update(page_count=..., page=...)` to commit a new count and
 valid page together. Represent an empty result set with `page_count=1`, `page=1`,
 and `enabled=False`; the control does not fetch or slice application data.
+
+### Steppers
+
+`Stepper` presents a sequence of ordinary `Step` containers, with numbered
+headings and connecting lines inspired by [Material steppers](https://m1.material.io/components/steppers.html).
+Click a numbered indicator or heading to navigate. The horizontal
+presentation places active content below the heading row; `orientation="vertical"`
+places it below its own heading. Child controls retain their values between steps.
+Step content scrolls automatically; a vertical Stepper scrolls headings and active
+content together when they exceed the available height.
+Define a validation rule on each step that needs one. Clicking another step runs
+the required checks automatically: valid input lets you continue, and invalid
+input shows the relevant step and its error. Once an error is shown, editing the
+fields reruns the rule and clears the message when valid, without moving steps.
+There is no need to connect every field's change event. Selecting the last step
+only shows its content; submitting or saving belongs to the application.
+
+<!-- recipe: stepper -->
+```python
+from pysual import Label, Step, Stepper, TextBox, ValidationEvent
+
+wizard = panel.create(Stepper)
+account = wizard.create(Step, title="Account")
+name = account.create(TextBox, placeholder="Your name")
+review = wizard.create(Step, title="Review", requires=[account])
+Label(parent=review, text="Review your details.")
+
+def account_validating(event: ValidationEvent) -> None:
+    if not name.text.strip():
+        event.reject("Enter your name")
+
+account.validating.connect(account_validating)
+```
+
+In an App or composite, name the step `self.account` and define
+`account_on_validating(event)` to bind the same rule automatically. Handlers may
+be synchronous or asynchronous: return `True` or `None` to accept, `False` to
+reject, or call `event.reject(message)` to supply useful feedback. A step with no
+validation handler is accepted by default.
+
+Pointer and keyboard navigation run the destination's prerequisite checks,
+including steps already marked completed, so editing an earlier answer cannot
+bypass its rule. A failed check selects that step and shows its message; success
+clears any old message. Going back checks only the destination's prerequisites,
+and choosing the current step does nothing.
+The active error appears in a full-width row below horizontal headings, or in
+the active heading in vertical mode.
+
+New forms stay quiet until validation is requested. After a shown error, live
+feedback continues as fields change, including after a successful repair.
+`await step.validate()` also runs the same rule explicitly, updates completion
+and feedback, and returns a boolean. `show_error=False` keeps invalid input quiet
+until a message has been shown. This method does not navigate. When asynchronous
+checks overlap, only the newest validation result is applied.
+
+`select(index)`, `next()`, and `previous()` are synchronous navigation methods.
+They consult completion/error state without running validation or marking completion.
+`can_select(index)` reports whether the cached state permits selection. A heading
+can still be clicked when this returns `False`: the click runs validation before
+deciding whether to move.
+
+With default `linear=True`, earlier required steps must be completed and free of
+errors. Indicator navigation validates them before selecting the destination.
+`optional=True` allows a step to be skipped without validating or completing it,
+unless another step explicitly requires it. `linear=False` allows steps out of order.
+Explicit prerequisites still apply: `requires=[account]` uses actual
+Step references and prevents entering Review until Account is valid, even in
+nonlinear mode. It is additional to linear progression, not a replacement for it.
+Prerequisites must be attached to the same Stepper first; self references,
+duplicates, and cycles are rejected. Their own prerequisites also apply. A
+disabled prerequisite still counts when completed; an incomplete one blocks
+progress.
+
+Add only `Step` objects as application children of a Stepper; put fields inside
+each step. `steps` returns their ordered tuple. `selected_step` is the active step,
+or `None` when empty. `selected_index` is zero-based and defaults to 0; an empty Stepper
+keeps 0 as its placeholder index. The Stepper owns step visibility, so change
+selection instead of assigning `Step.visible`.
+
+A completed step with `editable=False` cannot be revisited through navigation.
+Arrow keys follow the orientation, Home/End request the first/last available step, and
+Enter/Space activate on release. Direct assignment to `selected_index` is an
+application override, still checked for bounds and modal visibility. Selection
+emits `changed` with old/new indices and the user/program origin. Inactive content
+is hidden from painting, picking, and keyboard navigation without losing state.
+
+`wizard.reset()` clears progress, errors, and scroll offsets, stops live feedback until validation
+shows another error, and selects the first step. It preserves field values,
+which the application can clear explicitly.
+
+Manual integrations can still assign `completed`/`error` or call
+`step.set_validation(error, show_error=True)`: an empty string accepts, a message
+rejects, and the return value is a boolean. This applies an already-computed
+result without running handlers or navigating. Without validating handlers,
+later validation respects that stored result, including a quiet error.
+`completed=True` draws a check mark; a nonempty `error` draws the error indicator
+and message.
+
+`header_height` defaults to 72 logical pixels and `step_width` to 180. Theme parts
+are `body`, `header`, `label`, `description`, `indicator`, `connector`, `error`,
+`track`, and `thumb`.
+Both classes support direct construction and `Container.create`. Blueprints
+support their schema properties; assign `review.requires = [account]` after the
+blueprint Steps are created, since prerequisites are live references rather than
+schema values. Neither class reserves additional Container factory names. Run
+[`examples/stepper.py`](../examples/stepper.py) to try validation, optional steps,
+and switching orientation without rebuilding the form.
 
 ### Choice cards, disclosure groups, and feedback
 

@@ -19,6 +19,7 @@ from .dates import DatePicker
 from ._controls.indicators import RangeSlider, CircularProgress
 from .navigation import SegmentedControl, Breadcrumb, Pagination
 from .cards import ChoiceCard, Disclosure
+from .steppers import Step, Stepper
 from .feedback import Badge, AlertBanner, Meter
 from .extras import GroupBox, Hyperlink, Separator
 from .menus import Menu, MenuBar
@@ -76,6 +77,8 @@ BUILTIN_CONTROLS = (
     BuiltinControl("pagination", Pagination, "navigation"),
     BuiltinControl("choice_card", ChoiceCard, "actions"),
     BuiltinControl("disclosure", Disclosure, "layout"),
+    BuiltinControl("step", Step, "layout"),
+    BuiltinControl("stepper", Stepper, "navigation"),
     BuiltinControl("badge", Badge, "feedback"),
     BuiltinControl("alert_banner", AlertBanner, "feedback"),
     BuiltinControl("meter", Meter, "feedback"),

@@ -48,6 +48,8 @@ from pysual import (
     Separator,
     Slider,
     SplitPane,
+    Step,
+    Stepper,
     SubWindow,
     TabControl,
     TabPage,
@@ -57,6 +59,7 @@ from pysual import (
     TreeNode,
     TreeView,
     UiEvent,
+    ValidationEvent,
     get_theme,
     prop,
     register_control,
@@ -391,6 +394,29 @@ class Showcase(App):
 
     def lab_window_on_click(self, event: ClickEvent):
         self.modeless_button_on_click(event)
+
+    def page_stepper(self):
+        wizard = Stepper(parent=self.workspace, height=220)
+        account = Step(parent=wizard, title="Account")
+        Label(parent=account, text="Give your workspace a name.", height=26)
+        name_entry = TextBox(parent=account, placeholder="Workspace name", height=38)
+        preferences = Step(parent=wizard, title="Preferences", optional=True)
+        Label(parent=preferences, text="Add an optional note.", height=26)
+        note_entry = TextBox(parent=preferences, placeholder="Optional note", height=38)
+        review = Step(parent=wizard, title="Review", requires=[account])
+        summary = Label(parent=review, text="Review your workspace.", word_wrap=True)
+        note_summary = Label(parent=review, text="No note added.", word_wrap=True)
+
+        def validate_account(event: ValidationEvent):
+            if not name_entry.text.strip():
+                event.reject("Enter a workspace name")
+
+        def refresh(event: ChangeEvent[int]):
+            summary.text = f"Workspace: {name_entry.text.strip()}"
+            note_summary.text = note_entry.text.strip() or "No note added."
+
+        account.validating.connect(validate_account)
+        wizard.changed.connect(refresh)
 
     def show_page(self, name):
         for child in self.workspace.children:
@@ -962,6 +988,8 @@ class Showcase(App):
                 text="Desktop and web run the same controls, events and layout.",
                 height=26,
             )
+        elif name in ("Step", "Stepper"):
+            self.page_stepper()
         elif name in self._catalog:
             cls = self._catalog[name]
             try:

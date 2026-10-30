@@ -18,6 +18,7 @@ from typing import (
     TypeVar,
     Protocol,
     Union,
+    cast,
     get_args,
     get_origin,
     get_type_hints,
@@ -118,8 +119,37 @@ class ClosingEvent(UiEvent):
         self._decision.cancelled = True
 
 
+@dataclass
+class _ValidationDecision(_Decision):
+    message: str = ""
+
+
+@dataclass(frozen=True, kw_only=True)
+class ValidationEvent(ClosingEvent):
+    """An awaited validation decision; reject with optional user-facing feedback."""
+
+    _decision: _ValidationDecision = field(
+        default_factory=_ValidationDecision, repr=False, compare=False
+    )
+
+    @property
+    def message(self) -> str:
+        return self._decision.message
+
+    def reject(self, message: str = "") -> None:
+        if not is_ui_thread():
+            return call(self.reject, message)
+        if type(message) is not str:
+            raise TypeError("Validation message must be a string")
+        self.cancel()
+        if message and not self._decision.message:
+            self._decision.message = message
+
+
 E = TypeVar("E", bound=UiEvent)
+DecisionT = TypeVar("DecisionT", bound=ClosingEvent)
 Callback = Callable[[E], None | Awaitable[None]]
+ValidationCallback = Callable[[ValidationEvent], bool | None | Awaitable[bool | None]]
 
 
 def source_label(owner: object) -> str:
@@ -188,6 +218,9 @@ class Event(Generic[E]):
     def __set_name__(self, owner: type, name: str) -> None:
         self.name = name
 
+    def _make_channel(self, owner: EventOwner) -> Channel[E]:
+        return Channel(owner, self)
+
     @overload
     def __get__(self, owner: None, cls: type | None = None) -> Event[E]: ...
     @overload
@@ -201,7 +234,7 @@ class Event(Generic[E]):
             return call(self.__get__, owner, cls)
         owner._check_live()
         if self.name not in owner._channels:
-            owner._channels[self.name] = Channel(owner, self)
+            owner._channels[self.name] = self._make_channel(owner)
         return owner._channels[self.name]
 
 
@@ -272,6 +305,35 @@ class Channel(Generic[E]):
         dispatcher = self.owner._dispatcher
         if dispatcher is not None:
             dispatcher.emit(self, event)
+
+
+class _ValidationChannel(Channel[ValidationEvent]):
+    @ui_method
+    def connect(self, callback: ValidationCallback) -> Subscription:
+        # Storage and lifecycle are shared with ordinary channels; only this
+        # channel's public callback contract admits a boolean decision.
+        return super().connect(cast(Callback[ValidationEvent], callback))
+
+
+class Validation(Event[ValidationEvent]):
+    """A typed validation channel accepting False as well as event.reject()."""
+
+    def __init__(self, *, doc: str = ""):
+        super().__init__(ValidationEvent, doc=doc)
+
+    def _make_channel(self, owner: EventOwner) -> _ValidationChannel:
+        return _ValidationChannel(owner, self)
+
+    @overload
+    def __get__(self, owner: None, cls: type | None = None) -> Validation: ...
+    @overload
+    def __get__(self, owner: EventOwner, cls: type | None = None) -> _ValidationChannel: ...
+    def __get__(
+        self, owner: EventOwner | None, cls: type | None = None
+    ) -> Validation | _ValidationChannel:
+        if owner is None:
+            return self
+        return cast(_ValidationChannel, super().__get__(owner, cls))
 
 
 class Dispatcher:
@@ -356,9 +418,11 @@ class Dispatcher:
         phase_token = _phase.set(None)
         try:
             if terminal or not channel.owner._disposed:
-                result = callback(event)
+                result: object = callback(event)
                 if inspect.isawaitable(result):
-                    await result
+                    result = await result
+                if isinstance(event, ValidationEvent) and result is False:
+                    event.reject()
         except Exception as error:
             annotate_error(
                 error,
@@ -453,9 +517,9 @@ class Dispatcher:
                 raise errors[0]
             raise BaseExceptionGroup("Event handlers failed", errors)
 
-    async def decide(self, channel: Channel[ClosingEvent], event: ClosingEvent) -> bool:
+    async def decide(self, channel: Channel[DecisionT], event: DecisionT) -> bool:
         if event.source is not channel.owner or event._decision.sealed:
-            raise LifecycleError("Invalid or already-dispatched closing event")
+            raise LifecycleError("Invalid or already-dispatched decision event")
         listeners = channel._snapshot()
         self._reserve(len(listeners), channel)
         remaining = len(listeners)

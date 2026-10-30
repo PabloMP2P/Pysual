@@ -40,10 +40,32 @@ def test_import_does_not_consume_args_or_start_resources():
     result = isolated('''
 import json,pysual
 from pysual._engine import _instance
-print(json.dumps([sys.argv[1:],_instance is None, len(pysual.registered_controls()),
-                  len(pysual.theme_names()),len(pysual.icon_names())]))
+print(json.dumps([sys.argv[1:],_instance is None]))
 ''', '--backend', 'web')
-    assert result == [['--backend', 'web'], True, 43, 18, 44]
+    assert result == [['--backend', 'web'], True]
+
+
+def test_import_registers_the_declared_catalog_and_legacy_factories():
+    # A fresh process excludes application registrations made by other tests.
+    result = isolated('''
+import json,pysual
+from pysual._catalog import BUILTIN_CONTROLS
+expected = {entry.name: entry.control_type for entry in BUILTIN_CONTROLS}
+assert len(expected) == len(BUILTIN_CONTROLS), "Duplicate built-in catalog names"
+catalog = dict(pysual.registered_controls())
+assert catalog == expected, catalog
+factories = dict(pysual.registered_controls(factories_only=True))
+assert factories == {entry.name: entry.control_type for entry in BUILTIN_CONTROLS
+                     if entry.legacy_factory}, factories
+for entry in BUILTIN_CONTROLS:
+    assert getattr(pysual, entry.control_type.__name__) is entry.control_type
+assert catalog["step"] is pysual.Step
+assert catalog["stepper"] is pysual.Stepper
+assert {"Step", "Stepper"}.issubset(pysual.__all__)
+assert not {"step", "stepper"}.intersection(factories)
+print(json.dumps(True))
+''')
+    assert result is True
 
 
 def test_opted_in_cli_preserves_application_args_and_selects_python_terminal():

@@ -570,16 +570,23 @@ class Control(SchemaObject, metaclass=_ControlMeta):
         # ancestor walk for ordinary built-in controls.
         if type(self).invalidate is not Control.invalidate:
             self.invalidate(self._change_affects(field, old, value))
-        if field.definition.changed and self._dispatcher is not None:
-            getattr(self, field.definition.changed).emit(
-                ChangeEvent(
-                    source=self,
-                    old_value=old,
-                    new_value=value,
-                    property_name=field.name,
-                    origin=self._origin,
-                )
+        if field.definition.changed and (self._dispatcher is not None or self._parent is not None):
+            event = ChangeEvent(
+                source=self,
+                old_value=old,
+                new_value=value,
+                property_name=field.name,
+                origin=self._origin,
             )
+            if self._dispatcher is not None:
+                getattr(self, field.definition.changed).emit(event)
+            if self._parent is not None:
+                self._parent._descendant_changed(event)
+
+    def _descendant_changed(self, event: ChangeEvent[object]) -> None:
+        """Notify enclosing composites of a committed value change."""
+        if self._parent is not None:
+            self._parent._descendant_changed(event)
 
     def _change_affects(self, field: Field, old: object, value: object) -> Dirty:
         if field.name in ("left", "top", "anchor"):

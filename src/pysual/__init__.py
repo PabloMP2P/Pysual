@@ -18,6 +18,7 @@ from .controls import registered_controls as registered_controls
 from .events import (
     ClickEvent as ClickEvent,
     ClosingEvent as ClosingEvent,
+    ValidationEvent as ValidationEvent,
     Event as Event,
     UiEvent as UiEvent,
 )
@@ -120,6 +121,7 @@ from .navigation import (
     BreadcrumbEvent as BreadcrumbEvent, Pagination as Pagination,
 )
 from .cards import ChoiceCard as ChoiceCard, Disclosure as Disclosure
+from .steppers import Step as Step, Stepper as Stepper
 from .feedback import Badge as Badge, AlertBanner as AlertBanner, Meter as Meter
 
 from ._catalog import install_builtin_controls as _install_builtin_controls
@@ -142,9 +144,10 @@ __all__ = (
     "RangeSlider", "CircularProgress", "SegmentedControl", "Breadcrumb",
     "BreadcrumbEvent", "Pagination",
     "ChoiceCard", "Disclosure", "Badge", "AlertBanner", "Meter",
+    "Step", "Stepper",
     "LineChart", "ChartSeries", "DonutChart", "ChartSlice", "DataGrid",
     "GridColumn", "GridRow", "CellValue", "GridCellEvent", "GridEditEvent",
-    "Event", "UiEvent", "ClickEvent", "ClosingEvent", "ChangeEvent",
+    "Event", "UiEvent", "ClickEvent", "ClosingEvent", "ValidationEvent", "ChangeEvent",
     "PointerEvent", "KeyEvent", "CommandEvent", "DragPayload", "DragEvent",
     "Theme", "Tokens", "Style", "Rule", "dark", "light", "get_theme",
     "theme_names", "load_theme", "save_theme", "icon_names",
