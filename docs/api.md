@@ -911,6 +911,65 @@ be synchronous or asynchronous: return `True` or `None` to accept, `False` to
 reject, or call `event.reject(message)` to supply useful feedback. A step with no
 validation handler is accepted by default.
 
+A longer flow can put each step in its own module. Subclass `Step`, create its
+controls in `_initialize`, and define `<name>_on_<event>` on that class.
+Connect `validating` on the subclass when the rule belongs with the step.
+`_initialize` runs before the step joins the Stepper, so read the other steps
+from a handler: `self.parent` is the Stepper and `self.parent.steps` is the
+sequence. The window imports the classes and assembles them:
+
+```python
+from pysual import (
+    App, Button, ClickEvent, Label, RadioButton, Step, Stepper, TextBox,
+    ValidationEvent,
+)
+
+class ChooseStep(Step):
+    def _initialize(self) -> None:
+        super()._initialize()
+        self.brief = RadioButton(text="Brief", group="style", checked=True)
+        self.friendly = RadioButton(text="Friendly", group="style")
+        self.formal = RadioButton(text="Formal", group="style")
+
+    @property
+    def selection(self) -> str:
+        options = (self.brief, self.friendly, self.formal)
+        return next(option.text for option in options if option.checked)
+
+class WriteStep(Step):
+    def _initialize(self) -> None:
+        super()._initialize()
+        self.message = TextBox(placeholder="Message")
+        self.validating.connect(self._require_text)
+
+    def _require_text(self, event: ValidationEvent) -> None:
+        if not self.message.text.strip():
+            event.reject("Enter some text")
+
+class ActionStep(Step):
+    def _initialize(self) -> None:
+        super()._initialize()
+        self.apply = Button(text="Apply")
+        self.summary = Label(text="")
+
+    def apply_on_click(self, event: ClickEvent) -> None:
+        steps = self.parent.steps
+        choose = next(step for step in steps if isinstance(step, ChooseStep))
+        write = next(step for step in steps if isinstance(step, WriteStep))
+        self.summary.text = f"{choose.selection}: {write.message.text.strip()}"
+
+class Flow(App):
+    def build(self) -> None:
+        self.wizard = Stepper(flex=1)
+        self.choose = ChooseStep(parent=self.wizard, title="Choose")
+        self.write = WriteStep(parent=self.wizard, title="Write")
+        self.actions = ActionStep(parent=self.wizard, title="Act")
+```
+
+Clicking the Act heading validates Write before that step opens. Further
+actions, such as starting over or closing the window, are additional buttons
+named on `ActionStep`.
+
 Pointer and keyboard navigation run the destination's prerequisite checks,
 including steps already marked completed, so editing an earlier answer cannot
 bypass its rule. A failed check selects that step and shows its message; success
