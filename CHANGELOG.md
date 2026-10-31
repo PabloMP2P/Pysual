@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.1.6 — 2026-10-31
+
+`Stepper` presents a sequence of `Step` containers with numbered headings and
+connecting lines. The horizontal layout places the active content below the
+heading row. `orientation="vertical"` places it below its own heading. Child
+controls keep their values between steps. Step content scrolls automatically. A
+vertical Stepper scrolls headings and the active content together when they
+exceed the available height.
+
+Click a numbered indicator or heading to move. With the default `linear=True`,
+earlier required steps must be completed and free of errors. `optional=True`
+lets a step be skipped. `linear=False` allows steps out of order. `requires`
+lists steps on the same Stepper that must be valid first, including in
+nonlinear mode. Going back checks only the destination's prerequisites.
+
+A `validating` handler may be synchronous or asynchronous. Return `True` or
+`None` to accept, `False` to reject, or call `event.reject(message)`. A step
+with no handler is accepted. Invalid input selects that step and shows its
+message. After an error is shown, later edits rerun the rule and clear the
+message when the step becomes valid. `await step.validate()` runs the same
+rule without navigating. Overlapping checks keep the newest result.
+`select()`, `next()`, and `previous()` move from the cached result and do not
+run validation. `reset()` clears progress, errors, and scroll, selects the
+first step, and keeps field values. Neither class reserves a Container factory
+name. See `examples/stepper.py`.
+
+A DataGrid header is one continuous band with rounded top corners and a square
+lower edge. Column rules, the header separator, cells, and scrollbars stay
+inside the theme frame. The header above the scrollbar can still sort and
+resize columns. A grid with no columns paints only its body.
+
+Wrapped text reuses results for lines whose wrapping inputs are unchanged.
+
 ## 0.1.5 — 2026-10-23
 
 `word_wrap=True` on a `Label` or multiline `TextBox` wraps text at the available
