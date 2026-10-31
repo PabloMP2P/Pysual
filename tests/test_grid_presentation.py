@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from test_library import RecordingHost, eventually
 
-from pysual import App, DataGrid, GridColumn, GridRow, Rect, Style, Theme
+from pysual import App, DataGrid, GridColumn, GridRow, Rect, Style, Theme, get_theme, theme_names
 from pysual.data_grid import _display, _measure_places, _parse_number
 from pysual.host import Input
 from pysual.icons import draw_icon
@@ -90,7 +90,7 @@ class ColumnPresentationTests(unittest.TestCase):
             self.assertEqual(len(matches), 1)
             _, x, _, size = matches[0]
             spare = 104 - host.measure(text, size)[0]
-            self.assertAlmostEqual(x, grid.bounds.x + column * 120 + 8 + spare * fraction)
+            self.assertAlmostEqual(x, grid.bounds.x + 1 + column * 120 + 8 + spare * fraction)
 
     def test_plain_number_columns_share_decimal_places(self):
         column = GridColumn("n", "Number", kind="number", prefix="$")
@@ -260,7 +260,7 @@ class ColumnPresentationTests(unittest.TestCase):
             self.assertEqual(len(positions), 3)
             for i, (_, x, _, size) in enumerate(positions):
                 spare = 104 - host.measure(text, size)[0]
-                self.assertAlmostEqual(x, grid.bounds.x + i * 120 + 8 + spare * (i / 2))
+                self.assertAlmostEqual(x, grid.bounds.x + 1 + i * 120 + 8 + spare * (i / 2))
         grid.rows = (GridRow("a", ("A very long cell value",) * 3),)
         host.positions = []
         paint_tree(app, host)
@@ -324,14 +324,148 @@ class ColumnPresentationTests(unittest.TestCase):
                             text_width = host.measure(title, font_size)[0]
                             self.assertLessEqual(text_width, available)
                             self.assertAlmostEqual(
-                                x, grid.bounds.x - shown + 8
+                                x, grid.bounds.x + 1 - shown + 8
                                 + (available - text_width) * fraction,
                             )
-                            self.assertAlmostEqual(marker_x, 140 - shown - 8 - marker_size)
-                            self.assertAlmostEqual(marker_y, (grid._header_height() - marker_size) / 2)
+                            self.assertAlmostEqual(marker_x, 141 - shown - 8 - marker_size)
+                            self.assertAlmostEqual(marker_y, (grid._header_height() + 1 - marker_size) / 2)
+
+
+class GridPaintHost(RecordingHost):
+    def __init__(self):
+        super().__init__()
+        self.surfaces = []
+        self.rects = []
+        self.captions = []
+        self.current_clip = Rect()
+
+    def clip(self, rect):
+        self.current_clip = rect
+
+    def styled_rect(self, rect, style):
+        self.surfaces.append((rect, style, self.current_clip))
+        return True
+
+    def rect(self, rect, fill, *args, **kwargs):
+        self.rects.append((rect, fill, self.current_clip))
+
+    def text(self, text, *args, **kwargs):
+        self.captions.append((text, self.current_clip))
+        super().text(text, *args, **kwargs)
 
 
 class GridViewportPixelsTests(unittest.TestCase):
+    def test_header_cells_and_scrollbars_stay_inside_each_themes_frame(self):
+        app, host = App(width=500, height=300), GridPaintHost()
+        self.addCleanup(app.destroy)
+        grid = DataGrid(parent=app, left=20, top=20, width=220.5, height=160.5,
+                        columns=(GridColumn("name", "Name", 120.5),
+                                 GridColumn("value", "Value", 140)),
+                        rows=tuple(GridRow(str(i), ("Account", "Value")) for i in range(20)))
+        for name in theme_names():
+            with self.subTest(theme=name):
+                app.theme = get_theme(name)
+                arrange(app, host)
+                host.surfaces.clear()
+                host.rects.clear()
+                host.captions.clear()
+                paint_tree(app, host)
+                # The beveled families have a two-pixel frame; other families
+                # have a one-pixel stroke. No painted part may cover either.
+                inset = 2 if name.startswith(("win31", "analog_arcade")) else 1
+                inner = grid.bounds.inset(inset)
+                body_index = next(i for i, (box, _, _) in enumerate(host.surfaces)
+                                  if box == grid.bounds)
+                for _, _, clip in host.surfaces[body_index + 1:]:
+                    self.assertEqual(clip.intersect(inner), clip)
+                vertical, horizontal = grid._scrollbars()
+                for bar in (vertical, horizontal):
+                    self.assertEqual(bar.track.intersect(inner), bar.track)
+                self.assertEqual(vertical.track.bottom, horizontal.track.y)
+                self.assertEqual(horizontal.track.right, vertical.track.x)
+                for text, clip in host.captions:
+                    if text == "Name":
+                        self.assertEqual(clip.right, inner.right)
+                        self.assertEqual(clip.bottom, vertical.track.y)
+                    elif text == "Account":
+                        self.assertEqual(clip.right, vertical.track.x)
+                        self.assertEqual(clip.bottom, horizontal.track.y)
+                # The header separator occupies its own final pixel; it does
+                # not straddle the first row or the scrollbar track.
+                separators = [box for box, _, _ in host.rects
+                              if box.width == inner.width and box.height == 1]
+                self.assertEqual(separators, [Rect(inner.x, vertical.track.y - 1,
+                                                   inner.width, 1)])
+
+    def test_header_above_scrollbar_can_sort_and_resize_but_frame_cannot(self):
+        app, host = App(), RecordingHost()
+        self.addCleanup(app.destroy)
+        grid = DataGrid(parent=app, left=20, top=20, width=220, height=160,
+                        columns=(GridColumn("name", "Name", 212),),
+                        rows=tuple(GridRow(str(i), (str(i),)) for i in range(20)))
+        arrange(app, host)
+        box = grid.bounds
+        for x, y in ((box.x, box.y + 10), (box.x + 10, box.y),
+                     (box.right - .5, box.y + 10), (box.x + 10, box.bottom - .5)):
+            grid.handle_input(Input("pointer_down", x=x, y=y))
+            self.assertIsNone(grid.sort_key)
+            self.assertIsNone(grid.selected_key)
+            self.assertIsNone(grid._resize)
+        grid.handle_input(Input("pointer_down", x=box.x + 207, y=box.y + 10))
+        self.assertEqual(grid.sort_key, "name")
+        grid.handle_input(Input("pointer_down", x=box.x + 213, y=box.y + 10))
+        self.assertIsNotNone(grid._resize)
+        grid.handle_input(Input("pointer_move", x=box.x + 233, y=box.y + 10))
+        grid.handle_input(Input("pointer_up", x=box.x + 233, y=box.y + 10))
+        self.assertEqual(grid.columns[0].width, 232)
+
+    def test_empty_schema_paints_only_its_body_and_can_be_repopulated(self):
+        app, host = App(), GridPaintHost()
+        self.addCleanup(app.destroy)
+        grid = DataGrid(parent=app, left=20, top=20, width=220, height=160)
+        for columns, rows in (((), ()), ((GridColumn("name", "Name", 300),),
+                                        (GridRow("one", ("Account",)),)),
+                              ((), tuple(GridRow(str(i), ()) for i in range(20)))):
+            grid.set_data(columns=columns, rows=rows)
+            arrange(app, host)
+            host.surfaces.clear()
+            host.rects.clear()
+            host.captions.clear()
+            paint_tree(app, host)
+            if columns:
+                self.assertEqual(grid._painted_cells, 1)
+                self.assertTrue(grid._scrollbars())
+                self.assertTrue(host.captions)
+            else:
+                self.assertEqual(grid._painted_cells, 0)
+                self.assertEqual(grid._header_height(), 0)
+                self.assertEqual(grid._scrollbars(), [])
+                self.assertFalse(host.captions)
+                self.assertFalse(host.rects)
+                self.assertEqual(host.surfaces[-1][0], grid.bounds)
+                self.assertEqual(grid._scroll_x, 0)
+
+    def test_scrollbars_resolve_each_other_using_the_space_inside_the_border(self):
+        app, host = App(theme=Theme().styled(DataGrid, Style(border_width=3))), RecordingHost()
+        self.addCleanup(app.destroy)
+        columns = (GridColumn("name", "Name", 210),)
+        rows = tuple(GridRow(str(i), (str(i),)) for i in range(4))
+        grid = DataGrid(parent=app, width=220, height=157, columns=columns, rows=rows)
+        arrange(app, host)
+        self.assertEqual(grid._scrollbars(), [])
+        grid.rows += (GridRow("extra", ("Extra",)),)
+        self.assertEqual(tuple(bar.axis for bar in grid._scrollbars()), (1, 0))
+        grid.set_data(columns=(replace(columns[0], width=215),), rows=rows)
+        self.assertEqual(tuple(bar.axis for bar in grid._scrollbars()), (1, 0))
+        grid.set_data(columns=columns, rows=rows)
+        self.assertEqual(grid._scrollbars(), [])
+        for width, height in ((0, 0), (10, 10), (220, 34), (220, 40)):
+            grid.update(width=width, height=height)
+            arrange(app, host)
+            paint_tree(app, host)
+            for bar in grid._scrollbars():
+                self.assertEqual(bar.track.intersect(grid.bounds), bar.track)
+
     def test_contained_parts_preserve_body_bounds_and_external_body_effects(self):
         effect = Style(glow="#ffffff", glow_width=8, shadow="#00000090", shadow_blur=12)
         theme = Theme()

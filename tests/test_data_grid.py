@@ -401,33 +401,33 @@ class GridDataTests(unittest.TestCase):
         self.addCleanup(app.destroy)
         grid = DataGrid(parent=app, left=10, top=10, width=220, height=160)
         arrange(app, host)
-        header = grid._header_height()
 
         def axes():
             return tuple(bar.axis for bar in grid._scrollbars())
 
         self.assertEqual(axes(), ())
-        self.assertAlmostEqual(grid._viewport(), (220, 160 - header))
+        self.assertEqual(grid._viewport(), (218, 158))
 
         grid.columns = (GridColumn("name", "Name", 80),)
         grid.rows = (GridRow("a", ("A",)),)
+        header = grid._header_height()
         self.assertEqual(axes(), ())
-        self.assertAlmostEqual(grid._viewport()[0], 220)
+        self.assertAlmostEqual(grid._viewport()[0], 218)
 
         grid.rows = tuple(GridRow(str(i), (str(i),)) for i in range(40))
         self.assertEqual(axes(), (1,))
-        self.assertAlmostEqual(grid._viewport()[0], 208)
-        self.assertAlmostEqual(grid._viewport()[1], 160 - header)
+        self.assertAlmostEqual(grid._viewport()[0], 206)
+        self.assertAlmostEqual(grid._viewport()[1], 159 - header)
 
         grid.rows = (GridRow("a", ("A",)),)
         grid.columns = (GridColumn("name", "Name", 400),)
         self.assertEqual(axes(), (0,))
-        self.assertAlmostEqual(grid._viewport()[0], 220)
-        self.assertAlmostEqual(grid._viewport()[1], 160 - header - 12)
+        self.assertAlmostEqual(grid._viewport()[0], 218)
+        self.assertAlmostEqual(grid._viewport()[1], 159 - header - 12)
 
         grid.rows = tuple(GridRow(str(i), (str(i),)) for i in range(40))
         self.assertEqual(axes(), (1, 0))
-        self.assertAlmostEqual(grid._viewport(), (208, 160 - header - 12))
+        self.assertEqual(grid._viewport(), (206, 159 - header - 12))
 
     def test_paint_is_limited_by_viewport_and_outer_clip(self):
         app, host = App(width=500, height=300), RecordingHost()
@@ -686,7 +686,7 @@ class GridRuntimeTests(AsyncUIOwnerTestCase):
         self.assertTrue(popup.is_open)
         self.assertEqual(grid.bounds.x, before.x + 200)
         self.assertEqual(grid.bounds.y, before.y + 100)
-        self.assertEqual(popup.bounds.x, grid.bounds.x)
+        self.assertEqual(popup.bounds.x, grid.bounds.x + 1)
         self.assertEqual(popup.bounds.y, grid.bounds.y + grid._header_height())
         self.assertEqual(editor.text, "Resized edit")
         await self.key("Enter")

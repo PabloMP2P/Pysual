@@ -21,7 +21,7 @@ from .popup import Popup
 from .schema import Dirty, Field, _persist_record, prop
 from .widgets import ListView, TextBox
 from .host import Host, Input
-from .painting import Painter
+from .painting import Painter, resolve_style
 from .theme import ResolvedStyle, style_instance
 
 CellValue: TypeAlias = str | int | float | bool | None
@@ -408,7 +408,8 @@ class _CellPopup(Popup):
             grid = self._owner
             assert isinstance(grid, DataGrid) and grid.selected_key is not None
             self._point = (
-                grid.bounds.x + sum(c.width for c in grid.columns[:grid.selected_column])
+                grid.bounds.x + grid._inner_bounds().x
+                + sum(c.width for c in grid.columns[:grid.selected_column])
                 - grid._scroll_x,
                 grid.bounds.y + grid._header_height()
                 + (grid._positions[grid.selected_key] - grid._scroll) * grid._row_height(),
@@ -417,22 +418,12 @@ class _CellPopup(Popup):
 
 
 def _paint_header_band(
-    p: Painter, header: ResolvedStyle, header_height: float, body: ResolvedStyle,
+    p: Painter, header: ResolvedStyle, area: Rect, radius: float,
 ) -> None:
-    """Fill the header inside the body stroke, following its top corners.
-
-    A square band from the control edge covers the rounded outline. The top of
-    the band uses the inner corner radius; a straight piece below it keeps the
-    row boundary level.
-    """
-    inset = body.border_width or 0
-    curve = max(0.0, (body.radius or 0) - inset)
-    width = max(0.0, p.width - 2 * inset)
-    height = max(0.0, header_height - inset)
-    if width <= 0 or height <= 0:
-        return
+    """One continuous fill, with rounded top corners and a square lower edge."""
     band = replace(
         style_instance(header),
+        radius=radius,
         border_width=0,
         shadow="#00000000",
         glow_width=0,
@@ -441,20 +432,10 @@ def _paint_header_band(
         highlight=None,
         inner_border=None,
     )
-    if curve > 0 and height > curve:
+    with p._clipped(area):
         p.surface(
-            Rect(inset, inset, width, min(height, curve * 2)),
-            replace(band, radius=curve),
-        )
-        if height > curve:
-            p.surface(
-                Rect(inset, inset + curve, width, height - curve),
-                replace(band, radius=0),
-            )
-    else:
-        p.surface(
-            Rect(inset, inset, width, height),
-            replace(band, radius=min(curve, height / 2)),
+            Rect(area.x, area.y, area.width, area.height + radius),
+            band,
         )
 
 
@@ -479,9 +460,8 @@ class DataGrid(Control):
     activated: ClassVar[Event[GridCellEvent]] = Event(GridCellEvent)
     edited: ClassVar[Event[GridEditEvent]] = Event(GridEditEvent)
     style_parts: ClassVar[tuple[str, ...]] = ("body", "header", "cell", "scrollbar", "track", "thumb")
-    # Header/cell surfaces are explicitly viewport-clipped during paint. The
-    # scrollbar uses an inset rect, not surface effects. These parts cannot
-    # extend the body and must not inflate its render-cache allocation.
+    # Header/cell surfaces and scrollbar effects are clipped during paint.
+    # These parts cannot extend the body or inflate its render-cache allocation.
     _contained_style_parts: ClassVar[frozenset[str]] = frozenset(
         ("header", "cell", "scrollbar", "track", "thumb")
     )
@@ -824,32 +804,41 @@ class DataGrid(Control):
         return self.effective_row_height(self.row_height)
 
     def _header_height(self) -> float:
-        return self.effective_row_height(self.header_height)
+        return self.effective_row_height(self.header_height) if self.columns else 0
+
+    def _inner_bounds(self) -> Rect:
+        """Local content bounds, inside the theme's outline or bevel."""
+        style = resolve_style(self)
+        inset = style.border_width or 0
+        if style.bevel in ("raised", "sunken"):
+            inset = max(inset, style.bevel_width if style.bevel_width is not None else 2)
+        inset = min(inset, self.bounds.width / 2, self.bounds.height / 2)
+        return Rect(0, 0, self.bounds.width, self.bounds.height).inset(inset)
 
     def _scrollbar_axes(self) -> tuple[bool, bool]:
         """Return vertical, horizontal for tracks that overflow.
 
-        A track is reserved only while its scrollbar is shown. Reserving both
-        in advance leaves a square notch in the header and along the bottom
-        when the content already fits. Each axis can force the other, so the
-        pair is resolved together.
+        Each axis can force the other, so the pair is resolved together.
         """
+        if not self.columns:
+            return False, False
         vertical = horizontal = False
+        inner = self._inner_bounds()
         row_height = self._row_height()
-        header = self._header_height()
+        body_height = max(0.0, inner.bottom - self._header_height())
         content_width = sum(column.width for column in self._view_columns())
         row_count = len(self._order)
         bar = SCROLLBAR_SIZE
         for _ in range(3):
-            width = max(0.0, self.bounds.width - (bar if vertical else 0))
-            height = max(0.0, self.bounds.height - header - (bar if horizontal else 0))
+            width = max(0.0, inner.width - (bar if vertical else 0))
+            height = max(0.0, body_height - (bar if horizontal else 0))
             page = max(1, int(height / row_height)) if row_height > 0 else 1
             next_vertical = (
-                height > 0 and self.bounds.width > bar and row_count > page
+                height > 0 and inner.width > bar and row_count > page
             )
             next_horizontal = (
                 width > 0
-                and self.bounds.height > header + bar
+                and body_height > bar
                 and content_width > width
             )
             if (next_vertical, next_horizontal) == (vertical, horizontal):
@@ -858,11 +847,13 @@ class DataGrid(Control):
         return vertical, horizontal
 
     def _viewport(self) -> tuple[float, float]:
+        inner = self._inner_bounds()
         vertical, horizontal = self._scrollbar_axes()
         bar = SCROLLBAR_SIZE
         return (
-            max(0.0, self.bounds.width - (bar if vertical else 0)),
-            max(0.0, self.bounds.height - self._header_height() - (bar if horizontal else 0)),
+            max(0.0, inner.width - (bar if vertical else 0)),
+            max(0.0, inner.bottom - max(inner.y, self._header_height())
+                - (bar if horizontal else 0)),
         )
 
     def _view_columns(self) -> tuple[GridColumn, ...]:
@@ -913,14 +904,17 @@ class DataGrid(Control):
         self._clamp()
 
     def _scrollbars(self) -> list[Scrollbar]:
+        vertical, horizontal = self._scrollbar_axes()
+        inner = self._inner_bounds()
         width, height = self._viewport()
-        x, y = self.bounds.x, self.bounds.y + self._header_height()
+        x, y = self.bounds.x + inner.x, self.bounds.y + self._header_height()
         bar = SCROLLBAR_SIZE
         bars = (
-            scrollbar(Rect(x + width, y, min(bar, self.bounds.width), height),
-                      len(self._order), self._page_rows(), self._scroll),
-            scrollbar(Rect(x, y + height, width, min(bar, self.bounds.height)),
-                      sum(c.width for c in self._view_columns()), width, self._scroll_x, 0),
+            scrollbar(Rect(x + width, y, bar, height),
+                      len(self._order), self._page_rows(), self._scroll) if vertical else None,
+            scrollbar(Rect(x, y + height, width, bar),
+                      sum(c.width for c in self._view_columns()), width, self._scroll_x, 0)
+            if horizontal else None,
         )
         return [bar for bar in bars if bar is not None]
 
@@ -950,7 +944,8 @@ class DataGrid(Control):
         if e.kind == "focus" and self._should_reveal_focus():
             self._reveal()
         self._clamp()
-        x, y = e.x - self.bounds.x, e.y - self.bounds.y
+        inner = self._inner_bounds()
+        x, y = e.x - self.bounds.x - inner.x, e.y - self.bounds.y
         width, height = self._viewport()
         handled, self._drag, values = handle_scrollbars(e, self._scrollbars(), self._drag)
         if 1 in values:
@@ -1012,7 +1007,14 @@ class DataGrid(Control):
         elif e.kind == "pointer_down":
             previous_click, self._last_click = self._last_click, None
             boundary, resize_index = -self._scroll_x, None
-            if 0 <= x < width and 0 <= y < self._header_height():
+            in_header = 0 <= x < inner.width and inner.y <= y < min(
+                inner.bottom, self._header_height()
+            )
+            in_body = (
+                0 <= x < width
+                and self._header_height() <= y < self._header_height() + height
+            )
+            if in_header:
                 for index, column in enumerate(self.columns):
                     boundary += column.width
                     if abs(x - boundary) <= 5:
@@ -1021,7 +1023,7 @@ class DataGrid(Control):
             if resize_index is not None:
                 self._close_editor()
                 self._resize = (resize_index, e.x, self.columns, self._scroll_x)
-            elif x < width and y < self._header_height() + height:
+            elif in_header or in_body:
                 column = self._column_at(x)
                 if column is not None:
                     if y < self._header_height():
@@ -1305,15 +1307,20 @@ class DataGrid(Control):
     def paint(self, p: Painter, /) -> None:
         row_height, header_height = self._row_height(), self._header_height()
         body = p.body()
+        self._painted_cells = 0
         if self._pending_reveal:
             self._reveal()
         self._clamp()
+        if not self.columns:
+            return
+        inner = self._inner_bounds()
         width, height = self._viewport()
+        viewport = Rect(inner.x, header_height, width, height)
         visible_columns: list[tuple[int, GridColumn, float]] = []
-        x = -self._scroll_x
+        x = inner.x - self._scroll_x
         for i, column in enumerate(self._view_columns()):
-            if x + column.width > max(0, self._clip.x - self.bounds.x) and x < min(
-                width, self._clip.right - self.bounds.x
+            if x + column.width > max(inner.x, self._clip.x - self.bounds.x) and x < min(
+                inner.right, self._clip.right - self.bounds.x
             ):
                 visible_columns.append((i, column, x))
             x += column.width
@@ -1331,16 +1338,20 @@ class DataGrid(Control):
                 / row_height
             ),
         )
-        self._painted_cells = 0
         places = self._decimal_places()
-        with p._clipped(Rect(0, header_height, width, height)):
+        with p._clipped(viewport):
             for row_index in range(first, end):
                 row = self._order[row_index]
                 y = header_height + (row_index - self._scroll) * row_height
                 style = p.style("cell", selected=row.key == self.selected_key)
                 text_height = self.effective_row_height(style.font_size * 1.2)
-                p.surface(Rect(0, y, width, row_height), style)
+                p.surface(
+                    Rect(inner.x, y, width, row_height),
+                    replace(style_instance(style), radius=0),
+                )
                 for i, column, x in visible_columns:
+                    if x >= viewport.right:
+                        break
                     text = p.elide(
                         single_line(_display(row.cells[i], column, places=places[i])),
                         column.width - 16,
@@ -1357,11 +1368,8 @@ class DataGrid(Control):
                         size=style.font_size,
                         font_family=style.font_family,
                     )
-                    p.line(
-                        x + column.width,
-                        y,
-                        x + column.width,
-                        y + row_height,
+                    p.rect(
+                        Rect(x + column.width - 1, y, 1, row_height),
                         style.border,
                     )
                     if row.key == self.selected_key and i == self.selected_column:
@@ -1372,12 +1380,13 @@ class DataGrid(Control):
                         )
                     self._painted_cells += 1
         header = p.style("header")
-        # The header is one band across the control, inside the body's stroke.
-        # Column titles stay in the content width, so a vertical scrollbar
-        # does not cover them.
-        _paint_header_band(p, header, header_height, body)
-        with p._clipped(Rect(0, 0, width, header_height + height)):
-            with p._clipped(Rect(0, 0, width, header_height)):
+        # The scrollbar starts below the header, so the entire band is usable.
+        header_bounds = Rect(
+            inner.x, inner.y, inner.width, max(0, header_height - inner.y)
+        ).intersect(inner)
+        _paint_header_band(p, header, header_bounds, max(0, (body.radius or 0) - inner.x))
+        with p._clipped(inner):
+            with p._clipped(header_bounds):
                 text_height = self.effective_row_height(header.font_size * 1.2)
                 for _, column, x in visible_columns:
                     marker = min(header.font_size, 20) if self.sort_key == column.key else 0
@@ -1394,7 +1403,7 @@ class DataGrid(Control):
                             p, title, column, x, header.font_size, header.font_family,
                             trailing=trailing,
                         ),
-                        (header_height - text_height) / 2,
+                        inner.y + (header_bounds.height - text_height) / 2,
                         color=header.foreground,
                         size=header.font_size,
                         font_family=header.font_family,
@@ -1403,31 +1412,32 @@ class DataGrid(Control):
                         p.icon(
                             "arrow_down" if self.sort_descending else "arrow_up",
                             x + column.width - 8 - marker,
-                            (header_height - marker) / 2,
+                            inner.y + (header_bounds.height - marker) / 2,
                             size=marker,
                             color=header.foreground,
                         )
-                    p.line(
-                        x + column.width,
-                        body.border_width or 0,
-                        x + column.width,
-                        header_height,
+                    p.rect(
+                        Rect(x + column.width - 1, inner.y, 1, header_bounds.height),
                         header.border,
                     )
+                p.rect(Rect(inner.x, header_height - 1, inner.width, 1), header.border)
             if self._resize is not None:
                 index = self._resize[0]
                 boundary = sum(c.width for c in self._view_columns()[: index + 1])
                 p.line(
-                    boundary - self._scroll_x,
-                    0,
-                    boundary - self._scroll_x,
-                    header_height + height,
+                    inner.x + boundary - self._scroll_x - 1,
+                    inner.y,
+                    inner.x + boundary - self._scroll_x - 1,
+                    viewport.bottom,
                     p.theme.tokens.accent,
                     2,
                 )
-        inset = body.border_width or 0
-        p.line(inset, header_height, max(inset, p.width - inset), header_height, header.border)
-        paint_scrollbars(p, self._scrollbars())
+        for bar in self._scrollbars():
+            with p._clipped(Rect(
+                bar.track.x - self.bounds.x, bar.track.y - self.bounds.y,
+                bar.track.width, bar.track.height,
+            )):
+                paint_scrollbars(p, (bar,))
 
     def destroy(self) -> None:
         self._close_editor()

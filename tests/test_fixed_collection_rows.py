@@ -197,7 +197,7 @@ class FixedCollectionRowsTests(unittest.TestCase):
         app, host = self.app(), CellHost()
         listing = ListView(parent=app, items=("A", "B"))
         tree = TreeView(parent=app, nodes=(TreeNode("a", "A"),))
-        grid = DataGrid(parent=app)
+        grid = DataGrid(parent=app, columns=(GridColumn("name", "Name"),))
         entry = TextBox(parent=app, multiline=True, text="A\nB")
         arrange(app, host)
 
@@ -339,7 +339,8 @@ class FixedCollectionRowsTests(unittest.TestCase):
         app, host = self.app(), RecordingHost()
         listing = ListView(parent=app, items=("A", "B", "C"), width=200, height=90, row_height=30)
         tree = TreeView(parent=app, nodes=(TreeNode("a", "A"),), width=200, height=90, row_height=30)
-        grid = DataGrid(parent=app, width=220, height=136, row_height=30, header_height=34)
+        grid = DataGrid(parent=app, columns=(GridColumn("name", "Name"),),
+                        width=220, height=136, row_height=30, header_height=34)
         arrange(app, host)
         self.assertEqual(listing._visible_rows(), 3)
         self.assertEqual(tree._page_rows(), 3)
