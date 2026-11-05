@@ -16,11 +16,30 @@ from pysual import App, Button, Container, Control, Label, Rect
 from pysual._engine import Engine, _Request
 from pysual._modality import ModalManager, contains
 from pysual.backends._web_native import LiveSVGHost
+from pysual.backends.native import NativeHost
 from pysual.input import Router, _HitIndex
 from pysual.host import Input
 from pysual.layout import arrange
 from pysual.painting import RetainedPaintTree, paint_tree
 from pysual.runtime import Runtime
+
+
+class SceneBridge:
+    """Accept native scene and text requests without a native process."""
+
+    diagnostics = {}
+
+    def request(self, op, **fields):
+        if op == "open":
+            return {"width": 640, "height": 400, "scale": 1, "resource_revision": 0}
+        if op == "measure":
+            return len(fields["text"]) * 8, 16
+        if op == "measure_many":
+            return [(len(text) * 8, 16) for text in fields["texts"]]
+        return {} if op == "configure" else None
+
+    def close(self):
+        pass
 
 
 class CorePerformanceTests(UIOwnerTestCase):
@@ -208,6 +227,45 @@ class SchedulingPerformanceTests(AsyncUIOwnerTestCase):
                 await runtime.dispatcher.shutdown()
                 app._runtime = None
                 app.destroy()
+
+    async def test_wake_arriving_during_a_backlog_still_polls_its_batch(self):
+        # Native input wakes the owner once per unread batch. Inert motion
+        # (no hover, scroll or paint change) must not strand a later batch,
+        # such as the window's close request, once the backlog drains.
+        app = App(width=640, height=400, reduce_motion=True, fps_limit=None,
+                  redraw_interval=None)
+        host = NativeHost(client_factory=lambda **_kwargs: SceneBridge())
+        host.open("Backlog", 640, 400, True, 1)
+        runtime = Runtime(app, host)
+        app._runtime = runtime
+        app._wake = runtime.invalidate
+        app._attach_dispatcher(runtime.dispatcher)
+        Label(parent=app, width=200, height=100)
+        host.set_wake_callback(runtime._wake_event.set)
+        runtime._paint_frame()
+        # More than one input slice was already polled when the next event arrives.
+        runtime._pending_input.extend(Input("pointer_move", x=x + 10, y=10) for x in range(100))
+        host._on_event({"kind": "key_down", "key": "a"})
+        await asyncio.sleep(0)
+        self.assertTrue(runtime._wake_event.is_set())
+        received = []
+        process = runtime._process_input
+
+        def record(event):
+            received.append(event.kind)
+            if event.kind == "key_down":
+                runtime._stop.set()
+            process(event)
+
+        runtime._process_input = record
+        try:
+            await asyncio.wait_for(runtime._pump(), 2)
+            self.assertEqual(received, ["pointer_move"] * 100 + ["key_down"])
+        finally:
+            await runtime.dispatcher.shutdown()
+            app._runtime = None
+            app.destroy()
+            host.close()
 
     async def test_live_web_wakes_owner_and_keeps_disconnect_deadlines(self):
         host = LiveSVGHost(open_browser=False)

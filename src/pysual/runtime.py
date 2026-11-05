@@ -672,9 +672,12 @@ class Runtime:
         engine = get_engine()
         pending = self._pending_input
         while not self._stop.is_set():
-            self._wake_event.clear()
             self.dispatcher.raise_errors()
             if not pending:
+                # Event-driven hosts wake once per unread batch. Only the poll
+                # that reads it may consume that wake; clearing it while a
+                # slice is still pending strands later input, including close.
+                self._wake_event.clear()
                 pending.extend(self.host.poll())
             input_deadline = perf_counter() + 0.004
             handler_budget = min(64, max(1, (self.dispatcher.limit or 128) // 2))

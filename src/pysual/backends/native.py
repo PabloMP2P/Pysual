@@ -53,6 +53,10 @@ _Metric = tuple[float, float]
 _MetricKey = tuple[str, float, bool]
 _Setting = bool | int | float | None
 _CAPTION_THEME = Theme()  # Caption font/color values are already resolved.
+# Unread input beyond one runtime input slice means the owner has fallen
+# behind. Motion then merges into its unread predecessor instead of queueing,
+# so a slow frame cannot grow the queue toward its overflow limit.
+_MOTION_BACKLOG = 64
 
 
 def _display(value: str) -> str:
@@ -61,6 +65,33 @@ def _display(value: str) -> str:
 
 def _rect(rect: Rect | None) -> list[float] | None:
     return None if rect is None else [rect.x, rect.y, rect.width, rect.height]
+
+
+def _merge_motion(previous: object, value: object) -> object | None:
+    """Combine unread motion with the same buttons and modifiers; None keeps both.
+
+    A pointer move replaces the previous move. Wheel notches add up only at the
+    same position and in the same direction, so routing and scroll chaining see
+    the same target. Presses, keys, leaves and lifecycle events never merge.
+    """
+    if not isinstance(previous, dict) or not isinstance(value, dict):
+        return None
+    earlier, later = cast(dict[str, object], previous), cast(dict[str, object], value)
+    kind = later.get("kind")
+    if kind not in ("pointer_move", "wheel") or earlier.get("kind") != kind or any(
+        earlier.get(name) != later.get(name) for name in ("button", "shift", "ctrl")
+    ):
+        return None
+    if kind == "pointer_move":
+        return later
+    first, second = earlier.get("delta"), later.get("delta")
+    if (
+        type(first) not in (int, float) or type(second) not in (int, float)
+        or earlier.get("x") != later.get("x") or earlier.get("y") != later.get("y")
+    ):
+        return None
+    first, second = cast(float, first), cast(float, second)
+    return {**later, "delta": first + second} if first * second > 0 else None
 
 
 _STYLE_NAMES = tuple(field.name for field in fields(Style))
@@ -201,7 +232,13 @@ class NativeHost(NativeServices):
         with self._event_lock:
             if self._closed or self._overflow:
                 return
-            if len(self._events) >= 4096:
+            merged = (
+                _merge_motion(self._events[-1], value)
+                if len(self._events) >= _MOTION_BACKLOG else None
+            )
+            if merged is not None:
+                self._events[-1] = merged
+            elif len(self._events) >= 4096:
                 self._events.clear()
                 self._events.append({"kind": "error", "text": "Native input queue exceeded 4096 events"})
                 self._overflow = True

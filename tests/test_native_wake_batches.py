@@ -114,6 +114,47 @@ def test_overflow_retains_one_error_and_existing_batch_wake(monkeypatch):
     assert host.poll() == []
 
 
+def test_motion_keeps_every_sample_until_the_owner_falls_behind(monkeypatch):
+    host = native.NativeHost()
+    bind(monkeypatch, host, lambda: None)
+    for x in range(native._MOTION_BACKLOG):
+        host._on_event({"kind": "pointer_move", "x": x, "button": 1})
+    assert [event.x for event in host.poll()] == list(range(native._MOTION_BACKLOG))
+
+
+def test_backlog_coalesces_motion_and_keeps_discrete_input(monkeypatch):
+    host = native.NativeHost()
+    loop = bind(monkeypatch, host, lambda: None)
+    for _ in range(native._MOTION_BACKLOG):
+        host._on_event({"kind": "key_down", "key": "a"})
+    for x in range(500):
+        host._on_event({"kind": "pointer_move", "x": x, "y": 5, "button": 1, "shift": False})
+    host._on_event({"kind": "pointer_down", "x": 499, "y": 5, "button": 1})
+    for x in range(500):
+        host._on_event({"kind": "pointer_move", "x": x, "y": 5, "button": 1, "shift": True})
+    host._on_event({"kind": "pointer_move", "x": 7, "y": 5, "button": 1, "shift": False})
+    host._on_event({"kind": "close"})
+    assert loop.scheduled == 1
+    events = host.poll()[native._MOTION_BACKLOG:]
+    assert [(event.kind, event.x, event.shift) for event in events] == [
+        ("pointer_move", 499, False), ("pointer_down", 499, False),
+        ("pointer_move", 499, True), ("pointer_move", 7, False), ("close", 0, False),
+    ]
+
+
+def test_backlog_adds_wheel_notches_in_one_place_and_direction(monkeypatch):
+    host = native.NativeHost()
+    bind(monkeypatch, host, lambda: None)
+    for _ in range(native._MOTION_BACKLOG):
+        host._on_event({"kind": "key_down", "key": "a"})
+    notches = [(1, 10, False)] * 40 + [(-1, 10, False)] * 3 + [(0.5, 10, False), (0.25, 20, False),
+                                                              (2, 20, True), (1, 20, True)]
+    for delta, x, shift in notches:
+        host._on_event({"kind": "wheel", "x": x, "y": 30, "delta": delta, "shift": shift, "ctrl": False})
+    wheels = [(event.delta, event.x, event.shift) for event in host.poll()[native._MOTION_BACKLOG:]]
+    assert wheels == [(40, 10, False), (-3, 10, False), (0.5, 10, False), (0.25, 20, False), (3, 20, True)]
+
+
 def test_close_cancels_queued_wakes_and_events(monkeypatch):
     host, wakes = native.NativeHost(), []
     loop = bind(monkeypatch, host, lambda: wakes.append(True))
