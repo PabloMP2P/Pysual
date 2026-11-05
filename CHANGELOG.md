@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.7 — 2026-11-05
+
+### Fixes
+
+- Keep a native window reading input while an earlier batch is still being
+  handled. The wake for an unread batch is consumed only when that batch is
+  polled, so later input, including the window's close request, is no longer
+  left unread while the UI is idle.
+- While a native window is behind by 64 or more unread events, replace an
+  unread pointer move with the later move, and add wheel notches that share a
+  position, direction, buttons, and modifiers. Clicks, keys, and close stay
+  separate events. The input queue stays within its 4096-event limit instead
+  of failing the window.
+
 ## 0.1.6 — 2026-10-31
 
 `Stepper` presents a sequence of `Step` containers with numbered headings and
