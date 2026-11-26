@@ -610,7 +610,11 @@ Set `reduce_motion=True` for immediate interaction states.
 
 Theme changes preserve control values and application state. Primary actions,
 secondary controls, inset editors, selected rows, focus outlines, and disabled
-states retain distinct roles within each family. Try
+states retain distinct roles within each family. `Tokens.focus` is the keyboard
+focus color. `None`, the default, uses `accent` when the ring is drawn. An
+eight-digit color sets the ring's opacity, and a fully transparent color such
+as `#00000000` hides it. `theme.derive(focus="#5c6bd466")` changes the current
+theme. Saved theme documents may omit `focus`; it loads as `None`. Try
 [theme_gallery.py](../examples/theme_gallery.py) for live control interactions
 and family/appearance switching. These are portable rendered interpretations;
 terminal hosts approximate them within their character grid.
@@ -687,10 +691,31 @@ built-in uses the same property and invalidation rules. See
 [the contributor architecture guide](control-architecture.md#from-a-control-change-to-a-frame)
 for the update path.
 
-`Control.paint_focus(painter)` draws the keyboard outline after the cached body.
-Composite controls may override it when their owner provides the visible focus
-indication, as SearchField does for its internal entry. Invalidate that owner's
-paint on focus and blur so retained and direct renderers agree.
+`Control.paint_focus(painter)` draws keyboard focus after the cached body. It
+asks the root window's `paint_focus_ring(painter)` for the indication. Override
+that window method to hide the ring, pass a color to
+`painter.standard_focus_ring(color)`, or draw a different signal with the
+painter. The painter belongs to the focused control, or to the composite that
+draws one shared outline. Read only the painter and that control. A control
+can still override `paint_focus` for its own
+indication; call `self._root().paint_focus_ring(painter)` there to keep the
+window policy.
+
+```python
+class Quiet(App):
+    def paint_focus_ring(self, painter):
+        return
+
+class Underline(App):
+    def paint_focus_ring(self, painter):
+        painter.line(4, painter.height - 3, painter.width - 4, painter.height - 3,
+                     painter.theme.tokens.accent, 2)
+```
+
+Composite controls may override `paint_focus` when their owner provides the
+visible focus indication, as SearchField does for its internal entry. The field
+draws one outline around itself through the same window method. Invalidate that
+owner's paint on focus and blur so retained and direct renderers agree.
 
 ### Composing control behavior
 

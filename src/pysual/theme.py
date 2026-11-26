@@ -83,11 +83,17 @@ class Tokens:
     spacing: float = 12
     radius: float = 10
     control_height: float = 38
+    # None follows accent at draw time. An 8-digit color sets the ring opacity,
+    # and a fully transparent color hides the ring.
+    focus: str | None = None
 
     def __post_init__(self) -> None:
         for f in fields(self):
             value = getattr(self, f.name)
-            if f.name == "font_family":
+            if f.name == "focus":
+                if value is not None:
+                    _color(value)
+            elif f.name == "font_family":
                 if value not in ("ui", "mono"):
                     raise ValueError("font_family must be ui or mono")
             elif f.type is str:
@@ -611,13 +617,17 @@ class Theme:
             raise ValueError("Unsupported theme document")
         tokens = doc["tokens"]
         rules_value = doc["rules"]
+        names = {f.name for f in fields(Tokens)}
+        # focus was added after pysual-theme/1. Older documents omit it.
         if (
             not isinstance(tokens, dict)
-            or set(cast(dict[str, object], tokens)) != {f.name for f in fields(Tokens)}
+            or not set(cast(dict[str, object], tokens)) <= names
+            or not names - {"focus"} <= set(cast(dict[str, object], tokens))
             or not isinstance(rules_value, list)
         ):
             raise ValueError("Theme requires all declared tokens and a rules list")
-        token_map = cast(dict[str, object], tokens)
+        token_map = dict(cast(dict[str, object], tokens))
+        token_map.setdefault("focus", None)
         rules = cast(list[object], rules_value)
         if any(
             not isinstance(item, dict)

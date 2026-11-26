@@ -558,6 +558,28 @@ class SurfaceThemeTests(unittest.TestCase):
             document = theme.to_json()
             self.assertNotIn("_rule_index", document)
             self.assertEqual(Theme.from_json(document), theme)
+            self.assertIsNone(theme.tokens.focus)
+        # Documents saved before the focus token omit it and keep the accent ring.
+        previous = json.loads(Theme().to_json())
+        del previous["tokens"]["focus"]
+        restored = Theme.from_json(json.dumps(previous))
+        self.assertIsNone(restored.tokens.focus)
+        self.assertEqual(restored.tokens.accent, Theme().tokens.accent)
+        previous["tokens"]["focus"] = "#11223380"
+        self.assertEqual(
+            Theme.from_json(json.dumps(previous)).tokens.focus, "#11223380"
+        )
+        previous["tokens"]["focus"] = "blue"
+        with self.assertRaises(ValueError):
+            Theme.from_json(json.dumps(previous))
+        previous["tokens"].pop("focus")
+        previous["tokens"]["extra"] = "#112233"
+        with self.assertRaises(ValueError):
+            Theme.from_json(json.dumps(previous))
+        with self.assertRaises(ValueError):
+            Theme().derive(focus="blue")
+        self.assertEqual(Theme().derive(focus="#11223300").tokens.focus, "#11223300")
+        self.assertIsNone(Theme().derive(focus="#11223300").derive(focus=None).tokens.focus)
         # Existing documents omit new optional effect fields and still load.
         old = json.loads(Theme().styled(Button, Style(fill="#123456")).to_json())
         old["rules"][0]["style"] = {"fill": "#123456"}

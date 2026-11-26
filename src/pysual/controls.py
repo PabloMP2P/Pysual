@@ -723,11 +723,23 @@ class Control(SchemaObject, metaclass=_ControlMeta):
     def paint_focus(self, painter: Painter, /) -> None:
         """Draw keyboard focus after the cached body.
 
-        Composite entries may override this when their owner draws a shared
-        focus outline. Keep an equally visible indication on that owner.
+        The root window's ``paint_focus_ring`` supplies the indication.
+        Override this when this control draws its own, or when its owner draws
+        a shared outline. Call ``self._root().paint_focus_ring(painter)`` to
+        use the window policy.
         """
-        radius = (painter.style().radius or 0) if "body" in self.style_parts else 0
-        painter.focus_ring(painter.theme.tokens.accent, radius)
+        self._root().paint_focus_ring(painter)
+
+    def paint_focus_ring(self, painter: Painter, /) -> None:
+        """Draw this window's focus indication for ``painter``.
+
+        Override this on the window to hide, recolor, or replace the ring for
+        every control. The painter belongs to the focused control, or to the
+        composite that draws one shared outline.
+        ``painter.standard_focus_ring()`` draws the theme stroke. Read only the
+        painter and its control.
+        """
+        painter.standard_focus_ring()
 
     def paint_bounds(self) -> Rect:
         """Declared effect bounds in app coordinates; never changes hit testing.

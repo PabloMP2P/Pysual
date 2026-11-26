@@ -30,6 +30,7 @@ from .theme import (
     StyleState,
     Theme,
     Tokens,
+    _color,
     as_resolved,
     style_instance,
 )
@@ -892,6 +893,27 @@ class Painter:
                 self.rect(
                     rect.inset(diameter * 0.3), foreground, radius=diameter * 0.2
                 )
+
+    def standard_focus_ring(self, color: str | None = None) -> None:
+        """Draw the theme focus stroke around this control.
+
+        ``None`` uses ``tokens.focus`` when it is set, and ``tokens.accent``
+        otherwise. A fully transparent color draws nothing. ``color`` replaces
+        the theme color for this call. The radius is the body radius when this
+        control has a body part.
+        """
+        if color is None:
+            tokens = self.theme.tokens
+            color = tokens.accent if tokens.focus is None else tokens.focus
+        else:
+            _color(color)
+        if len(color) == 9 and color[7:].lower() == "00":
+            return
+        radius = 0.0
+        control = self.control
+        if control is not None and "body" in control.style_parts:
+            radius = self.style().radius or 0
+        self.focus_ring(color, radius)
 
     def focus_ring(self, color: str, radius: float = 0) -> None:
         """Indicate keyboard focus using the host's full-bounds representation."""

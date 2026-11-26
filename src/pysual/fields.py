@@ -47,7 +47,7 @@ class _SearchEntry(TextBox):
             self._paint_text(painter, painter.style(), self._text_viewport())
 
     def paint_focus(self, painter: Painter, /) -> None:
-        # SearchField paints the shared outline, including the search icon.
+        # SearchField paints the shared outline through the window policy.
         pass
 
     def _validate_live_update(self, name: str, value: object) -> None:
@@ -156,9 +156,9 @@ class SearchField(Container):
         )
 
     def paint(self, painter: Painter, /) -> None:
-        style = painter.body()
+        painter.body()
         if self.entry.focused:
-            painter.focus_ring(painter.theme.tokens.accent, style.radius or 0)
+            self._root().paint_focus_ring(painter)
 
     def handle_input(self, event: Input, /) -> bool | None:
         if event.kind == "pointer_down" and event.button == 1 and self.effective_enabled:

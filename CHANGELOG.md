@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+`Tokens.focus` chooses the keyboard focus ring. `None` uses `accent`. An
+eight-digit color sets its opacity, and a fully transparent color hides it.
+Existing theme files omit `focus` and load unchanged.
+
+Override `paint_focus_ring` on the window to hide or replace the ring for every
+control. `painter.standard_focus_ring()` draws the theme stroke. `SearchField`
+uses the same window indication for its shared outline.
+
 ## 0.1.7 — 2026-11-05
 
 ### Fixes
