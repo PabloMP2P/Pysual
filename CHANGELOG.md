@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.8 — 2026-11-26
 
 `Tokens.focus` chooses the keyboard focus ring. `None` uses `accent`. An
 eight-digit color sets its opacity, and a fully transparent color hides it.

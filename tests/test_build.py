@@ -233,9 +233,13 @@ def test_checkout_module_entry_and_packaging_frontend_are_distinct():
 
 
 def test_main_module_import_does_not_run_cli():
-    imported = subprocess.run([sys.executable, "-c", "import pysual.__main__; print('imported')"],
-                              capture_output=True, text=True)
-    assert imported.returncode == 0
+    checkout = Path(__file__).resolve().parents[1]
+    imported = subprocess.run(
+        [sys.executable, "-c", "import pysual.__main__; print('imported')"],
+        capture_output=True, text=True, cwd=checkout,
+        env={**os.environ, "PYTHONPATH": str(checkout / "src")},
+    )
+    assert imported.returncode == 0, imported.stderr
     assert imported.stdout.strip() == "imported"
 
 
